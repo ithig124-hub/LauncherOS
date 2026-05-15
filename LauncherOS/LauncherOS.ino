@@ -46,7 +46,7 @@ HWCDC USBSerial;
 // ============================================================================
 //  POWER-SAVING TUNABLES   (set POWER_SAVE 0 to disable everything below)
 // ============================================================================
-#define POWER_SAVE              1
+#define POWER_SAVE              0
 
 // Drop CPU from 240 MHz to this when sitting on a static screen.
 // 80 MHz still runs the AMOLED + LVGL smoothly and roughly halves CPU draw.
@@ -84,7 +84,7 @@ HWCDC USBSerial;
 
 #define SCREEN_OFF_TIMEOUT_MS   10000     // 10 s of no touch -> screen off
 #define WAKE_TOUCH_SUPPRESS_MS    400     // ignore touches for 400ms after wake
-#define SWIPE_THRESHOLD_PX         40     // pixels of horizontal travel to count
+#define SWIPE_THRESHOLD_PX         30     // pixels of horizontal travel to count
 #define SWIPE_MAX_DURATION_MS     800     // anything longer is ignored
 #define TAP_MAX_TRAVEL_PX          15
 #define NAV_COOLDOWN_MS           250     // ignore rapid-fire swipes
@@ -166,25 +166,21 @@ static void my_disp_flush(lv_disp_drv_t *drv, const lv_area_t *area,
 }
 
 static void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
-    // Grace period after wake -- ignore any touch so the wake-up tap
-    // doesn't get forwarded to the watch face / list as a click.
     if (millis() < g_suppress_touch_until) {
         data->state = LV_INDEV_STATE_REL;
         FT3168->IIC_Interrupt_Flag = false;
         return;
     }
-    int32_t x = FT3168->IIC_Read_Device_Value(
-        FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
-    int32_t y = FT3168->IIC_Read_Device_Value(
-        FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
+    
+    int fingers = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
+    int32_t x = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
+    int32_t y = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
 
-    // Poll the IRQ pin level directly rather than only checking the flag.
-    // FT3168 keeps TP_INT pulled LOW the entire time a finger is on the
-    // screen, so a level read gives us reliable press / release / drag
-    // tracking every LVGL frame.  Relying on the IRQ flag alone misses
-    // every position update *during* a drag, which is why swipes weren't
-    // navigating any more.
-    bool pressed = (digitalRead(TP_INT) == LOW) || FT3168->IIC_Interrupt_Flag;
+    if (fingers > 0) {
+        USBSerial.printf("[TOUCH] Fingers: %d at (%d, %d)\n", fingers, x, y);
+    }
+
+    bool pressed = (fingers > 0);
 
     if (pressed) {
         FT3168->IIC_Interrupt_Flag = false;
@@ -205,8 +201,6 @@ static void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
             int32_t dx = tc_x - ts_x;
             int32_t dy = tc_y - ts_y;
             if (dur < SWIPE_MAX_DURATION_MS) {
-                // Horizontal swipe only -- vertical drags pass through so
-                // the apps list can scroll normally.
                 if (abs(dx) > SWIPE_THRESHOLD_PX && abs(dx) > abs(dy)) {
                     g_pending_swipe = (dx < 0) ? SWIPE_LEFT : SWIPE_RIGHT;
                 }
@@ -1182,7 +1176,23 @@ void setup() {
     static_cast<Arduino_CO5300 *>(gfx)->setBrightness(DEFAULT_BRIGHTNESS);
 #endif
 
+    // I2C bus recovery: clock out any stuck transaction before Wire.begin()
+    pinMode(IIC_SCL, OUTPUT);
+    for (int i = 0; i < 9; i++) {
+        digitalWrite(IIC_SCL, LOW); delayMicroseconds(5);
+        digitalWrite(IIC_SCL, HIGH); delayMicroseconds(5);
+    }
+
     Wire.begin(IIC_SDA, IIC_SCL);
+
+    // Touch controller reset pulse
+    pinMode(TP_RESET, OUTPUT);
+    digitalWrite(TP_RESET, LOW);
+    delay(50);
+    digitalWrite(TP_RESET, HIGH);
+    delay(200);
+
+    pinMode(TP_INT, INPUT_PULLUP);
     while (FT3168->begin() == false) { USBSerial.println("FT3168 init fail"); delay(500); }
     FT3168->IIC_Write_Device_State(
         FT3168->Arduino_IIC_Touch::Device::TOUCH_POWER_MODE,
