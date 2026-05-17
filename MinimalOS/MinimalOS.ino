@@ -202,11 +202,16 @@ static void launcher_app_boot() {
 static Preferences g_timeprefs;
 static int32_t     g_gmt_offset_sec = 0;
 static bool        g_time_valid     = false;
+static int8_t      g_shift_x = 0, g_shift_y = 0;   // burn-shift drift (persisted)
+static uint32_t    g_last_ntp_ok    = 0;            // unix-epoch of last good sync
 
 static void time_restore_from_nvs() {
     g_timeprefs.begin("rtcsave", true);
     uint32_t t   = g_timeprefs.getULong("t",   0);
     int32_t  gmt = g_timeprefs.getLong("gmt",  0);
+    g_last_ntp_ok = g_timeprefs.getULong("ntp", 0);
+    g_shift_x = g_timeprefs.getChar("sx", 0);
+    g_shift_y = g_timeprefs.getChar("sy", 0);
     g_timeprefs.end();
     if (t < 1700000000UL) return;
     g_gmt_offset_sec = gmt;
@@ -216,14 +221,48 @@ static void time_restore_from_nvs() {
     Serial.printf("[rtc] restored t=%lu gmt=%ld\n", (unsigned long)t, (long)gmt);
 }
 
-static void time_save_to_nvs() {
+// [17] Atomic save -- time + last NTP timestamp + drift offsets in one commit.
+static void state_save_all() {
     time_t now; time(&now);
-    if (now < 1700000000) return;
     g_timeprefs.begin("rtcsave", false);
-    g_timeprefs.putULong("t",   (uint32_t)now);
-    g_timeprefs.putLong("gmt",  g_gmt_offset_sec);
+    if (now >= 1700000000) {
+        g_timeprefs.putULong("t",   (uint32_t)now);
+        g_timeprefs.putLong ("gmt", g_gmt_offset_sec);
+    }
+    g_timeprefs.putULong("ntp",   g_last_ntp_ok);
+    g_timeprefs.putChar ("sx",    g_shift_x);
+    g_timeprefs.putChar ("sy",    g_shift_y);
     g_timeprefs.end();
 }
+static void time_save_to_nvs() { state_save_all(); }
+
+// [8] Skip NTP if a successful sync happened within the last 6 hours.
+static bool wifi_sync_needed() {
+    if (!g_last_ntp_ok) return true;
+    time_t now; time(&now);
+    if (now < 1700000000) return true;
+    return (uint32_t)now - g_last_ntp_ok > 6UL * 3600UL;
+}
+
+// ---- Power / format config (read from SD) ----------------------------------
+struct PwrCfg {
+    uint32_t t_dim, t_sleep;
+    uint8_t  aod_bright;
+    uint8_t  quiet_start, quiet_end;
+    char     date_fmt[24];
+    float    wrist_z;
+    uint32_t wrist_ms;
+};
+static PwrCfg g_cfg = {
+    /*t_dim*/      4000,
+    /*t_sleep*/   12000,
+    /*aod_bright*/    6,
+    /*quiet_start*/  23,
+    /*quiet_end*/     6,
+    /*date_fmt*/  "%a %d %b",
+    /*wrist_z*/   0.85f,   // [9] less eager
+    /*wrist_ms*/  2500     // [9] longer hold
+};
 
 // =============================================================================
 //  WiFi loader (one-shot NTP only)
@@ -249,7 +288,15 @@ static void wifi_load_from_sd() {
                                g_wifi_list[i-1].ssid = v; }
                 else if (k == pi) g_wifi_list[i-1].pass = v;
             }
-            if (k == "GMT_OFFSET") g_gmt_offset_sec = v.toInt() * 3600;
+            if (k == "GMT_OFFSET")    g_gmt_offset_sec = v.toInt() * 3600;
+            else if (k == "DATE_FMT") { strncpy(g_cfg.date_fmt, v.c_str(), sizeof(g_cfg.date_fmt)-1); g_cfg.date_fmt[sizeof(g_cfg.date_fmt)-1]=0; }
+            else if (k == "T_DIM")    g_cfg.t_dim       = (uint32_t)v.toInt();
+            else if (k == "T_SLEEP")  g_cfg.t_sleep     = (uint32_t)v.toInt();
+            else if (k == "AOD_BRIGHT") g_cfg.aod_bright = (uint8_t)v.toInt();
+            else if (k == "QUIET_START") g_cfg.quiet_start = (uint8_t)v.toInt();
+            else if (k == "QUIET_END")   g_cfg.quiet_end   = (uint8_t)v.toInt();
+            else if (k == "WRIST_Z")  g_cfg.wrist_z     = v.toFloat();
+            else if (k == "WRIST_MS") g_cfg.wrist_ms    = (uint32_t)v.toInt();
         }
         f.close();
     }
@@ -272,7 +319,9 @@ static bool wifi_sync_once() {
                 struct tm tm;
                 if (getLocalTime(&tm, 200)) {
                     g_time_valid = true;
-                    time_save_to_nvs();
+                    time_t nowt; time(&nowt);
+                    g_last_ntp_ok = (uint32_t)nowt;
+                    state_save_all();
                 }
                 WiFi.disconnect(true, true);
                 WiFi.mode(WIFI_OFF);
@@ -367,25 +416,97 @@ static void panel_off() {
 
 static lv_obj_t *scr_root;
 static lv_obj_t *lbl_clock, *lbl_date, *lbl_batt, *lbl_state, *lbl_emerg, *back_btn;
+static lv_obj_t *sleep_btn;           // user-triggered deep-sleep "battery" card
 static lv_obj_t *aod_clock;          // [4] AOD label (separate, tiny, dim)
+static lv_obj_t *toast_lbl = nullptr; // tiny status toast
 
-// [7] burn-shift now includes the back pill
-static int8_t g_shift_x = 0, g_shift_y = 0;
+static int  g_batt_pct  = 100;
+static bool g_emergency = false;
+static bool g_charging  = false;
+
+static void batt_tap_cb(lv_event_t *);                          // [14] forward
+static void show_toast(const char *msg, uint32_t ms);           // forward
+
+// [7] burn-shift now includes the back pill -- drift clamped to +/- 8 px
 static uint32_t g_last_shift = 0;
 static void apply_burn_shift() {
     uint32_t now = millis();
     if (now - g_last_shift < 60000) return;
     g_last_shift = now;
-    g_shift_x = (int8_t)((g_shift_x + 1) % 5 - 2);
-    g_shift_y = (int8_t)((g_shift_y + 2) % 5 - 2);
+    int sx = (int)g_shift_x + ((esp_random() & 1) ? 1 : -1);
+    int sy = (int)g_shift_y + ((esp_random() & 1) ? 1 : -1);
+    if (sx >  8) sx =  8; if (sx < -8) sx = -8;
+    if (sy >  8) sy =  8; if (sy < -8) sy = -8;
+    g_shift_x = (int8_t)sx;
+    g_shift_y = (int8_t)sy;
     lv_obj_align(lbl_clock, LV_ALIGN_CENTER,     g_shift_x,       -40 + g_shift_y);
     lv_obj_align(lbl_date,  LV_ALIGN_CENTER,     g_shift_x,        12 + g_shift_y);
     lv_obj_align(lbl_batt,  LV_ALIGN_TOP_MID,    g_shift_x,        40 + g_shift_y);
     lv_obj_align(lbl_state, LV_ALIGN_BOTTOM_MID, g_shift_x,       -90 + g_shift_y);
     lv_obj_align(back_btn,  LV_ALIGN_BOTTOM_MID, g_shift_x,       -28 + g_shift_y);
+    lv_obj_align(sleep_btn, LV_ALIGN_BOTTOM_MID, g_shift_x,       -92 + g_shift_y);
 }
 
-static void back_btn_cb(lv_event_t *) { return_to_launcher(); }
+// [10] Launcher exit: short tap shows hint, long-press (>=600 ms) confirms.
+static uint32_t g_back_press_t = 0;
+static void back_btn_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        g_back_press_t = millis();
+    } else if (code == LV_EVENT_LONG_PRESSED) {
+        return_to_launcher();
+    } else if (code == LV_EVENT_RELEASED) {
+        uint32_t held = g_back_press_t ? (millis() - g_back_press_t) : 0;
+        g_back_press_t = 0;
+        if (held > 0 && held < 600) show_toast("Hold to exit to Launcher", 1500);
+    }
+}
+
+// -----------------------------------------------------------------------------
+//  Manual deep-sleep (user-triggered via LONG-PRESS of the Sleep card).
+//  - Refuses if battery < 5 % and not charging (#4 brick-prevention).
+//  - RTC slow/fast memory + RTC peripherals stay powered for realtime.
+//  - Wake source: ONLY the BOOT (power) button. Touch is disabled.
+//  - setup() guard requires the button held >=800 ms before resuming.
+// -----------------------------------------------------------------------------
+static void enter_deep_sleep_manual() {
+    // [4] Pre-sleep battery check -- don't brick the watch.
+    if (g_has_pmu && !g_charging && g_batt_pct < 5) {
+        show_toast("Low battery -- charge first", 2500);
+        return;
+    }
+    // Atomic persist of clock + drift + last NTP timestamp.
+    state_save_all();
+
+    // [15] Flush pending UART + LVGL frames instead of arbitrary delay.
+    Serial.flush();
+    lv_refr_now(NULL);
+
+    panel_off();
+
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH,    ESP_PD_OPTION_ON);
+    esp_sleep_enable_ext1_wakeup((1ULL << BOOT_BTN_PIN), ESP_EXT1_WAKEUP_ANY_LOW);
+    esp_deep_sleep_start();
+}
+
+// [2] Short tap on the Sleep card -> AOD (light sleep, instant wake).
+//     Long press (>=900 ms)        -> manual deep sleep.
+static uint32_t g_sleep_press_t = 0;
+static void sleep_btn_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        g_sleep_press_t = millis();
+    } else if (code == LV_EVENT_LONG_PRESSED) {
+        enter_deep_sleep_manual();
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_CLICKED) {
+        uint32_t held = g_sleep_press_t ? (millis() - g_sleep_press_t) : 0;
+        g_sleep_press_t = 0;
+        if (held < 900 && held > 0) {
+            // Short tap -> AOD
+            if (g_state != ST_SLEEP) enter_state(ST_SLEEP);
+        }
+    }
+}
 
 static void build_ui() {
     scr_root = lv_obj_create(NULL);
@@ -397,6 +518,9 @@ static void build_ui() {
     lv_obj_set_style_text_color(lbl_batt, lv_color_hex(COL_MUTE), 0);
     lv_obj_set_style_text_font(lbl_batt, &lv_font_montserrat_14, 0);
     lv_obj_align(lbl_batt, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_add_flag(lbl_batt, LV_OBJ_FLAG_CLICKABLE);                  // [14]
+    lv_obj_set_ext_click_area(lbl_batt, 18);
+    lv_obj_add_event_cb(lbl_batt, batt_tap_cb, LV_EVENT_CLICKED, NULL);
 
     lbl_clock = lv_label_create(scr_root);
     lv_label_set_text(lbl_clock, "--:--");
@@ -438,7 +562,37 @@ static void build_ui() {
     lv_obj_set_style_text_color(bl, lv_color_hex(COL_ACCENT), 0);
     lv_obj_set_style_text_font(bl, &lv_font_montserrat_16, 0);
     lv_obj_center(bl);
-    lv_obj_add_event_cb(back_btn, back_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(back_btn, back_btn_cb, LV_EVENT_PRESSED,      NULL);
+    lv_obj_add_event_cb(back_btn, back_btn_cb, LV_EVENT_LONG_PRESSED, NULL);
+    lv_obj_add_event_cb(back_btn, back_btn_cb, LV_EVENT_RELEASED,     NULL);
+
+    // ---- Sleep card (battery-style) -----------------------------------------
+    //  Tap to enter deep sleep. Hold BOOT/power to wake.
+    sleep_btn = lv_btn_create(scr_root);
+    lv_obj_set_size(sleep_btn, 150, 56);
+    lv_obj_align(sleep_btn, LV_ALIGN_BOTTOM_MID, 0, -92);
+    lv_obj_set_style_bg_color(sleep_btn, lv_color_hex(0x0E0E0E), 0);
+    lv_obj_set_style_border_color(sleep_btn, lv_color_hex(0x39FF7A), 0);
+    lv_obj_set_style_border_width(sleep_btn, 1, 0);
+    lv_obj_set_style_radius(sleep_btn, 10, 0);
+    // Battery "nub" on the right side
+    lv_obj_t *nub = lv_obj_create(sleep_btn);
+    lv_obj_set_size(nub, 6, 22);
+    lv_obj_align(nub, LV_ALIGN_RIGHT_MID, 10, 0);
+    lv_obj_set_style_bg_color(nub, lv_color_hex(0x39FF7A), 0);
+    lv_obj_set_style_border_width(nub, 0, 0);
+    lv_obj_set_style_radius(nub, 2, 0);
+    lv_obj_clear_flag(nub, LV_OBJ_FLAG_CLICKABLE);
+    // Label
+    lv_obj_t *sl = lv_label_create(sleep_btn);
+    lv_label_set_text(sl, LV_SYMBOL_POWER "  Sleep");
+    lv_obj_set_style_text_color(sl, lv_color_hex(0x39FF7A), 0);
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_16, 0);
+    lv_obj_center(sl);
+    // [2] short tap = AOD, long-press (>=900 ms) = deep sleep
+    lv_obj_add_event_cb(sleep_btn, sleep_btn_cb, LV_EVENT_PRESSED,      NULL);
+    lv_obj_add_event_cb(sleep_btn, sleep_btn_cb, LV_EVENT_LONG_PRESSED, NULL);
+    lv_obj_add_event_cb(sleep_btn, sleep_btn_cb, LV_EVENT_RELEASED,     NULL);
 
     // [4] AOD label -- hidden by default, shown only in SLEEP
     aod_clock = lv_label_create(scr_root);
@@ -449,7 +603,30 @@ static void build_ui() {
     lv_obj_align(aod_clock, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_flag(aod_clock, LV_OBJ_FLAG_HIDDEN);
 
+    // Toast label for short status messages (low-batt, wake reason, etc.)
+    toast_lbl = lv_label_create(scr_root);
+    lv_label_set_text(toast_lbl, "");
+    lv_obj_set_style_text_color(toast_lbl, lv_color_hex(COL_TXT), 0);
+    lv_obj_set_style_text_font(toast_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(toast_lbl, LV_ALIGN_TOP_MID, 0, 6);
+    lv_obj_add_flag(toast_lbl, LV_OBJ_FLAG_HIDDEN);
+
     lv_scr_load(scr_root);
+}
+
+// ---- Toast (auto-hide) ------------------------------------------------------
+static uint32_t g_toast_hide_at = 0;
+static void show_toast(const char *msg, uint32_t ms) {
+    if (!toast_lbl) return;
+    lv_label_set_text(toast_lbl, msg);
+    lv_obj_clear_flag(toast_lbl, LV_OBJ_FLAG_HIDDEN);
+    g_toast_hide_at = millis() + ms;
+}
+static void tick_toast() {
+    if (g_toast_hide_at && millis() >= g_toast_hide_at) {
+        lv_obj_add_flag(toast_lbl, LV_OBJ_FLAG_HIDDEN);
+        g_toast_hide_at = 0;
+    }
 }
 
 // =============================================================================
@@ -469,8 +646,8 @@ static void update_clock(bool force = false) {
         return;
     }
     char t[8], d[24];
-    strftime(t, sizeof(t), "%H:%M",      &tm);
-    strftime(d, sizeof(d), "%a %d %b",   &tm);
+    strftime(t, sizeof(t), "%H:%M",        &tm);
+    strftime(d, sizeof(d), g_cfg.date_fmt, &tm);    // [13] configurable
     if (force || strcmp(t, g_last_hhmm) != 0) {
         strcpy(g_last_hhmm, t);
         lv_label_set_text(lbl_clock, t);
@@ -482,17 +659,23 @@ static void update_clock(bool force = false) {
     }
 }
 
-static int  g_batt_pct  = 100;
-static bool g_emergency = false;
-static bool g_charging  = false;
+// [11] color ramp
+static uint32_t batt_color() {
+    if (g_emergency)       return COL_DANGER;
+    if (g_batt_pct >= 60)  return 0x39FF7A;     // green
+    if (g_batt_pct >= 30)  return 0xFFD24A;     // yellow
+    if (g_batt_pct >= 15)  return 0xFF8A2A;     // orange
+    return COL_DANGER;
+}
 
 static void update_battery() {
     if (!g_has_pmu) return;
     g_batt_pct = g_pmu.getBatteryPercent();
     g_charging = g_pmu.isCharging();
-    char b[16];
-    if (g_charging) snprintf(b, sizeof(b), "%d%%  CHG", g_batt_pct);
-    else            snprintf(b, sizeof(b), "%d%%",      g_batt_pct);
+    char b[24];
+    // [12] charging glyph (LV_SYMBOL_CHARGE = lightning)
+    if (g_charging) snprintf(b, sizeof(b), "%s %d%%", LV_SYMBOL_CHARGE, g_batt_pct);
+    else            snprintf(b, sizeof(b), "%d%%",    g_batt_pct);
     lv_label_set_text(lbl_batt, b);
 
     bool new_emerg = (g_batt_pct < 5 && !g_charging);
@@ -500,9 +683,20 @@ static void update_battery() {
         g_emergency = new_emerg;
         if (g_emergency) lv_obj_clear_flag(lbl_emerg, LV_OBJ_FLAG_HIDDEN);
         else             lv_obj_add_flag  (lbl_emerg, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_text_color(lbl_batt,
-            lv_color_hex(g_emergency ? COL_DANGER : COL_MUTE), 0);
     }
+    // [11] update color every tick (cheap)
+    lv_obj_set_style_text_color(lbl_batt, lv_color_hex(batt_color()), 0);
+}
+
+// [14] Tap the battery label to cycle brightness 60 -> 120 -> 200 -> 60
+static void batt_tap_cb(lv_event_t *) {
+    if (g_state != ST_ACTIVE) return;
+    static const uint8_t levels[] = { 60, 120, 200 };
+    static uint8_t idx = 2;
+    idx = (idx + 1) % 3;
+    co5300_set_brightness(levels[idx]);
+    char m[24]; snprintf(m, sizeof(m), "Brightness %u%%", (unsigned)(levels[idx] * 100u / 255u));
+    show_toast(m, 900);
 }
 
 static void set_state_label() {
@@ -530,6 +724,8 @@ static void aod_show()  {
     lv_obj_add_flag  (lbl_batt,  LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag  (lbl_state, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag  (back_btn,  LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag  (sleep_btn, LV_OBJ_FLAG_HIDDEN);
+    if (toast_lbl)   lv_obj_add_flag(toast_lbl, LV_OBJ_FLAG_HIDDEN);
     if (g_emergency) lv_obj_add_flag(lbl_emerg, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(aod_clock, LV_OBJ_FLAG_HIDDEN);
     aod_reposition();
@@ -541,6 +737,7 @@ static void aod_hide()  {
     lv_obj_clear_flag(lbl_batt,  LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(lbl_state, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(back_btn,  LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(sleep_btn, LV_OBJ_FLAG_HIDDEN);
     if (g_emergency) lv_obj_clear_flag(lbl_emerg, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -569,18 +766,23 @@ static void enter_state(int s_int) {
             aod_show();
             update_clock(true);
             lv_refr_now(NULL);
-            co5300_set_brightness(g_emergency ? 3 : 6);
+            co5300_set_brightness(g_emergency ? 3 : g_cfg.aod_bright);
             setCpuFrequencyMhz(40);
             break;
         case ST_DEEP:
-            panel_off();
-            time_save_to_nvs();
-            esp_sleep_enable_ext1_wakeup(
-                (1ULL << BOOT_BTN_PIN) | (1ULL << TP_INT),
-                ESP_EXT1_WAKEUP_ANY_LOW);
-            esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
-            delay(50);
-            esp_deep_sleep_start();
+            // DEEP SLEEP DISABLED — fall through to ST_SLEEP (AOD) instead,
+            // so the watch stays reachable and you can exit to the launcher.
+            // Original deep-sleep code removed intentionally.
+            g_state = ST_SLEEP;
+            lv_obj_add_flag(lbl_clock,   LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(lbl_date,    LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(lbl_batt,    LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(lbl_state,   LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(aod_clock, LV_OBJ_FLAG_HIDDEN);
+            update_clock(true);
+            lv_refr_now(NULL);
+            co5300_set_brightness(g_emergency ? 3 : 6);
+            setCpuFrequencyMhz(40);
             break;
     }
 }
@@ -606,9 +808,9 @@ static uint32_t g_wristdown_since = 0;
 static void check_wrist_down() {
     if (!g_has_imu) return;
     float z = qmi_read_z();
-    if (z > 0.7f) {
+    if (z > g_cfg.wrist_z) {                                // [9] tunable
         if (!g_wristdown_since) g_wristdown_since = millis();
-        else if (millis() - g_wristdown_since > 1500
+        else if (millis() - g_wristdown_since > g_cfg.wrist_ms
                  && g_state == ST_ACTIVE) {
             Serial.println("[imu] wrist down -> SLEEP");
             enter_state(ST_SLEEP);
@@ -622,50 +824,113 @@ static void check_wrist_down() {
 static bool in_quiet_hours() {
     struct tm tm;
     if (!g_time_valid || !getLocalTime(&tm, 5)) return false;
-    return (tm.tm_hour >= 23 || tm.tm_hour < 6);
+    uint8_t qs = g_cfg.quiet_start, qe = g_cfg.quiet_end;
+    if (qs == qe) return false;
+    if (qs < qe) return (tm.tm_hour >= qs && tm.tm_hour < qe);
+    return (tm.tm_hour >= qs || tm.tm_hour < qe);   // wraps midnight
 }
 
 // =============================================================================
 //  setup / loop
 // =============================================================================
+// [18] BOOT-button hardware interrupt -- lets the loop break out of LVGL work
+// immediately when the user presses power. Polling still continues in loop()
+// to measure hold-duration for the launcher-exit gesture.
+static volatile bool g_boot_irq = false;
+static void IRAM_ATTR boot_isr() { g_boot_irq = true; }
+
 void setup() {
+    // ---- Hold-to-wake guard ------------------------------------------------
+    // If we just woke from manual deep sleep (BOOT button), require the user
+    // to KEEP HOLDING the button for >=800 ms. A short accidental press will
+    // send us straight back to deep sleep.
+    pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+    esp_sleep_wakeup_cause_t wcause = esp_sleep_get_wakeup_cause();
+    bool woke_from_deep = (wcause == ESP_SLEEP_WAKEUP_EXT1);
+    if (woke_from_deep) {
+        uint32_t held_start = millis();
+        bool ok = false;
+        while (millis() - held_start < 1200) {
+            if (digitalRead(BOOT_BTN_PIN) != LOW) break;        // released early
+            if (millis() - held_start >= 800) { ok = true; break; }
+            delay(10);
+        }
+        if (!ok) {
+            // Not a real wake -- go straight back to deep sleep.
+            esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH,   ESP_PD_OPTION_ON);
+            esp_sleep_enable_ext1_wakeup((1ULL << BOOT_BTN_PIN), ESP_EXT1_WAKEUP_ANY_LOW);
+            esp_deep_sleep_start();
+        }
+        // Wait for button release before continuing into normal boot, so the
+        // launcher-exit BOOT-hold logic doesn't immediately re-trigger.
+        while (digitalRead(BOOT_BTN_PIN) == LOW) delay(10);
+    }
+
     launcher_app_boot();
     qmi_init();
     time_restore_from_nvs();        // [1]
+    wifi_load_from_sd();            // [16] preload config (incl. [power] block)
 
     build_ui();
+
+    // [6] Wake confirmation flash -- short white blink so the user knows
+    //     the hold-to-wake registered before the clock fades in.
+    if (woke_from_deep) {
+        gfx->fillScreen(0xFFFF);
+        co5300_set_brightness(180);
+        delay(60);
+        co5300_set_brightness(0);
+        gfx->fillScreen(0x0000);
+    }
+
     update_battery();
     update_clock(true);
 
-    // Manual CPU scaling -- portable across ESP32 Arduino core versions.
-    // (Light-sleep in the SLEEP state below covers most of the same wins
-    //  that esp_pm_configure() would give, without the IDF-version dance.)
     setCpuFrequencyMhz(160);
 
-    // One-shot NTP only if we don't already have a valid time
-    if (!g_time_valid) {
+    // [8] One-shot NTP only if we don't already have a fresh sync.
+    if (!g_time_valid || wifi_sync_needed()) {
         Serial.println("[minimal] syncing time...");
         wifi_sync_once();
         update_clock(true);
     } else {
-        Serial.println("[minimal] using NVS-restored time, skipping wifi");
+        Serial.println("[minimal] fresh NVS time, skipping wifi");
     }
 
     enter_state(ST_ACTIVE);
     g_last_touch_t = millis();
+
+    // [7] Wake-reason toast for 3 s
+    const char *wr = "WOKE: POWER";
+    switch (wcause) {
+        case ESP_SLEEP_WAKEUP_EXT1:  wr = "WOKE: POWER";  break;
+        case ESP_SLEEP_WAKEUP_TIMER: wr = "WOKE: TIMER";  break;
+        case ESP_SLEEP_WAKEUP_TOUCHPAD: wr = "WOKE: TOUCH"; break;
+        case ESP_SLEEP_WAKEUP_UNDEFINED: wr = "BOOT: COLD"; break;
+        default: wr = "BOOT"; break;
+    }
+    show_toast(wr, 3000);
+
+    // [18] arm the BOOT-button ISR (level-triggered low isn't supported on
+    //     classic ESP32 attachInterrupt; FALLING covers the press edge).
+    attachInterrupt(digitalPinToInterrupt(BOOT_BTN_PIN), boot_isr, FALLING);
 }
 
 void loop() {
     uint32_t now = millis();
 
     lv_timer_handler();
+    tick_toast();
 
-    // BOOT-button safety exit
+    // BOOT-button safety exit (long hold = exit to launcher)
     static uint32_t btn_t = 0;
     if (digitalRead(BOOT_BTN_PIN) == LOW) {
         if (!btn_t) btn_t = now;
         else if (now - btn_t > 1500) return_to_launcher();
     } else btn_t = 0;
+    // [18] clear the latched ISR flag (just informational; loop already
+    //      acts on digitalRead above for hold-duration measurement).
+    if (g_boot_irq) g_boot_irq = false;
 
     check_touch_wake();
     if (g_touch_pressed_now) { g_last_touch_t = now; instant_wake(); }
@@ -687,20 +952,21 @@ void loop() {
             g_last_aod_move = now;
             aod_reposition();                           // [4]
         }
-        if (g_time_valid && now - g_last_save >= 300000UL) {
+        // [3] persist clock + drift every 60 s
+        if (g_time_valid && now - g_last_save >= 60000UL) {
             g_last_save = now;
-            time_save_to_nvs();
+            state_save_all();
         }
     }
 
-    // [8] Quiet-hours override
+    // [8] Quiet-hours override (deep disabled, only adjusts dim/sleep timing)
     bool quiet = in_quiet_hours() && !g_charging;
-    uint32_t t_dim   = (g_emergency ?  3000 :  4000);
-    uint32_t t_sleep = (g_emergency ?  8000 : 12000);
-    uint32_t t_deep  = (quiet       ?  5000 : (g_emergency ? 30000 : 60000));
+    uint32_t t_dim   = (g_emergency ?  3000 : g_cfg.t_dim);
+    uint32_t t_sleep = (g_emergency ?  8000 : g_cfg.t_sleep);
+    if (quiet) { t_dim = 2500; t_sleep = 5000; }
 
-    if      (idle >= t_deep  && g_state != ST_DEEP)   enter_state(ST_DEEP);
-    else if (idle >= t_sleep && g_state == ST_DIM)    enter_state(ST_SLEEP);
+    // DEEP sleep disabled -- only DIM and SLEEP (AOD) transitions remain.
+    if      (idle >= t_sleep && g_state == ST_DIM)    enter_state(ST_SLEEP);
     else if (idle >= t_dim   && g_state == ST_ACTIVE) enter_state(ST_DIM);
 
     // [3] Real light-sleep while in SLEEP/AOD -- TP_INT poll on timer wake.
