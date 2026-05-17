@@ -853,12 +853,50 @@ static void refresh_wallpaper() {
     lv_obj_invalidate(face_bg_img);
 }
 
-static void face_tap_cb(lv_event_t *e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;   // post-swipe click-guard
+// ---- wallpaper persistence + long-press cycling -----------------------
+// wp_idx is stashed in the same "dcw" Preferences namespace already used
+// by the favourites list, so it survives reboots AND is visible to any
+// other app that wants to honour the last-chosen wallpaper.
+static const uint32_t FACE_LONG_PRESS_MS = 1000;
+static uint32_t g_face_press_ms   = 0;
+static bool     g_face_long_fired = false;
+
+static void save_wp_idx() {
+    g_prefs.begin("dcw", false);
+    g_prefs.putInt("wp_idx", g_photo_idx);
+    g_prefs.end();
+}
+
+static void cycle_wallpaper_and_save() {
     if (!g_photo_count) return;
     g_photo_idx = (g_photo_idx + 1) % g_photo_count;
     refresh_wallpaper();
+    save_wp_idx();
+}
+
+// Single handler subscribed to LV_EVENT_ALL.  Short click and ~1 s
+// tap-and-hold both cycle the wallpaper forward and persist wp_idx.
+// The long-press path latches g_face_long_fired so the trailing
+// CLICKED on release doesn't double-cycle.
+static void face_tap_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+
+    if (code == LV_EVENT_PRESSED) {
+        g_face_press_ms   = millis();
+        g_face_long_fired = false;
+    } else if (code == LV_EVENT_PRESSING) {
+        if (!g_face_long_fired && g_face_press_ms &&
+            millis() - g_face_press_ms >= FACE_LONG_PRESS_MS) {
+            g_face_long_fired = true;
+            cycle_wallpaper_and_save();
+        }
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        g_face_press_ms = 0;
+    } else if (code == LV_EVENT_CLICKED) {
+        if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;   // post-swipe guard
+        if (g_face_long_fired) { g_face_long_fired = false; return; } // long-press already cycled
+        cycle_wallpaper_and_save();
+    }
 }
 
 static void update_face_time() {
@@ -936,7 +974,9 @@ static void build_screen_face() {
     lv_obj_set_style_border_width(tap, 0, 0);
     lv_obj_add_flag(tap, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(tap, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(tap, face_tap_cb, LV_EVENT_CLICKED, NULL);
+    // LV_EVENT_ALL so we see PRESSED / PRESSING / RELEASED / CLICKED --
+    // tap cycles wallpaper, ~1 s tap-and-hold also cycles + persists.
+    lv_obj_add_event_cb(tap, face_tap_cb, LV_EVENT_ALL, NULL);
 
     // Translucent time
     face_time = lv_label_create(s);
@@ -2119,6 +2159,18 @@ void setup() {
         }
         splash_progress(82, "scanning apps");    scan_apps();
         splash_progress(92, "scanning photos");  scan_photos();
+        // Restore the last-used wallpaper index so the watch face -- and
+        // any app that reads "wp_idx" from the same Preferences namespace
+        // -- picks up where we left off.
+        {
+            g_prefs.begin("dcw", true);
+            int saved_wp = g_prefs.getInt("wp_idx", 0);
+            g_prefs.end();
+            if (g_photo_count > 0) {
+                if (saved_wp < 0 || saved_wp >= g_photo_count) saved_wp = 0;
+                g_photo_idx = saved_wp;
+            }
+        }
     } else {
         splash_progress(50, "SD mount failed");  delay(800);
     }

@@ -40,6 +40,7 @@
 #include "XPowersLib.h"
 
 #include <esp_ota_ops.h>
+#include <esp_partition.h>
 #include <esp_system.h>
 #include <esp_sleep.h>
 #include <esp_bt.h>
@@ -127,9 +128,23 @@ static void pmu_init() {
 }
 
 // ---- Back-to-launcher (mandatory) -------------------------------------------
+// LauncherOS lives in the `factory` partition (see partitions.csv), and this
+// app lives in `ota_0`.  esp_ota_get_next_update_partition() ONLY walks the
+// ota_X slots and skips `factory`, so with our single-OTA layout it would
+// return ota_0 itself -- i.e. the running app -- and the watch would reboot
+// straight back into us.  Target the factory partition explicitly instead.
 static void return_to_launcher() {
-    const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
-    if (other) esp_ota_set_boot_partition(other);
+    const esp_partition_t *factory = esp_partition_find_first(
+        ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
+    if (factory) {
+        esp_ota_set_boot_partition(factory);
+    } else {
+        // Fallback for builds that still use a 2-OTA layout (no factory).
+        const esp_partition_t *other = esp_ota_get_next_update_partition(NULL);
+        if (other && other != esp_ota_get_running_partition()) {
+            esp_ota_set_boot_partition(other);
+        }
+    }
     delay(80);
     esp_restart();
 }
