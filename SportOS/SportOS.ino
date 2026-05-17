@@ -99,6 +99,38 @@ static void lv_touch(lv_indev_drv_t*,lv_indev_data_t*d){
     int f=FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
     if(f>0){d->state=LV_INDEV_STATE_PR;d->point.x=x;d->point.y=y;}else d->state=LV_INDEV_STATE_REL;}
 
+
+// =====================================================================
+//  3-CARD SWIPE LOOP forward decls + globals  (full bodies near setup())
+// =====================================================================
+#define SCREEN_FACE             0
+#define SCREEN_APPS             1
+#define SCREEN_BATTERY          2
+#define NUM_SCREENS             3
+#define SWIPE_THRESHOLD_PX      25
+#define SWIPE_MAX_DURATION_MS   800
+#define TAP_THRESHOLD_PX        20
+#define CLICK_AFTER_SWIPE_MS    350
+#define SCREEN_SWITCH_ANIM_MS   140
+
+static lv_obj_t *screens[NUM_SCREENS] = { nullptr, nullptr, nullptr };
+static int       current_screen   = SCREEN_FACE;
+static int32_t   ts_x=0, ts_y=0, tc_x=0, tc_y=0;
+static uint32_t  ts_ms=0;
+static bool      touchActive=false;
+static uint32_t  lastSwipeMs=0;
+static volatile int g_pending_swipe = 0;
+static lv_obj_t *g_transient_screen = nullptr;
+static bool      g_apps_built = false;
+
+static void lv_touch_gesture(lv_indev_drv_t *, lv_indev_data_t *d);
+static void goto_screen(int s);
+static void build_screen_face();
+static void build_screen_apps();
+static void build_screen_battery();
+static void update_battery_screen();
+static void open_app_screen(lv_obj_t *s);
+
 static void return_to_launcher(){
     // Boot the FACTORY partition (where LauncherOS lives).  Using
     // esp_ota_get_next_update_partition() alone skips the factory slot,
@@ -231,33 +263,7 @@ static void wf_upd(lv_timer_t*){
     if(wf_clk) lv_label_set_text(wf_clk,t);
     if(wf_dt)  lv_label_set_text(wf_dt,d);
 }
-static void open_watchface(){
-    lv_obj_t *s=lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(s,lv_color_hex(0x000000),0); lv_obj_set_style_bg_opa(s,LV_OPA_COVER,0);
-    lv_obj_clear_flag(s,LV_OBJ_FLAG_SCROLLABLE);
-    make_wallpaper_bg(s);
-    wf_clk=lv_label_create(s); lv_label_set_text(wf_clk,"--:--");
-    lv_obj_set_style_text_color(wf_clk,lv_color_hex(0xFFFFFF),0);
-    lv_obj_set_style_text_font(wf_clk,&lv_font_montserrat_48,0);
-    lv_obj_set_style_text_opa(wf_clk,235,0);
-    lv_obj_align(wf_clk,LV_ALIGN_CENTER,0,-30);
-    wf_dt=lv_label_create(s); lv_label_set_text(wf_dt,"no sync");
-    lv_obj_set_style_text_color(wf_dt,lv_color_hex(0xBBBBBB),0);
-    lv_obj_set_style_text_font(wf_dt,&lv_font_montserrat_18,0);
-    lv_obj_align(wf_dt,LV_ALIGN_CENTER,0,20);
-    lv_obj_t *hint=lv_label_create(s); lv_label_set_text(hint,"tap anywhere to go back");
-    lv_obj_set_style_text_color(hint,lv_color_hex(0x666666),0);
-    lv_obj_set_style_text_font(hint,&lv_font_montserrat_12,0);
-    lv_obj_set_style_text_letter_space(hint,2,0);
-    lv_obj_align(hint,LV_ALIGN_BOTTOM_MID,0,-40);
-    lv_obj_add_event_cb(s,[](lv_event_t*){
-        if(wf_tk){ lv_timer_del(wf_tk); wf_tk=nullptr; }
-        open_home_wrap();
-    },LV_EVENT_CLICKED,NULL);
-    if(wf_tk) lv_timer_del(wf_tk);
-    wf_tk=lv_timer_create(wf_upd,1000,NULL); wf_upd(nullptr);
-    lv_scr_load_anim(s,LV_SCR_LOAD_ANIM_FADE_IN,250,0,true);
-}
+static void open_watchface() { if (!screens[SCREEN_FACE]) build_screen_face(); goto_screen(SCREEN_FACE); }
 
 struct WifiCred{String ssid,pass;};
 static WifiCred g_creds[6]; static int g_creds_n=0; static int g_gmt=0; static bool g_wifi_synced=false;
@@ -318,7 +324,7 @@ static void hw_boot(){
     lv_disp_draw_buf_init(&g_db,g_lvbuf,NULL,px);
     lv_disp_drv_init(&g_dd); g_dd.flush_cb=lv_flush; g_dd.draw_buf=&g_db; g_dd.hor_res=LCD_W; g_dd.ver_res=LCD_H;
     lv_disp_drv_register(&g_dd);
-    lv_indev_drv_init(&g_id); g_id.type=LV_INDEV_TYPE_POINTER; g_id.read_cb=lv_touch;
+    lv_indev_drv_init(&g_id); g_id.type=LV_INDEV_TYPE_POINTER; g_id.read_cb=lv_touch_gesture;
     lv_indev_drv_register(&g_id);
     SD_MMC.setPins(SDMMC_CLK,SDMMC_CMD,SDMMC_DATA); SD_MMC.begin("/sdcard",true);
     sd_ensure_dirs(); load_wifi_config();
@@ -415,6 +421,7 @@ static void make_top_strip(lv_obj_t *p){
     lv_obj_align(g_date_lbl,LV_ALIGN_TOP_MID,0,98);
 }
 static void tick_top(){
+    if (!g_batt_fill || !lv_obj_is_valid(g_batt_fill)) return;
     if(g_has_pmu){
         int pct=g_pmu.getBatteryPercent(); bool ch=g_pmu.isCharging();
         uint32_t c=pct<15?0xFF4040:pct<30?0xFFB300:0x00E5FF;
@@ -647,7 +654,7 @@ static void open_workout_active(){
 
     if(aw_t) lv_timer_del(aw_t);
     aw_t=lv_timer_create(aw_tick,250,NULL);
-    lv_scr_load_anim(s,LV_SCR_LOAD_ANIM_FADE_IN,200,0,true);
+    open_app_screen(s);
 }
 
 static void log_session_csv(){
@@ -716,7 +723,7 @@ static void open_summary(int xp_gain){
     lv_obj_set_style_text_letter_space(hl,3,0); lv_obj_center(hl);
     lv_obj_add_event_cb(home,[](lv_event_t*){ open_home(); },LV_EVENT_CLICKED,NULL);
 
-    lv_scr_load_anim(s,LV_SCR_LOAD_ANIM_FADE_IN,300,0,true);
+    open_app_screen(s);
 }
 
 static void finish_workout(){
@@ -783,7 +790,7 @@ static void open_pace_picker(){
         WK.steps=0; WK.km=0; last_step_tick=millis();
         open_workout_active();
     },LV_EVENT_CLICKED,NULL);
-    lv_scr_load_anim(s,LV_SCR_LOAD_ANIM_FADE_IN,250,0,true);
+    open_app_screen(s);
 }
 
 // =====================================================================
@@ -849,7 +856,7 @@ static void open_stats(){
     lv_obj_set_style_text_font(hl,&lv_font_montserrat_16,0);
     lv_obj_set_style_text_letter_space(hl,3,0); lv_obj_center(hl);
     lv_obj_add_event_cb(hm,[](lv_event_t*){ open_home(); },LV_EVENT_CLICKED,NULL);
-    lv_scr_load_anim(s,LV_SCR_LOAD_ANIM_FADE_IN,250,0,true);
+    open_app_screen(s);
 }
 
 // =====================================================================
@@ -861,62 +868,617 @@ static void start_workout_simple(WType t){
     WK.hiit_phase=0; WK.hiit_phase_start=millis();
     open_workout_active();
 }
-static void open_home(){
-    lv_obj_t *s=lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(s,lv_color_hex(0x000000),0); lv_obj_set_style_bg_opa(s,LV_OPA_COVER,0);
-    lv_obj_clear_flag(s,LV_OBJ_FLAG_SCROLLABLE);
-    make_wallpaper_bg(s);
-    make_top_strip(s);
-
-    lv_obj_t *title=lv_label_create(s); lv_label_set_text(title,"SPORT//OS");
-    lv_obj_set_style_text_color(title,lv_color_hex(ACCENT_SPORT),0);
-    lv_obj_set_style_text_font(title,&lv_font_montserrat_22,0);
-    lv_obj_set_style_text_letter_space(title,4,0);
-    lv_obj_align(title,LV_ALIGN_TOP_MID,0,135);
-
-    auto tile=[&](const char *t,uint32_t accent,int idx,lv_event_cb_t cb){
-        lv_obj_t *b=lv_btn_create(s);
-        lv_obj_set_size(b,330,46); lv_obj_align(b,LV_ALIGN_CENTER,0,-100+idx*52);
-        lv_obj_set_style_bg_color(b,lv_color_hex(0x0E0E0E),0);
-        lv_obj_set_style_border_color(b,lv_color_hex(accent),0);
-        lv_obj_set_style_border_width(b,1,0); lv_obj_set_style_radius(b,14,0);
-        lv_obj_t *l=lv_label_create(b); lv_label_set_text(l,t);
-        lv_obj_set_style_text_color(l,lv_color_hex(0xFFFFFF),0);
-        lv_obj_set_style_text_font(l,&lv_font_montserrat_18,0);
-        lv_obj_set_style_text_letter_space(l,3,0);
-        lv_obj_align(l,LV_ALIGN_LEFT_MID,20,0);
-        lv_obj_t *dot=lv_obj_create(b); lv_obj_remove_style_all(dot);
-        lv_obj_set_size(dot,6,6); lv_obj_align(dot,LV_ALIGN_RIGHT_MID,-22,0);
-        lv_obj_set_style_radius(dot,3,0); lv_obj_set_style_bg_opa(dot,LV_OPA_COVER,0);
-        lv_obj_set_style_bg_color(dot,lv_color_hex(accent),0);
-        lv_obj_add_event_cb(b,cb,LV_EVENT_CLICKED,NULL);
-    };
-    tile("WATCH FACE", 0x00E5FF, 0, [](lv_event_t*){ open_watchface(); });
-    tile("RUN",   ACCENT_SPORT, 1, [](lv_event_t*){ open_pace_picker(); });
-    tile("WALK",  ACCENT_CYAN,  2, [](lv_event_t*){ start_workout_simple(W_WALK); });
-    tile("CYCLE", 0xFFB300,     3, [](lv_event_t*){ start_workout_simple(W_CYCLE); });
-    tile("HIIT",  0xFF4040,     4, [](lv_event_t*){ start_workout_simple(W_HIIT); });
-    tile("STATS", 0xFF2EC4,     5, [](lv_event_t*){ open_stats(); });
-
-    make_back_card(s);
-
-    lv_scr_load_anim(s,LV_SCR_LOAD_ANIM_FADE_IN,300,0,true);
-}
+static void open_home() { if (!g_apps_built) build_screen_apps(); goto_screen(SCREEN_APPS); }
 
 // resolves open_watchface()'s home call to this OS's home screen
 static void open_home_wrap(){ open_home(); }
 
 // =====================================================================
-void setup(){
+
+// =====================================================================
+//  3-CARD SWIPE LOOP full bodies (Face <-> Apps <-> Battery)
+// =====================================================================
+static void lv_touch_gesture(lv_indev_drv_t *, lv_indev_data_t *d) {
+    int32_t x = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
+    int32_t y = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
+    int     f = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
+    bool pressed = (f > 0);
+    static int zero_streak = 0;
+    if (pressed) zero_streak = 0;
+    else if (touchActive) {
+        zero_streak++;
+        if (zero_streak < 3) { pressed = true; x = tc_x; y = tc_y; }
+    }
+    if (pressed) {
+        d->state = LV_INDEV_STATE_PR;
+        d->point.x = x; d->point.y = y;
+        if (!touchActive) { touchActive = true; ts_x=x; ts_y=y; ts_ms=millis(); }
+        tc_x = x; tc_y = y;
+    } else {
+        d->state = LV_INDEV_STATE_REL;
+        if (touchActive) {
+            touchActive = false;
+            uint32_t dur = millis() - ts_ms;
+            int32_t dx = tc_x - ts_x;
+            int32_t dy = tc_y - ts_y;
+            if (dur < SWIPE_MAX_DURATION_MS &&
+                abs(dx) > SWIPE_THRESHOLD_PX && abs(dx) > abs(dy)) {
+                g_pending_swipe = (dx < 0) ? +1 : -1;
+            }
+        }
+    }
+}
+
+static void goto_screen(int s) {
+    while (s < 0)             s += NUM_SCREENS;
+    while (s >= NUM_SCREENS)  s -= NUM_SCREENS;
+    if (s == current_screen)  return;
+    current_screen  = s;
+    g_pending_swipe = 0;
+    if (g_transient_screen) {
+        lv_obj_del_async(g_transient_screen);
+        g_transient_screen = nullptr;
+    }
+    if (screens[s])
+        lv_scr_load_anim(screens[s], LV_SCR_LOAD_ANIM_FADE_ON,
+                         SCREEN_SWITCH_ANIM_MS, 0, false);
+}
+
+static void open_app_screen(lv_obj_t *s) {
+    lv_obj_t *prev = g_transient_screen;
+    g_transient_screen = s;
+    lv_scr_load_anim(s, LV_SCR_LOAD_ANIM_FADE_ON, 250, 0, false);
+    if (prev) lv_obj_del_async(prev);
+}
+
+static lv_obj_t *batt_arc=nullptr, *batt_pct_lbl=nullptr;
+static lv_obj_t *batt_state=nullptr, *batt_remain=nullptr;
+static lv_obj_t *batt_volt=nullptr;
+
+static int batt_remain_min_estimate(int pct) {
+    if (pct <= 0) return 0;
+    return (pct * 360) / 100;
+}
+
+static void update_battery_screen() {
+    if (!batt_arc || !g_has_pmu) return;
+    int pct = g_pmu.getBatteryPercent();
+    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    lv_arc_set_value(batt_arc, pct);
+    char b[16]; snprintf(b, 16, "%d%%", pct);
+    lv_label_set_text(batt_pct_lbl, b);
+    uint32_t col = pct<=15 ? 0xFF4040 : pct<=30 ? 0xFFB300 : 0x00FF80;
+    lv_obj_set_style_arc_color(batt_arc, lv_color_hex(col), LV_PART_INDICATOR);
+    lv_obj_set_style_text_color(batt_pct_lbl, lv_color_hex(col), 0);
+    bool charging = g_pmu.isCharging();
+    if (charging) {
+        lv_label_set_text(batt_state, LV_SYMBOL_CHARGE "  charging");
+        lv_obj_set_style_text_color(batt_state, lv_color_hex(0x00E5FF), 0);
+        lv_label_set_text(batt_remain, "");
+    } else {
+        lv_label_set_text(batt_state, "on battery");
+        lv_obj_set_style_text_color(batt_state, lv_color_hex(0xBBBBBB), 0);
+        int mins = batt_remain_min_estimate(pct);
+        char r[48];
+        int h = mins/60, m = mins%60;
+        if (h>0) snprintf(r,48,"~ %d h %02d min remaining", h, m);
+        else     snprintf(r,48,"~ %d min remaining", m);
+        lv_label_set_text(batt_remain, r);
+    }
+    float mv = g_pmu.getBattVoltage();
+    char v[32]; snprintf(v, 32, "%.2f V", mv/1000.0f);
+    lv_label_set_text(batt_volt, v);
+}
+
+static void build_screen_battery() {
+    lv_obj_t *s = lv_obj_create(NULL);
+    screens[SCREEN_BATTERY] = s;
+    lv_obj_set_style_bg_color(s, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(s);
+    lv_label_set_text(title, "Battery");
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 24, 22);
+
+    lv_obj_t *sub = lv_label_create(s);
+    lv_label_set_text(sub, "AXP2101");
+    lv_obj_set_style_text_color(sub, lv_color_hex(0x00E5FF), 0);
+    lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
+    lv_obj_align(sub, LV_ALIGN_TOP_LEFT, 24, 50);
+
+    batt_arc = lv_arc_create(s);
+    lv_obj_set_size(batt_arc, 280, 280);
+    lv_obj_align(batt_arc, LV_ALIGN_CENTER, 0, -10);
+    lv_arc_set_rotation(batt_arc, 135);
+    lv_arc_set_bg_angles(batt_arc, 0, 270);
+    lv_arc_set_range(batt_arc, 0, 100);
+    lv_arc_set_value(batt_arc, 0);
+    lv_obj_remove_style(batt_arc, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(batt_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_color(batt_arc, lv_color_hex(0x141414), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(batt_arc, 14, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(batt_arc, lv_color_hex(0x00FF80), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(batt_arc, 14, LV_PART_INDICATOR);
+
+    batt_pct_lbl = lv_label_create(s);
+    lv_label_set_text(batt_pct_lbl, "--%");
+    lv_obj_set_style_text_color(batt_pct_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(batt_pct_lbl, &lv_font_montserrat_48, 0);
+    lv_obj_align(batt_pct_lbl, LV_ALIGN_CENTER, 0, -10);
+
+    batt_state = lv_label_create(s);
+    lv_label_set_text(batt_state, "on battery");
+    lv_obj_set_style_text_color(batt_state, lv_color_hex(0xBBBBBB), 0);
+    lv_obj_set_style_text_font(batt_state, &lv_font_montserrat_18, 0);
+    lv_obj_align(batt_state, LV_ALIGN_CENTER, 0, 90);
+
+    batt_remain = lv_label_create(s);
+    lv_label_set_text(batt_remain, "");
+    lv_obj_set_style_text_color(batt_remain, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(batt_remain, &lv_font_montserrat_16, 0);
+    lv_obj_align(batt_remain, LV_ALIGN_CENTER, 0, 125);
+
+    batt_volt = lv_label_create(s);
+    lv_label_set_text(batt_volt, "");
+    lv_obj_set_style_text_color(batt_volt, lv_color_hex(0x666666), 0);
+    lv_obj_set_style_text_font(batt_volt, &lv_font_montserrat_14, 0);
+    lv_obj_align(batt_volt, LV_ALIGN_CENTER, 0, 160);
+
+    lv_obj_t *sleepBtn = lv_btn_create(s);
+    lv_obj_set_size(sleepBtn, 175, 44);
+    lv_obj_align(sleepBtn, LV_ALIGN_BOTTOM_RIGHT, -15, -40);
+    lv_obj_set_style_radius(sleepBtn, 22, 0);
+    lv_obj_set_style_bg_color(sleepBtn, lv_color_hex(0x141414), 0);
+    lv_obj_set_style_border_color(sleepBtn, lv_color_hex(0x00E5FF), 0);
+    lv_obj_set_style_border_width(sleepBtn, 1, 0);
+    lv_obj_add_event_cb(sleepBtn, [](lv_event_t*){
+        if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+        static_cast<Arduino_CO5300*>(gfx)->setBrightness(0);
+        esp_sleep_enable_ext1_wakeup((1ULL<<BOOT_BTN), ESP_EXT1_WAKEUP_ANY_LOW);
+        esp_deep_sleep_start();
+    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *sl = lv_label_create(sleepBtn);
+    lv_label_set_text(sl, LV_SYMBOL_POWER "  Sleep Now");
+    lv_obj_set_style_text_color(sl, lv_color_hex(0x00E5FF), 0);
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_16, 0);
+    lv_obj_center(sl);
+
+    lv_obj_t *launchBtn = lv_btn_create(s);
+    lv_obj_set_size(launchBtn, 175, 44);
+    lv_obj_align(launchBtn, LV_ALIGN_BOTTOM_LEFT, 15, -40);
+    lv_obj_set_style_radius(launchBtn, 22, 0);
+    lv_obj_set_style_bg_color(launchBtn, lv_color_hex(0x141414), 0);
+    lv_obj_set_style_border_color(launchBtn, lv_color_hex(0x00FF80), 0);
+    lv_obj_set_style_border_width(launchBtn, 1, 0);
+    lv_obj_add_event_cb(launchBtn, [](lv_event_t*){
+        if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+        return_to_launcher();
+    }, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *ll = lv_label_create(launchBtn);
+    lv_label_set_text(ll, LV_SYMBOL_HOME "  Launcher");
+    lv_obj_set_style_text_color(ll, lv_color_hex(0x00FF80), 0);
+    lv_obj_set_style_text_font(ll, &lv_font_montserrat_16, 0);
+    lv_obj_center(ll);
+
+    lv_obj_t *foot = lv_label_create(s);
+    lv_label_set_text(foot, LV_SYMBOL_LEFT "  apps   \u00b7   watch face  " LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_color(foot, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_text_font(foot, &lv_font_montserrat_12, 0);
+    lv_obj_align(foot, LV_ALIGN_BOTTOM_MID, 0, -10);
+}
+
+static void build_screen_face() {
+    lv_obj_t *s = lv_obj_create(NULL);
+    screens[SCREEN_FACE] = s;
+    lv_obj_set_style_bg_color(s, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+    make_wallpaper_bg(s);
+
+    wf_clk = lv_label_create(s);
+    lv_label_set_text(wf_clk, "--:--");
+    lv_obj_set_style_text_color(wf_clk, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(wf_clk, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_opa(wf_clk, 240, 0);
+    lv_obj_align(wf_clk, LV_ALIGN_CENTER, 0, -30);
+
+    wf_dt = lv_label_create(s);
+    lv_label_set_text(wf_dt, "no sync");
+    lv_obj_set_style_text_color(wf_dt, lv_color_hex(0xBBBBBB), 0);
+    lv_obj_set_style_text_font(wf_dt, &lv_font_montserrat_18, 0);
+    lv_obj_align(wf_dt, LV_ALIGN_CENTER, 0, 20);
+
+    lv_obj_t *hint = lv_label_create(s);
+    lv_label_set_text(hint, "swipe " LV_SYMBOL_RIGHT " for apps");
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x666666), 0);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_letter_space(hint, 2, 0);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -40);
+
+    // 1 Hz time tick
+    if (wf_tk) lv_timer_del(wf_tk);
+    wf_tk = lv_timer_create(wf_upd, 1000, NULL);
+    wf_upd(nullptr);
+}
+
+static void build_screen_apps() {
+    lv_obj_t *s = lv_obj_create(NULL);
+    screens[SCREEN_APPS] = s;
+    lv_obj_set_style_bg_color(s, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(s);
+    lv_label_set_text(title, "SPORT//OS");
+    lv_obj_set_style_text_color(title, lv_color_hex(0x00FF80), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_22, 0);
+    lv_obj_set_style_text_letter_space(title, 4, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 26);
+
+    lv_obj_t *hint = lv_label_create(s);
+    lv_label_set_text(hint, LV_SYMBOL_LEFT "  watch face   ·   battery  " LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_color(hint, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 60);
+
+    // Card list
+    lv_obj_t *list = lv_obj_create(s);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_size(list, LCD_W - 50, LCD_H - 160);
+    lv_obj_align(list, LV_ALIGN_CENTER, 0, 30);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(list, 12, 0);
+    lv_obj_set_style_pad_all(list, 8, 0);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+
+    {
+        lv_obj_t *card = lv_obj_create(list);
+        lv_obj_remove_style_all(card);
+        lv_obj_set_size(card, LV_PCT(100), 72);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x0E0E0E), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(card, 18, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(0x1C1C1C), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_pad_all(card, 14, 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x1A1A1A), LV_STATE_PRESSED);
+        lv_obj_set_style_transform_zoom(card, 250, LV_STATE_PRESSED);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *bar = lv_obj_create(card); lv_obj_remove_style_all(bar);
+        lv_obj_set_size(bar, 4, 38); lv_obj_align(bar, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_set_style_radius(bar, 2, 0);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(0x00FF80), 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+
+        lv_obj_t *dot = lv_obj_create(card); lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, 36, 36); lv_obj_align(dot, LV_ALIGN_LEFT_MID, 18, 0);
+        lv_obj_set_style_radius(dot, 18, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(0x00FF80), 0);
+        lv_obj_set_style_bg_opa(dot, 60, 0);
+        lv_obj_set_style_border_color(dot, lv_color_hex(0x00FF80), 0);
+        lv_obj_set_style_border_width(dot, 1, 0);
+        lv_obj_t *dt = lv_label_create(dot);
+        lv_label_set_text(dt, "R");
+        lv_obj_set_style_text_color(dt, lv_color_hex(0x00FF80), 0);
+        lv_obj_set_style_text_font(dt, &lv_font_montserrat_22, 0);
+        lv_obj_center(dt);
+
+        lv_obj_t *name = lv_label_create(card);
+        lv_label_set_text(name, "RUN");
+        lv_obj_set_style_text_color(name, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_letter_space(name, 2, 0);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, 64, -10);
+
+        lv_obj_t *desc = lv_label_create(card);
+        lv_label_set_text(desc, "real-time pace + zones");
+        lv_obj_set_style_text_color(desc, lv_color_hex(0x666666), 0);
+        lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_letter_space(desc, 1, 0);
+        lv_obj_align(desc, LV_ALIGN_LEFT_MID, 64, 12);
+
+        lv_obj_t *chev = lv_label_create(card);
+        lv_label_set_text(chev, LV_SYMBOL_RIGHT);
+        lv_obj_set_style_text_color(chev, lv_color_hex(0x333333), 0);
+        lv_obj_set_style_text_font(chev, &lv_font_montserrat_22, 0);
+        lv_obj_align(chev, LV_ALIGN_RIGHT_MID, -8, 0);
+
+        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card, [](lv_event_t*){
+            if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+            open_pace_picker();
+        }, LV_EVENT_CLICKED, NULL);
+    }
+    {
+        lv_obj_t *card = lv_obj_create(list);
+        lv_obj_remove_style_all(card);
+        lv_obj_set_size(card, LV_PCT(100), 72);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x0E0E0E), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(card, 18, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(0x1C1C1C), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_pad_all(card, 14, 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x1A1A1A), LV_STATE_PRESSED);
+        lv_obj_set_style_transform_zoom(card, 250, LV_STATE_PRESSED);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *bar = lv_obj_create(card); lv_obj_remove_style_all(bar);
+        lv_obj_set_size(bar, 4, 38); lv_obj_align(bar, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_set_style_radius(bar, 2, 0);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(0x00E5FF), 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+
+        lv_obj_t *dot = lv_obj_create(card); lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, 36, 36); lv_obj_align(dot, LV_ALIGN_LEFT_MID, 18, 0);
+        lv_obj_set_style_radius(dot, 18, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(0x00E5FF), 0);
+        lv_obj_set_style_bg_opa(dot, 60, 0);
+        lv_obj_set_style_border_color(dot, lv_color_hex(0x00E5FF), 0);
+        lv_obj_set_style_border_width(dot, 1, 0);
+        lv_obj_t *dt = lv_label_create(dot);
+        lv_label_set_text(dt, "W");
+        lv_obj_set_style_text_color(dt, lv_color_hex(0x00E5FF), 0);
+        lv_obj_set_style_text_font(dt, &lv_font_montserrat_22, 0);
+        lv_obj_center(dt);
+
+        lv_obj_t *name = lv_label_create(card);
+        lv_label_set_text(name, "WALK");
+        lv_obj_set_style_text_color(name, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_letter_space(name, 2, 0);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, 64, -10);
+
+        lv_obj_t *desc = lv_label_create(card);
+        lv_label_set_text(desc, "casual cadence");
+        lv_obj_set_style_text_color(desc, lv_color_hex(0x666666), 0);
+        lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_letter_space(desc, 1, 0);
+        lv_obj_align(desc, LV_ALIGN_LEFT_MID, 64, 12);
+
+        lv_obj_t *chev = lv_label_create(card);
+        lv_label_set_text(chev, LV_SYMBOL_RIGHT);
+        lv_obj_set_style_text_color(chev, lv_color_hex(0x333333), 0);
+        lv_obj_set_style_text_font(chev, &lv_font_montserrat_22, 0);
+        lv_obj_align(chev, LV_ALIGN_RIGHT_MID, -8, 0);
+
+        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card, [](lv_event_t*){
+            if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+            start_workout_simple(W_WALK);
+        }, LV_EVENT_CLICKED, NULL);
+    }
+    {
+        lv_obj_t *card = lv_obj_create(list);
+        lv_obj_remove_style_all(card);
+        lv_obj_set_size(card, LV_PCT(100), 72);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x0E0E0E), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(card, 18, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(0x1C1C1C), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_pad_all(card, 14, 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x1A1A1A), LV_STATE_PRESSED);
+        lv_obj_set_style_transform_zoom(card, 250, LV_STATE_PRESSED);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *bar = lv_obj_create(card); lv_obj_remove_style_all(bar);
+        lv_obj_set_size(bar, 4, 38); lv_obj_align(bar, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_set_style_radius(bar, 2, 0);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(0xFFB300), 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+
+        lv_obj_t *dot = lv_obj_create(card); lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, 36, 36); lv_obj_align(dot, LV_ALIGN_LEFT_MID, 18, 0);
+        lv_obj_set_style_radius(dot, 18, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(0xFFB300), 0);
+        lv_obj_set_style_bg_opa(dot, 60, 0);
+        lv_obj_set_style_border_color(dot, lv_color_hex(0xFFB300), 0);
+        lv_obj_set_style_border_width(dot, 1, 0);
+        lv_obj_t *dt = lv_label_create(dot);
+        lv_label_set_text(dt, "C");
+        lv_obj_set_style_text_color(dt, lv_color_hex(0xFFB300), 0);
+        lv_obj_set_style_text_font(dt, &lv_font_montserrat_22, 0);
+        lv_obj_center(dt);
+
+        lv_obj_t *name = lv_label_create(card);
+        lv_label_set_text(name, "CYCLE");
+        lv_obj_set_style_text_color(name, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_letter_space(name, 2, 0);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, 64, -10);
+
+        lv_obj_t *desc = lv_label_create(card);
+        lv_label_set_text(desc, "distance + calories");
+        lv_obj_set_style_text_color(desc, lv_color_hex(0x666666), 0);
+        lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_letter_space(desc, 1, 0);
+        lv_obj_align(desc, LV_ALIGN_LEFT_MID, 64, 12);
+
+        lv_obj_t *chev = lv_label_create(card);
+        lv_label_set_text(chev, LV_SYMBOL_RIGHT);
+        lv_obj_set_style_text_color(chev, lv_color_hex(0x333333), 0);
+        lv_obj_set_style_text_font(chev, &lv_font_montserrat_22, 0);
+        lv_obj_align(chev, LV_ALIGN_RIGHT_MID, -8, 0);
+
+        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card, [](lv_event_t*){
+            if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+            start_workout_simple(W_CYCLE);
+        }, LV_EVENT_CLICKED, NULL);
+    }
+    {
+        lv_obj_t *card = lv_obj_create(list);
+        lv_obj_remove_style_all(card);
+        lv_obj_set_size(card, LV_PCT(100), 72);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x0E0E0E), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(card, 18, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(0x1C1C1C), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_pad_all(card, 14, 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x1A1A1A), LV_STATE_PRESSED);
+        lv_obj_set_style_transform_zoom(card, 250, LV_STATE_PRESSED);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *bar = lv_obj_create(card); lv_obj_remove_style_all(bar);
+        lv_obj_set_size(bar, 4, 38); lv_obj_align(bar, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_set_style_radius(bar, 2, 0);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(0xFF4040), 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+
+        lv_obj_t *dot = lv_obj_create(card); lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, 36, 36); lv_obj_align(dot, LV_ALIGN_LEFT_MID, 18, 0);
+        lv_obj_set_style_radius(dot, 18, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(0xFF4040), 0);
+        lv_obj_set_style_bg_opa(dot, 60, 0);
+        lv_obj_set_style_border_color(dot, lv_color_hex(0xFF4040), 0);
+        lv_obj_set_style_border_width(dot, 1, 0);
+        lv_obj_t *dt = lv_label_create(dot);
+        lv_label_set_text(dt, "H");
+        lv_obj_set_style_text_color(dt, lv_color_hex(0xFF4040), 0);
+        lv_obj_set_style_text_font(dt, &lv_font_montserrat_22, 0);
+        lv_obj_center(dt);
+
+        lv_obj_t *name = lv_label_create(card);
+        lv_label_set_text(name, "HIIT");
+        lv_obj_set_style_text_color(name, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_letter_space(name, 2, 0);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, 64, -10);
+
+        lv_obj_t *desc = lv_label_create(card);
+        lv_label_set_text(desc, "interval timer");
+        lv_obj_set_style_text_color(desc, lv_color_hex(0x666666), 0);
+        lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_letter_space(desc, 1, 0);
+        lv_obj_align(desc, LV_ALIGN_LEFT_MID, 64, 12);
+
+        lv_obj_t *chev = lv_label_create(card);
+        lv_label_set_text(chev, LV_SYMBOL_RIGHT);
+        lv_obj_set_style_text_color(chev, lv_color_hex(0x333333), 0);
+        lv_obj_set_style_text_font(chev, &lv_font_montserrat_22, 0);
+        lv_obj_align(chev, LV_ALIGN_RIGHT_MID, -8, 0);
+
+        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card, [](lv_event_t*){
+            if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+            start_workout_simple(W_HIIT);
+        }, LV_EVENT_CLICKED, NULL);
+    }
+    {
+        lv_obj_t *card = lv_obj_create(list);
+        lv_obj_remove_style_all(card);
+        lv_obj_set_size(card, LV_PCT(100), 72);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x0E0E0E), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(card, 18, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(0x1C1C1C), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_pad_all(card, 14, 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x1A1A1A), LV_STATE_PRESSED);
+        lv_obj_set_style_transform_zoom(card, 250, LV_STATE_PRESSED);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *bar = lv_obj_create(card); lv_obj_remove_style_all(bar);
+        lv_obj_set_size(bar, 4, 38); lv_obj_align(bar, LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_set_style_radius(bar, 2, 0);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(0xFF2EC4), 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+
+        lv_obj_t *dot = lv_obj_create(card); lv_obj_remove_style_all(dot);
+        lv_obj_set_size(dot, 36, 36); lv_obj_align(dot, LV_ALIGN_LEFT_MID, 18, 0);
+        lv_obj_set_style_radius(dot, 18, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(0xFF2EC4), 0);
+        lv_obj_set_style_bg_opa(dot, 60, 0);
+        lv_obj_set_style_border_color(dot, lv_color_hex(0xFF2EC4), 0);
+        lv_obj_set_style_border_width(dot, 1, 0);
+        lv_obj_t *dt = lv_label_create(dot);
+        lv_label_set_text(dt, "S");
+        lv_obj_set_style_text_color(dt, lv_color_hex(0xFF2EC4), 0);
+        lv_obj_set_style_text_font(dt, &lv_font_montserrat_22, 0);
+        lv_obj_center(dt);
+
+        lv_obj_t *name = lv_label_create(card);
+        lv_label_set_text(name, "STATS");
+        lv_obj_set_style_text_color(name, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_letter_space(name, 2, 0);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, 64, -10);
+
+        lv_obj_t *desc = lv_label_create(card);
+        lv_label_set_text(desc, "XP / streak / sessions");
+        lv_obj_set_style_text_color(desc, lv_color_hex(0x666666), 0);
+        lv_obj_set_style_text_font(desc, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_letter_space(desc, 1, 0);
+        lv_obj_align(desc, LV_ALIGN_LEFT_MID, 64, 12);
+
+        lv_obj_t *chev = lv_label_create(card);
+        lv_label_set_text(chev, LV_SYMBOL_RIGHT);
+        lv_obj_set_style_text_color(chev, lv_color_hex(0x333333), 0);
+        lv_obj_set_style_text_font(chev, &lv_font_montserrat_22, 0);
+        lv_obj_align(chev, LV_ALIGN_RIGHT_MID, -8, 0);
+
+        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(card, [](lv_event_t*){
+            if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+            open_stats();
+        }, LV_EVENT_CLICKED, NULL);
+    }
+
+    g_apps_built = true;
+}
+
+void setup() {
     hw_boot();
     splash_show();
-    load_player();
-    open_home();
+load_player();
+    build_screen_face();
+    build_screen_apps();
+    build_screen_battery();
+    current_screen = SCREEN_FACE;
+    lv_scr_load_anim(screens[SCREEN_FACE], LV_SCR_LOAD_ANIM_FADE_ON, 260, 0, false);
 }
-void loop(){
+void loop() {
     lv_timer_handler();
-    static uint32_t t1=0,btn_t=0; uint32_t now=millis();
-    if(now-t1>2000){t1=now; tick_top();}
-    if(digitalRead(BOOT_BTN)==LOW){ if(!btn_t) btn_t=now; else if(now-btn_t>1500) return_to_launcher(); } else btn_t=0;
+    uint32_t now = millis();
+
+    // Consume queued swipe
+    if (g_pending_swipe != 0 && g_transient_screen == nullptr) {
+        int ev = g_pending_swipe; g_pending_swipe = 0;
+        lastSwipeMs = now;
+        goto_screen(current_screen + ev);
+    }
+
+    // 1 s tick (battery screen)
+    static uint32_t tB = 0;
+    if (now - tB > 1000) {
+        tB = now;
+        if (current_screen == SCREEN_BATTERY) update_battery_screen();
+    }
+
+    // 2 s tick (legacy top-strip on transient screens)
+    static uint32_t t1 = 0;
+    if (now - t1 > 2000) {
+        t1 = now;
+        // tick_top() is only safe when its globals are alive.  They are
+        // built by transient screens that use the legacy top-strip; on the
+        // persistent 3-card screens they're not used.  Guard accordingly.
+        extern void tick_top();
+        if (g_transient_screen) tick_top();
+    }
+
+    // BOOT button long-press -> back to LauncherOS
+    static uint32_t btn_t = 0;
+    if (digitalRead(BOOT_BTN) == LOW) {
+        if (!btn_t) btn_t = now;
+        else if (now - btn_t > 1500) return_to_launcher();
+    } else btn_t = 0;
+
     delay(5);
 }
