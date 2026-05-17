@@ -79,9 +79,9 @@ static void lv_flush(lv_disp_drv_t*d,const lv_area_t*a,lv_color_t*p){
     uint32_t w=a->x2-a->x1+1,h=a->y2-a->y1+1;
     gfx->draw16bitRGBBitmap(a->x1,a->y1,(uint16_t*)p,w,h); lv_disp_flush_ready(d);}
 static void lv_touch(lv_indev_drv_t*,lv_indev_data_t*d){
-    int32_t x=FT3168->IIC_Read_Device_Value(Arduino_IIC_Touch::Arduino_IIC_Touch_X);
-    int32_t y=FT3168->IIC_Read_Device_Value(Arduino_IIC_Touch::Arduino_IIC_Touch_Y);
-    int f=FT3168->IIC_Read_Device_Value(Arduino_IIC_Touch::Arduino_IIC_Touch_FingerNumber);
+    int32_t x=FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
+    int32_t y=FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
+    int f=FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
     if(f>0){d->state=LV_INDEV_STATE_PR;d->point.x=x;d->point.y=y;}else d->state=LV_INDEV_STATE_REL;}
 
 // ---- Back-to-launcher (MANDATORY) ------------------------------------

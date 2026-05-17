@@ -48,6 +48,14 @@
 #include <esp32-hal-cpu.h>
 #include <Update.h>
 
+// ---------------------------------------------------------------------
+// Forward type decls -- MUST sit above any function signature that uses
+// them, otherwise Arduino's auto-generated prototypes (inserted at the
+// top of the .ino) fail with:
+//   "variable or field 'start_workout_simple' declared void"
+// ---------------------------------------------------------------------
+enum WType { W_RUN=0, W_WALK=1, W_CYCLE=2, W_HIIT=3 };
+
 #define LCD_SDIO0 4
 #define LCD_SDIO1 5
 #define LCD_SDIO2 6
@@ -86,9 +94,9 @@ static void lv_flush(lv_disp_drv_t*d,const lv_area_t*a,lv_color_t*p){
     uint32_t w=a->x2-a->x1+1,h=a->y2-a->y1+1;
     gfx->draw16bitRGBBitmap(a->x1,a->y1,(uint16_t*)p,w,h); lv_disp_flush_ready(d);}
 static void lv_touch(lv_indev_drv_t*,lv_indev_data_t*d){
-    int32_t x=FT3168->IIC_Read_Device_Value(Arduino_IIC_Touch::Arduino_IIC_Touch_X);
-    int32_t y=FT3168->IIC_Read_Device_Value(Arduino_IIC_Touch::Arduino_IIC_Touch_Y);
-    int f=FT3168->IIC_Read_Device_Value(Arduino_IIC_Touch::Arduino_IIC_Touch_FingerNumber);
+    int32_t x=FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
+    int32_t y=FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
+    int f=FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
     if(f>0){d->state=LV_INDEV_STATE_PR;d->point.x=x;d->point.y=y;}else d->state=LV_INDEV_STATE_REL;}
 
 static void return_to_launcher(){
@@ -466,7 +474,6 @@ static void register_session_day(){
 // =====================================================================
 // WORKOUT ENGINE
 // =====================================================================
-enum WType { W_RUN=0, W_WALK=1, W_CYCLE=2, W_HIIT=3 };
 struct Workout {
     WType type; uint32_t t_start=0; uint32_t t_pause=0; uint32_t paused_total=0;
     bool paused=false; int steps=0; float km=0; int target_pace_sec=360; // 6:00 / km
