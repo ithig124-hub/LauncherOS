@@ -1,0 +1,4 @@
+TITLE=The Last Olympian (Demo)
+AUTHOR=Original sample for BookOS
+GENRE=Fantasy
+THEME=Navy

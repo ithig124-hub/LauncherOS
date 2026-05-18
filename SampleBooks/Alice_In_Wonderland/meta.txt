@@ -1,0 +1,4 @@
+TITLE=Alice in Wonderland
+AUTHOR=Lewis Carroll
+GENRE=Fantasy
+THEME=Warm

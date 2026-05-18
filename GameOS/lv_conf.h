@@ -26,8 +26,24 @@
 /*=========================
    MEMORY
  *=========================*/
-#define LV_MEM_CUSTOM       0
-#define LV_MEM_SIZE         (64U * 1024U)   /* 64 KB heap for LVGL objects */
+/*=========================
+   MEMORY
+   ----------------------------------------------------------------------
+   We route LVGL's heap into PSRAM via heap_caps_malloc so the 32-card
+   launcher (~250 lv_obj_t's) has unlimited room.  Static buffers in
+   internal DRAM are tight on this board -- anything over ~200 KB makes
+   the linker spit `dram0_0_seg overflowed`, so we used to crash at boot
+   on a NULL lv_obj_create() instead.
+
+   LV_MEM_SIZE is still defined (LVGL references it for internal sanity
+   checks even when CUSTOM=1) but it no longer reserves DRAM.
+ *=========================*/
+#define LV_MEM_CUSTOM             1
+#define LV_MEM_CUSTOM_INCLUDE     "esp_heap_caps.h"
+#define LV_MEM_CUSTOM_ALLOC(s)    heap_caps_malloc((s), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define LV_MEM_CUSTOM_FREE(p)     heap_caps_free((p))
+#define LV_MEM_CUSTOM_REALLOC(p, s) heap_caps_realloc((p), (s), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+#define LV_MEM_SIZE         (64U * 1024U)
 #define LV_MEM_ADR          0
 #define LV_MEM_BUF_MAX_NUM  16
 #define LV_MEMCPY_MEMSET_STD 0

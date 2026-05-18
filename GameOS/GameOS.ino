@@ -636,17 +636,22 @@ static void hw_boot(){
     load_wifi_config();
 }
 
+// =====================================================================
+//   SPLASH  (tracked so we can free it after handing off to the watch-face,
+//   otherwise its 125 dim-line objects stay in the LVGL heap forever.)
+// =====================================================================
+static lv_obj_t *g_splash_scr = nullptr;
+
 static void splash_show(){
     lv_obj_t *s=lv_obj_create(NULL);
+    g_splash_scr = s;
     lv_obj_set_style_bg_color(s,lv_color_hex(COL_BG),0);
     lv_obj_set_style_bg_opa(s,LV_OPA_COVER,0);
     lv_obj_clear_flag(s,LV_OBJ_FLAG_SCROLLABLE);
-    for(int y=0;y<LCD_H;y+=4){
-        lv_obj_t *ln=lv_obj_create(s); lv_obj_remove_style_all(ln);
-        lv_obj_set_size(ln,LCD_W,1); lv_obj_set_pos(ln,0,y);
-        lv_obj_set_style_bg_color(ln,lv_color_hex(0x111111),0);
-        lv_obj_set_style_bg_opa(ln,80,0);
-    }
+    // (Removed: a 125-iter loop that created an lv_obj per scanline as a
+    //  "CRT lines" effect.  It ate ~25 KB of LVGL heap and was a major
+    //  contributor to the OOM that took out boot.  The remaining widgets
+    //  -- title / subtitle / progress bar -- are the splash visual.)
     lv_obj_t *t=lv_label_create(s); lv_label_set_text(t,"GAME//OS");
     lv_obj_set_style_text_color(t,lv_color_hex(COL_MAGENTA),0);
     lv_obj_set_style_text_font(t,&lv_font_montserrat_48,0);
@@ -983,6 +988,11 @@ static void lv_touch_gesture(lv_indev_drv_t *, lv_indev_data_t *d){
     int32_t x = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
     int32_t y = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
     int     f = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
+    // Defensive: if the I2C bus NACKs (PMU/touch wiring fault) the driver
+    // can return -1 / garbage.  Treat anything out-of-range as "no touch"
+    // instead of feeding negative coords into LVGL hit-testing.
+    bool valid = (x >= 0 && x < LCD_W && y >= 0 && y < LCD_H && f >= 0 && f <= 5);
+    if(!valid){ f = 0; x = 0; y = 0; }
     bool pressed = (f > 0);
     static int zero_streak = 0;
     if(pressed) zero_streak=0;
@@ -1039,6 +1049,9 @@ void setup(){
     build_screen_battery();
     current_screen = SCREEN_FACE;
     lv_scr_load_anim(screens[SCREEN_FACE], LV_SCR_LOAD_ANIM_FADE_ON, 260, 0, false);
+    // free the splash screen now that we've handed off to the watch face.
+    // (lv_scr_load_anim with auto_del=false leaves it parked in LVGL memory.)
+    if(g_splash_scr){ lv_obj_del_async(g_splash_scr); g_splash_scr=nullptr; }
 }
 
 void loop(){

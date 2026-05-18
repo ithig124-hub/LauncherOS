@@ -1,6 +1,26 @@
 // ============================================================================
 //  LauncherOS.ino   --   DualCore Watch launcher  (LVGL 8.3 / 8.4)
 //  ----------------------------------------------------------------------------
+//  v6.2 -- wake-time fix + 3-column app grid + favourites-first divider.
+//      * Sleep/wake time bug: after waking the panel showed the OLD time
+//        (the time-of-sleep) for up to a second.  Two root causes:
+//          (1) screen_on() invalidated + faded up BEFORE the 1 Hz tick
+//              had a chance to refresh face_time/face_date, so the user
+//              saw the stale pre-sleep frame brighten.
+//          (2) time_restore_from_nvs() ran unconditionally at the top of
+//              setup() and settimeofday()-ed the NVS snapshot back into
+//              the RTC -- but the RTC was still ticking across deep sleep
+//              (we pinned RTC_PERIPH ON), so this REWOUND the clock back
+//              to the moment we slept.  Now we check the RTC first and
+//              only restore from NVS on a true cold boot.
+//      * App grid: replaced the v5.x card list with a 3-column rounded-
+//        square tile grid.  Favourites are rendered first with a gold
+//        border + gold name text, followed by a thin full-width divider,
+//        then the rest of the apps in cyan-bordered tiles.  Long-press
+//        still toggles starred status.  See APP_TILE_SIZE / APP_TILE_GAP
+//        tunables for layout.
+//  ----------------------------------------------------------------------------
+
 //  v5.14 -- "Post-swipe click-guard" (kills accidental app launch).
 //      * Real cause of "screen turns off on second swipe": rapid flicks
 //        that don't travel >25 px register as taps (dx=0 dy=0).  On the
@@ -485,7 +505,32 @@ static void time_save_now(const char *why) {
 // Pull the last-known wall clock out of NVS and shove it into the RTC.
 // Called at the very top of setup() -- guarantees the watch face shows
 // a plausible time even if the battery was dead, before WiFi/NTP runs.
+//
+// v6.2 fix:  on deep-sleep wake the ESP32 internal RTC is still running
+// (we pinned RTC_PERIPH ON in deep_sleep_now()) so getLocalTime() already
+// returns a CURRENT timestamp.  Blindly settimeofday()-ing the stale NVS
+// snapshot here rewound the clock back to the moment we went to sleep --
+// which is exactly the bug the user reported ("time loads what I put it
+// in sleep at").  Only restore from NVS when the RTC is NOT already
+// holding a plausible (>= 2023) time.
 static void time_restore_from_nvs() {
+    time_t rtc_now = 0;
+    time(&rtc_now);
+    if (rtc_now >= 1700000000) {
+        // RTC already has a valid wall clock (either NTP-synced from a
+        // previous boot AND retained across deep sleep, or set by some
+        // other path).  Trust it -- do NOT overwrite with the stale NVS
+        // snapshot.  Just pull the gmt offset so format strings line up.
+        g_timeprefs.begin("rtcsave", true);
+        int32_t gmt = g_timeprefs.getLong("gmt", 0);
+        g_timeprefs.end();
+        g_gmt_offset_sec = gmt;
+        g_ntp_synced = true;
+        USBSerial.printf("[rtc] RTC live (t=%lu) -- skipping NVS restore\n",
+                         (unsigned long)rtc_now);
+        return;
+    }
+
     g_timeprefs.begin("rtcsave", true);
     uint32_t t   = g_timeprefs.getULong("t", 0);
     int32_t  gmt = g_timeprefs.getLong("gmt", 0);
@@ -498,7 +543,7 @@ static void time_restore_from_nvs() {
     struct timeval tv = { (time_t)t, 0 };
     settimeofday(&tv, NULL);
     g_ntp_synced = true;   // show a real time on the face immediately
-    USBSerial.printf("[rtc] restored t=%lu gmt=%ld from NVS\n",
+    USBSerial.printf("[rtc] restored t=%lu gmt=%ld from NVS (cold start)\n",
                      (unsigned long)t, (long)gmt);
 }
 
@@ -1507,89 +1552,96 @@ static void compute_order(int *out) {
         if (!favs_contains(g_apps[j].name)) out[n++] = j;
 }
 
-// One styled section header (pill).
-static void add_section_header(lv_obj_t *parent, const char *txt, uint32_t accent) {
-    lv_obj_t *wrap = lv_obj_create(parent);
-    lv_obj_remove_style_all(wrap);
-    lv_obj_set_size(wrap, LV_PCT(100), 28);
-    lv_obj_set_style_pad_left(wrap, 14, 0);
-    lv_obj_set_style_pad_top(wrap, 6, 0);
-    lv_obj_clear_flag(wrap, LV_OBJ_FLAG_SCROLLABLE);
+// ============================================================================
+//  v6.2 APP GRID  --  3-column rounded-square tiles, favourites first,
+//  thin divider between favs and the rest, gold border + gold name on
+//  favourites.  Replaces the v5.x card-list layout entirely.
+// ============================================================================
+//
+// Tile geometry: panel is LCD_WIDTH - 30 = 380 px wide, pad_all 6 each
+// side -> 368 inner.  With 3 tiles and an 8 px column gap that gives
+// (368 - 16) / 3 = 117 px -- we round to 112 to leave a tiny breathing
+// margin and keep the radius looking square.  Tile height matches width
+// so the result is a true square grid.
+#define APP_TILE_SIZE       112
+#define APP_TILE_RADIUS     20
+#define APP_TILE_GAP        8
 
-    lv_obj_t *dot = lv_obj_create(wrap);
-    lv_obj_remove_style_all(dot);
-    lv_obj_set_size(dot, 6, 6);
-    lv_obj_align(dot, LV_ALIGN_LEFT_MID, 0, 0);
-    lv_obj_set_style_radius(dot, 3, 0);
-    lv_obj_set_style_bg_color(dot, lv_color_hex(accent), 0);
-    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+// Full-width divider row that visually separates the favourites block
+// from the rest of the apps.  Sized at LV_PCT(100) so the parent flex
+// wrap forces it onto its own row (it cannot fit next to a 112 px tile).
+static void add_grid_divider(lv_obj_t *parent) {
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_PCT(100), 18);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
 
-    lv_obj_t *l = lv_label_create(wrap);
-    lv_label_set_text(l, txt);
-    lv_obj_set_style_text_color(l, lv_color_hex(accent), 0);
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_letter_space(l, 2, 0);
-    lv_obj_align(l, LV_ALIGN_LEFT_MID, 14, 0);
+    lv_obj_t *line = lv_obj_create(row);
+    lv_obj_remove_style_all(line);
+    lv_obj_set_size(line, LV_PCT(80), 1);
+    lv_obj_align(line, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(line, lv_color_hex(0x2A2A2A), 0);
+    lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
 }
 
-// One app row -- styled card with accent bar, name, size, chevron.
-static void add_app_card(lv_obj_t *parent, int idx, bool isFav) {
-    lv_obj_t *card = lv_obj_create(parent);
-    lv_obj_remove_style_all(card);
-    lv_obj_set_size(card, LV_PCT(100), 64);
-    lv_obj_set_style_bg_color(card, lv_color_hex(isFav ? 0x1A1408 : 0x0E0E0E), 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 14, 0);
-    lv_obj_set_style_pad_all(card, 12, 0);
-    // (Row spacing is handled by the parent flex container's pad_row.)
-    lv_obj_set_style_border_color(card, lv_color_hex(isFav ? 0x3A2810 : 0x1C1C1C), 0);
-    lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-    // Pressed-state feedback
-    lv_obj_set_style_bg_color(card, lv_color_hex(isFav ? 0x2A1E10 : 0x1A1A1A), LV_STATE_PRESSED);
-    lv_obj_set_style_transform_zoom(card, 250, LV_STATE_PRESSED);   // ~0.97x
+// One rounded-square app tile.  Favourites get a gold border + gold name
+// text on a slightly warmer background, otherwise it's a cyan border on
+// near-black -- matches the visual language used elsewhere in the OS.
+static void add_app_tile(lv_obj_t *parent, int idx, bool isFav) {
+    lv_obj_t *tile = lv_obj_create(parent);
+    lv_obj_remove_style_all(tile);
+    lv_obj_set_size(tile, APP_TILE_SIZE, APP_TILE_SIZE);
+    lv_obj_set_style_bg_color(tile, lv_color_hex(isFav ? 0x1A1408 : 0x0E0E0E), 0);
+    lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(tile, APP_TILE_RADIUS, 0);
+    lv_obj_set_style_pad_all(tile, 8, 0);
+    // Gold for favourites, cyan for the rest -- both at 1 px so the tile
+    // grid reads as a clean rhythm rather than a heavy stack.
+    lv_obj_set_style_border_color(tile, lv_color_hex(isFav ? 0xFFB300 : 0x1C1C1C), 0);
+    lv_obj_set_style_border_width(tile, isFav ? 2 : 1, 0);
+    lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+    // Pressed-state: slightly darker bg + a touch of zoom for tactile feel.
+    lv_obj_set_style_bg_color(tile, lv_color_hex(isFav ? 0x2A1E10 : 0x1A1A1A), LV_STATE_PRESSED);
+    lv_obj_set_style_transform_zoom(tile, 248, LV_STATE_PRESSED); // ~0.97x
 
-    // Left accent bar
-    lv_obj_t *bar = lv_obj_create(card);
-    lv_obj_remove_style_all(bar);
-    lv_obj_set_size(bar, 4, 40);
-    lv_obj_align(bar, LV_ALIGN_LEFT_MID, -4, 0);
-    lv_obj_set_style_radius(bar, 2, 0);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(isFav ? 0xFFB300 : 0x00E5FF), 0);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    // First letter glyph at the top -- gives each tile a quick visual
+    // anchor even before you read the name (favourites tint it gold).
+    char glyph[2] = { 0, 0 };
+    if (!g_apps[idx].name.isEmpty()) {
+        glyph[0] = g_apps[idx].name.charAt(0);
+        if (glyph[0] >= 'a' && glyph[0] <= 'z') glyph[0] -= 32;
+    } else {
+        glyph[0] = '?';
+    }
+    lv_obj_t *g = lv_label_create(tile);
+    lv_label_set_text(g, glyph);
+    lv_obj_set_style_text_color(g, lv_color_hex(isFav ? 0xFFD060 : 0x00E5FF), 0);
+    lv_obj_set_style_text_font(g, &lv_font_montserrat_28, 0);
+    lv_obj_align(g, LV_ALIGN_TOP_MID, 0, 8);
 
-    // Name
-    lv_obj_t *name = lv_label_create(card);
+    // Star marker on favourites (top-right corner of the tile).
+    if (isFav) {
+        lv_obj_t *star = lv_label_create(tile);
+        lv_label_set_text(star, LV_SYMBOL_OK);   // small filled glyph -- reads as a "starred" badge
+        lv_obj_set_style_text_color(star, lv_color_hex(0xFFB300), 0);
+        lv_obj_set_style_text_font(star, &lv_font_montserrat_12, 0);
+        lv_obj_align(star, LV_ALIGN_TOP_RIGHT, -2, 2);
+    }
+
+    // App name -- one line, ellipsised, gold for favourites otherwise white.
+    lv_obj_t *name = lv_label_create(tile);
     lv_label_set_text(name, g_apps[idx].name.c_str());
     lv_obj_set_style_text_color(name, lv_color_hex(isFav ? 0xFFD060 : 0xFFFFFF), 0);
-    lv_obj_set_style_text_font(name, &lv_font_montserrat_18, 0);
-    lv_obj_set_width(name, LCD_WIDTH - 140);
+    lv_obj_set_style_text_font(name, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(name, APP_TILE_SIZE - 12);
     lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
-    lv_obj_align(name, LV_ALIGN_LEFT_MID, 12, -10);
+    lv_obj_align(name, LV_ALIGN_BOTTOM_MID, 0, -4);
 
-    // Size
-    lv_obj_t *sz = lv_label_create(card);
-    char b[40];
-    if (g_apps[idx].size >= 1024 * 1024)
-        snprintf(b, sizeof(b), "%.2f MB", g_apps[idx].size / 1048576.0f);
-    else
-        snprintf(b, sizeof(b), "%.1f KB", g_apps[idx].size / 1024.0f);
-    if (isFav) { strncat(b, "  ·  starred", sizeof(b) - strlen(b) - 1); }
-    lv_label_set_text(sz, b);
-    lv_obj_set_style_text_color(sz, lv_color_hex(isFav ? 0xBB8830 : 0x707070), 0);
-    lv_obj_set_style_text_font(sz, &lv_font_montserrat_12, 0);
-    lv_obj_align(sz, LV_ALIGN_LEFT_MID, 12, 12);
-
-    // Chevron
-    lv_obj_t *chev = lv_label_create(card);
-    lv_label_set_text(chev, LV_SYMBOL_RIGHT);
-    lv_obj_set_style_text_color(chev, lv_color_hex(isFav ? 0xFFB300 : 0x00E5FF), 0);
-    lv_obj_set_style_text_font(chev, &lv_font_montserrat_18, 0);
-    lv_obj_align(chev, LV_ALIGN_RIGHT_MID, 0, 0);
-
-    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(card, list_event_cb, LV_EVENT_CLICKED,      (void*)(intptr_t)idx);
-    lv_obj_add_event_cb(card, list_event_cb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)idx);
+    lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(tile, list_event_cb, LV_EVENT_CLICKED,      (void*)(intptr_t)idx);
+    lv_obj_add_event_cb(tile, list_event_cb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)idx);
 }
 
 static void populate_app_list() {
@@ -1625,19 +1677,22 @@ static void populate_app_list() {
     }
 
     int order[MAX_APPS]; compute_order(order);
-    if (g_fav_count > 0) {
-        add_section_header(g_list_widget, "FAVOURITES", 0xFFB300);
-    }
-    int sf = 0;
+    // Emit favourites first.  Once we've finished the favs run we drop in
+    // a single full-width divider (LV_PCT(100) row -- forces a flex break)
+    // and then the remaining apps follow.
+    bool divider_emitted = false;
+    int  emitted_favs    = 0;
     for (int k = 0; k < g_app_count; k++) {
-        int i = order[k];
+        int  i     = order[k];
         bool isFav = favs_contains(g_apps[i].name);
-        if (g_fav_count > 0 && sf == g_fav_count && !isFav) {
-            add_section_header(g_list_widget, "ALL APPS", 0x00E5FF);
+        if (!isFav && g_fav_count > 0 && !divider_emitted) {
+            add_grid_divider(g_list_widget);
+            divider_emitted = true;
         }
-        if (isFav) sf++;
-        add_app_card(g_list_widget, i, isFav);
+        if (isFav) emitted_favs++;
+        add_app_tile(g_list_widget, i, isFav);
     }
+    (void)emitted_favs; // currently informational only
 }
 
 static void build_screen_apps() {
@@ -1679,15 +1734,24 @@ static void build_screen_apps() {
     lv_obj_set_style_text_font(h2, &lv_font_montserrat_12, 0);
     lv_obj_align(h2, LV_ALIGN_TOP_LEFT, 24, 58);
 
-    // Scrollable card list
+    // Scrollable 3-column tile grid (v6.2).
+    // pad_column = pad_row = APP_TILE_GAP, flex flow row+wrap so every
+    // 3rd tile starts a new row.  A divider row (LV_PCT(100)) inserted
+    // between favourites and the rest forces a flex break, which is how
+    // we get the "favs first, then divider, then everything else" feel.
     g_list_widget = lv_obj_create(s);
     lv_obj_set_size(g_list_widget, LCD_WIDTH - 30, LCD_HEIGHT - 130);
     lv_obj_align(g_list_widget, LV_ALIGN_TOP_MID, 0, 84);
     lv_obj_set_style_bg_opa(g_list_widget, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(g_list_widget, 0, 0);
     lv_obj_set_style_pad_all(g_list_widget, 6, 0);
-    lv_obj_set_style_pad_row(g_list_widget, 10, 0);
-    lv_obj_set_flex_flow(g_list_widget, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(g_list_widget, APP_TILE_GAP, 0);
+    lv_obj_set_style_pad_column(g_list_widget, APP_TILE_GAP, 0);
+    lv_obj_set_flex_flow(g_list_widget, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(g_list_widget,
+                          LV_FLEX_ALIGN_CENTER,    // main axis (row)
+                          LV_FLEX_ALIGN_START,     // cross axis (vertical inside the row)
+                          LV_FLEX_ALIGN_START);    // tracks (where rows go)
     lv_obj_set_scroll_dir(g_list_widget, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(g_list_widget, LV_SCROLLBAR_MODE_AUTO);
     // Subtle scrollbar styling
@@ -2003,6 +2067,17 @@ static void screen_off() {
 static void screen_on() {
     if (!screenIsOff) return;
     screenIsOff = false;
+    // v6.2: BEFORE we repaint + fade up, force the visible screen to
+    // pull the CURRENT wall-clock value off the RTC.  The 1-second tick
+    // in loop() only runs once a second, so without this push the user
+    // sees the stale pre-sleep frame for up to a full second after wake
+    // (which is the "time isn't being updated after sleep" report).
+    if (current_screen == SCREEN_FACE) {
+        update_face_time();
+        update_face_battery();
+    } else if (current_screen == SCREEN_BATTERY) {
+        update_battery_screen();
+    }
     // Repaint first, then fade UP -- otherwise the user sees the stale
     // pre-sleep frame brighten before the new one lands.
     lv_obj_invalidate(lv_scr_act());
@@ -2064,7 +2139,7 @@ void setup() {
     bool from_deep_sleep =
         (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1);
 
-    USBSerial.printf("\n=== LauncherOS v6.1 (loader UX + persistent RTC) ===  %s\n",
+    USBSerial.printf("\n=== LauncherOS v6.2 (wake-time fix + 3-col app grid) ===  %s\n",
                      from_deep_sleep ? "(wake from deep sleep)" : "(cold boot)");
     // v6.0: re-anchor the bootloader on ourselves so any loaded app that
     // reboots (intentionally, via crash, or via power-cycle) comes back

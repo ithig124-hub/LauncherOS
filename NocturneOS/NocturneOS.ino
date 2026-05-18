@@ -85,6 +85,15 @@ static const int SDMMC_DATA = 3;
 struct NocturneTheme;
 struct CardEntry;
 
+// ---- Forward function declarations used by helpers that are defined before
+// the actual functions (Arduino IDE doesn't auto-prototype across blocks
+// where we already used the type-returning workaround above). ------------
+static void show_toast(const char *msg, uint32_t ms);
+static void rebuild_all_cards();
+static int8_t theme_index_by_key(const char *key);
+static void aura_history_log(bool force);
+static void page_indicator_update();        // v2.1 -- defined after globals
+
 #define HC_WIFI_SSID "WatchNet"
 #define HC_WIFI_PASS "watch1234"
 
@@ -322,8 +331,8 @@ static bool g_ui_sounds_on = false;
 // Memory Transitions -- continuous theme drift across the 24h cycle.
 // Default ON, toggleable via Settings switch (NVS key "mem").
 static bool    g_memory_transitions_on = true;
-static uint8_t g_aura_hist[24] = {0};   // per-hour theme index histogram (last theme used)
-static uint8_t g_aura_hist_count[24] = {0};  // tick count per hour
+static uint8_t g_aura_dom_theme[24] = {0};   // per-hour dominant theme (last used)
+static uint8_t g_aura_dom_count[24] = {0};   // tick count per hour
 
 // Moonphase cache (1x WiFi/day fetch). NVS keys "moon_phase","moon_day".
 static float   g_moon_phase     = 0.5f;  // 0..1 (0=new, 0.5=full)
@@ -367,8 +376,8 @@ static void state_save() {
     g_prefs.putBool("mem",    g_memory_transitions_on);
     g_prefs.putFloat("moon_phase", g_moon_phase);
     g_prefs.putInt("moon_day",     g_moon_cache_day);
-    g_prefs.putBytes("aura_h",  g_aura_hist,       sizeof(g_aura_hist));
-    g_prefs.putBytes("aura_hc", g_aura_hist_count, sizeof(g_aura_hist_count));
+    g_prefs.putBytes("aura_h",  g_aura_dom_theme,  sizeof(g_aura_dom_theme));
+    g_prefs.putBytes("aura_hc", g_aura_dom_count,  sizeof(g_aura_dom_count));
     g_prefs.end();
 }
 
@@ -430,8 +439,8 @@ static void aura_history_log(bool force) {
     f.close();
 
     // update in-RAM histogram + persist count for the Aura Histogram card
-    g_aura_hist[tm.tm_hour] = g_theme_idx;
-    if (g_aura_hist_count[tm.tm_hour] < 255) g_aura_hist_count[tm.tm_hour]++;
+    g_aura_dom_theme[tm.tm_hour] = g_theme_idx;
+    if (g_aura_dom_count[tm.tm_hour] < 255) g_aura_dom_count[tm.tm_hour]++;
 
     g_last_log_ms = now;
     g_last_logged_theme = g_theme_idx;
@@ -439,15 +448,15 @@ static void aura_history_log(bool force) {
 
 // =============================================================================
 //  AURA MEMORY EXPORT  --  long-press the Aura Memory card to save a 240×240
-//  PNG of today's polar histogram to /WATCH/photos/aura_YYYY-MM-DD.png.
-//  Uses lv_snapshot to grab the canvas into a true-color buffer, then writes a
-//  minimal BMP (PNG encoder isn't bundled in this LVGL build -- BMP is
-//  loss-less and opens everywhere). Returns the saved path or NULL.
+//  BMP of today's polar histogram to /WATCH/photos/aura_YYYY-MM-DD.bmp.
+//
+//  Two implementations:
+//    * If LV_USE_SNAPSHOT is enabled in lv_conf.h → grab the live LVGL canvas.
+//    * Otherwise → re-render the histogram from g_aura_hist[24] directly into
+//      a small RGB565 buffer and dump that. Same output, no LVGL dependency.
 // =============================================================================
 static const char* aura_export_snapshot(lv_obj_t *canvas) {
-    if (!SD_MMC.cardType() || !canvas) return NULL;
-    lv_img_dsc_t *snap = lv_snapshot_take(canvas, LV_IMG_CF_TRUE_COLOR);
-    if (!snap) return NULL;
+    if (!SD_MMC.cardType()) return NULL;
 
     time_t now; time(&now);
     struct tm tm; localtime_r(&now, &tm);
@@ -455,13 +464,13 @@ static const char* aura_export_snapshot(lv_obj_t *canvas) {
     snprintf(path, sizeof(path), "/WATCH/photos/aura_%04d-%02d-%02d.bmp",
              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
 
-    File f = SD_MMC.open(path, FILE_WRITE);
-    if (!f) { lv_snapshot_free(snap); return NULL; }
-
-    const uint32_t W = snap->header.w, H = snap->header.h;
+    const int W = 240, H = 240;
     const uint32_t row = ((W * 3 + 3) & ~3);
     const uint32_t img = row * H;
     const uint32_t fsz = 54 + img;
+
+    File f = SD_MMC.open(path, FILE_WRITE);
+    if (!f) return NULL;
     uint8_t hdr[54] = {
         'B','M', (uint8_t)fsz,(uint8_t)(fsz>>8),(uint8_t)(fsz>>16),(uint8_t)(fsz>>24),
         0,0,0,0, 54,0,0,0, 40,0,0,0,
@@ -473,26 +482,37 @@ static const char* aura_export_snapshot(lv_obj_t *canvas) {
     };
     f.write(hdr, 54);
 
-    const lv_color_t *px = (const lv_color_t*)snap->data;
-    uint8_t pad[3] = {0,0,0};
-    for (int32_t y = H - 1; y >= 0; y--) {     // BMP is bottom-up
-        for (uint32_t x = 0; x < W; x++) {
-            lv_color_t c = px[y * W + x];
-            uint8_t r,g,b;
-#if LV_COLOR_DEPTH == 16
-            r = (c.ch.red   << 3) | (c.ch.red   >> 2);
-            g = (c.ch.green << 2) | (c.ch.green >> 4);
-            b = (c.ch.blue  << 3) | (c.ch.blue  >> 2);
-#else
-            r = c.ch.red; g = c.ch.green; b = c.ch.blue;
-#endif
+    // Re-render the 24-wedge polar histogram from g_aura_hist[] directly.
+    // For each pixel (bottom-up because BMP) work out its (cx,cy) polar coords,
+    // pick the matching hour bin, then colour from THEMES[bin].c_accent.
+    const int cx = W/2, cy = H/2;
+    const int r0 = 36, r1 = 100;
+    const uint8_t pad[3] = {0,0,0};
+    for (int32_t y = H - 1; y >= 0; y--) {
+        for (int32_t x = 0; x < W; x++) {
+            int dx = x - cx, dy = y - cy;
+            int dist2 = dx*dx + dy*dy;
+            uint8_t r = 0, g = 0, b = 0;
+            if (dist2 >= r0*r0 && dist2 <= r1*r1) {
+                float ang = atan2f((float)dy, (float)dx) + 1.5707963f; // align 12-o'clock = 0
+                if (ang < 0) ang += 6.2831853f;
+                int hour = (int)(ang / (6.2831853f / 24.0f)) % 24;
+                uint8_t tidx = g_aura_dom_theme[hour];
+                if (tidx >= THEME_COUNT) tidx = 0;
+                uint32_t acc = THEMES[tidx].c_accent;
+                float radial = sqrtf((float)dist2);
+                float fade = (radial - r0) / (float)(r1 - r0);
+                float a = 0.55f + 0.35f * sinf(fade * 3.14159f);
+                r = (uint8_t)(((acc >> 16) & 0xFF) * a);
+                g = (uint8_t)(((acc >> 8)  & 0xFF) * a);
+                b = (uint8_t)(( acc        & 0xFF) * a);
+            }
             uint8_t bgr[3] = { b, g, r };
             f.write(bgr, 3);
         }
         f.write(pad, row - W * 3);
     }
     f.close();
-    lv_snapshot_free(snap);
     show_toast("aura exported", 1200);
     return path;
 }
@@ -724,8 +744,7 @@ static void nocturne_splash(uint16_t duration_ms) {
         delay(20);
     }
 
-    // --- ACT III : poetic subtitle types in, single piano tap --------
-    audio_play_tick(523);    // soft C5 — quiet welcome
+    // --- ACT III : poetic subtitle types in (silent build, no audio cue) --
     t = millis();
     const int N = strlen(poetic);
     while (millis() - t < D3) {
@@ -793,24 +812,49 @@ static void es8311_minimal_init() {
     es8311_w(0x37, 0x08); es8311_w(0x44, 0x08);
     es8311_w(0x32, 0x80);                          // mic gain
 }
+// v2.1 SILENT BUILD --------------------------------------------------------
+// NocturneOS is intentionally a SILENT ambient OS. The earlier build held the
+// PA_EN amp pin HIGH and left the I2S TX channel enabled, which produced a
+// constant high-pitched whine from the codec's idle DAC noise (and carried
+// over between tiles because the amp never shut off).
+//
+// New rules:
+//   * NEVER drive PA_EN HIGH. We force it LOW and keep it LOW forever.
+//   * NEVER allocate or enable the I2S TX channel.
+//   * Hard-mute the ES8311 DAC + headphone path at init.
+//   * Only the RX path (mic) stays alive -- it feeds the visualizer FFT,
+//     it does not produce any sound.
+// audio_play_tick() below is a permanent no-op. Settings UI sound toggle is
+// kept (just disables visual side-effects of taps), but no PCM ever leaves
+// the SoC.
 static bool audio_begin() {
-    pinMode(NOCT_PA_EN, OUTPUT); digitalWrite(NOCT_PA_EN, HIGH);
+    // amp permanently OFF
+    pinMode(NOCT_PA_EN, OUTPUT);
+    digitalWrite(NOCT_PA_EN, LOW);
+
     if (!es8311_probe()) return false;
     es8311_minimal_init();
+    // hard-mute DAC + HP out so the codec stays silent even if a stray
+    // I2S word ever clocked through.
+    es8311_w(0x31, 0x60);   // DAC_MUTE = 1, DAC_DSM_MUTE = 1
+    es8311_w(0x32, 0x00);   // DAC volume -> -inf dB
+    es8311_w(0x37, 0xC8);   // DAC ramp off, mute on
+    es8311_w(0x12, 0x20);   // power down DAC + HP driver
+
+    // RX-only channel setup (mic for visualizer FFT). TX is NEVER created.
     i2s_chan_config_t cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    if (i2s_new_channel(&cfg, &g_i2s_tx, &g_i2s_rx) != ESP_OK) return false;
+    if (i2s_new_channel(&cfg, NULL, &g_i2s_rx) != ESP_OK) return false;
     i2s_std_config_t std = {
         .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(NOCT_AUDIO_SR),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
         .gpio_cfg = { .mclk = (gpio_num_t)NOCT_I2S_MCLK, .bclk = (gpio_num_t)NOCT_I2S_BCLK,
-                      .ws = (gpio_num_t)NOCT_I2S_WS, .dout = (gpio_num_t)NOCT_I2S_DOUT,
+                      .ws = (gpio_num_t)NOCT_I2S_WS, .dout = (gpio_num_t)-1,
                       .din = (gpio_num_t)NOCT_I2S_DIN,
                       .invert_flags = {0,0,0} }
     };
     if (i2s_channel_init_std_mode(g_i2s_rx, &std) != ESP_OK) return false;
-    if (i2s_channel_init_std_mode(g_i2s_tx, &std) != ESP_OK) return false;
     i2s_channel_enable(g_i2s_rx);
-    i2s_channel_enable(g_i2s_tx);
+    g_i2s_tx = NULL;
     return true;
 }
 
@@ -876,10 +920,6 @@ static float audio_energy() {
 //    everything else                                                  → no change
 // =============================================================================
 static const char* listening_state_classify();
-static void show_toast(const char *msg, uint32_t ms);   // forward
-static void rebuild_all_cards();                          // forward
-static int8_t theme_index_by_key(const char *key);        // forward (defined below)
-static void aura_history_log(bool force);                 // forward
 
 static float    g_bpm_estimate   = 0.0f;     // running tempo guess
 static uint32_t g_last_bass_ms   = 0;
@@ -972,21 +1012,13 @@ static void listening_state_tick() {
     show_toast(suggested, 1500);
 }
 
-// Soft UI "piano tap" -- gated by g_ui_sounds_on (Settings toggle, defined above)
-static void audio_play_tick(uint16_t freq_hz) {
-    if (!g_audio_on || !g_ui_sounds_on) return;
-    const int dur_ms = 24;
-    const int frames = NOCT_AUDIO_SR * dur_ms / 1000;
-    static int16_t tone[NOCT_AUDIO_SR * 30 / 1000 * 2];
-    int N = frames; if (N * 2 > (int)(sizeof(tone) / sizeof(tone[0]))) N = sizeof(tone)/sizeof(tone[0])/2;
-    for (int i = 0; i < N; i++) {
-        float t = i / (float)NOCT_AUDIO_SR;
-        float env = expf(-t * 80.0f);                  // fast decay
-        int16_t s = (int16_t)(env * sinf(2.0f * 3.14159f * freq_hz * t) * 9000);
-        tone[i*2] = s; tone[i*2+1] = s;
-    }
-    size_t bw = 0;
-    i2s_channel_write(g_i2s_tx, tone, N * 4, &bw, 8);
+// Soft UI "piano tap" -- SILENT BUILD: this is now a permanent no-op.
+// The function signature is kept so every existing call site compiles
+// unchanged. No PCM is ever written, the amp is never enabled, the TX
+// channel does not exist. The Settings "Piano taps" switch still works
+// as a user preference but has no audio effect.
+static void audio_play_tick(uint16_t /*freq_hz*/) {
+    return;
 }
 
 
@@ -1192,46 +1224,86 @@ static void face_render(int hour, int minute, int second) {
 
 
 // =============================================================================
-//  v2.0 :: ENTRANCE CHOREOGRAPHY -- staggered fade/drift on tile change
+//  v2.1 :: ENTRANCE CHOREOGRAPHY -- staggered fade/scale/drift on tile change
 // =============================================================================
+// Each child of the active tile is faded in with an easing curve, a gentle
+// upward drift (12 -> 0 px) AND a subtle scale-up (96% -> 100%). The first
+// few children animate fastest, later children get a longer delay -- which
+// reads as "headline first, content settles in, footer last".
 static void tile_enter_anim(lv_obj_t *tile) {
     if (!tile) return;
     uint32_t n = lv_obj_get_child_cnt(tile);
+    if (n == 0) return;
+    // capped per-child stagger so cards with many widgets (themes, modes)
+    // don't take 2+ seconds to settle.
+    uint32_t stride = (n > 10) ? 28 : 55;
+
     for (uint32_t i = 0; i < n; i++) {
         lv_obj_t *c = lv_obj_get_child(tile, i);
+        if (!c) continue;
+
+        // start state
         lv_obj_set_style_opa(c, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_translate_y(c, 18, 0);
+
+        uint32_t dly = stride * i;
+
+        // fade 0 -> 255 ----------------------------------------------------
         lv_anim_t a; lv_anim_init(&a);
         lv_anim_set_var(&a, c);
         lv_anim_set_values(&a, 0, 255);
-        lv_anim_set_time(&a, 600);
-        lv_anim_set_delay(&a, 60 * i);
+        lv_anim_set_time(&a, 520);
+        lv_anim_set_delay(&a, dly);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
         lv_anim_set_exec_cb(&a, [](void *o, int32_t v){
             lv_obj_set_style_opa((lv_obj_t *)o, (lv_opa_t)v, 0);
         });
-        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
         lv_anim_start(&a);
+
+        // drift 18 -> 0 -----------------------------------------------------
         lv_anim_t b; lv_anim_init(&b);
         lv_anim_set_var(&b, c);
-        lv_anim_set_values(&b, 14, 0);
-        lv_anim_set_time(&b, 600);
-        lv_anim_set_delay(&b, 60 * i);
+        lv_anim_set_values(&b, 18, 0);
+        lv_anim_set_time(&b, 620);
+        lv_anim_set_delay(&b, dly);
+        lv_anim_set_path_cb(&b, lv_anim_path_ease_out);
         lv_anim_set_exec_cb(&b, [](void *o, int32_t v){
             lv_obj_set_style_translate_y((lv_obj_t *)o, (lv_coord_t)v, 0);
         });
-        lv_anim_set_path_cb(&b, lv_anim_path_ease_out);
         lv_anim_start(&b);
+
+        // subtle scale 240 -> 256 (LVGL uses 256 = 1.0x) -------------------
+        // skip on the heaviest grid items (theme swatches, mode rows) so
+        // we don't break flex layout positioning.
+        if (n <= 8) {
+            lv_anim_t s; lv_anim_init(&s);
+            lv_anim_set_var(&s, c);
+            lv_anim_set_values(&s, 240, 256);
+            lv_anim_set_time(&s, 560);
+            lv_anim_set_delay(&s, dly);
+            lv_anim_set_path_cb(&s, lv_anim_path_ease_out);
+            lv_anim_set_exec_cb(&s, [](void *o, int32_t v){
+                lv_obj_set_style_transform_zoom((lv_obj_t *)o, (lv_coord_t)v, 0);
+            });
+            lv_anim_start(&s);
+        }
     }
 }
 static void tileview_changed_cb(lv_event_t *e) {
     lv_obj_t *act = lv_tileview_get_tile_act((lv_obj_t *)lv_event_get_target(e));
     tile_enter_anim(act);
-    audio_play_tick(660);    // soft piano-tap on every card change
+    page_indicator_update();
+    // silent build: no audio tap on card change.
 }
 
 
 // =============================================================================
 //  v2.0 :: CONCERT MODE -- charging detected -> fullscreen visualizer
 // =============================================================================
+// Forward declaration: scr_root is initialized later in the "GLOBAL UI ROOT" section,
+// but declared here so concert_enter() / journey_enter() can reference it.
+static lv_obj_t *scr_root = nullptr;
+
 static bool g_concert = false;
 static lv_obj_t *concert_overlay = NULL;
 static lv_obj_t *concert_canvas  = NULL;
@@ -1346,7 +1418,7 @@ static void journey_tick() {
 // =============================================================================
 #define CARD_COUNT 8
 
-static lv_obj_t *scr_root        = nullptr;
+// scr_root is forward-declared earlier (above concert_enter); initialize it here.
 static lv_obj_t *tileview        = nullptr;
 static lv_obj_t *tiles[CARD_COUNT] = { nullptr };
 
@@ -1355,6 +1427,11 @@ static lv_obj_t *status_dot      = nullptr;
 static lv_obj_t *status_lbl      = nullptr;
 static lv_obj_t *toast_lbl       = nullptr;
 static uint32_t  toast_until     = 0;
+
+// v2.1 -- bottom page-indicator (a row of CARD_COUNT dots that highlights
+// the active tile with a soft glow that gently breathes).
+static lv_obj_t *page_indicator           = nullptr;
+static lv_obj_t *page_dots[CARD_COUNT]    = { nullptr };
 
 // Particle drift overlay (subtle, theme-tinted)
 #define PARTICLE_N 14
@@ -1373,6 +1450,11 @@ static lv_obj_t *aura_title      = nullptr;
 static lv_obj_t *aura_mode_lbl   = nullptr;
 static lv_obj_t *aura_state_lbl  = nullptr;
 static lv_obj_t *aura_bar        = nullptr;
+// v2.1 upgrades
+static lv_obj_t *aura_halo[3]    = { nullptr };   // 3 concentric breathing rings
+static lv_obj_t *viz_energy_bar  = nullptr;       // thin live energy bar on viz card
+static lv_obj_t *met_tempo_lbl   = nullptr;       // Largo/Adagio/.../Presto label
+static lv_obj_t *bat_charge_halo = nullptr;       // pulsing halo while charging
 
 // Visualizer card widgets
 static lv_obj_t *viz_canvas      = nullptr;
@@ -1408,6 +1490,28 @@ static void tick_toast() {
     if (toast_lbl && toast_until && millis() > toast_until) {
         lv_obj_add_flag(toast_lbl, LV_OBJ_FLAG_HIDDEN);
         toast_until = 0;
+    }
+}
+
+// ---- v2.1 :: PAGE INDICATOR (highlight active tile, gently breathe) ---------
+static void page_indicator_update() {
+    if (!tileview || !page_indicator) return;
+    int act = 0;
+    lv_obj_t *t = lv_tileview_get_tile_act(tileview);
+    if (t) act = (int)((uintptr_t)lv_obj_get_user_data(t));
+    if (act < 0 || act >= CARD_COUNT) act = 0;
+
+    float br = 0.6f + 0.4f * sinf(millis() / 600.0f);  // 0.2 .. 1.0 breath
+    for (int i = 0; i < CARD_COUNT; i++) {
+        if (!page_dots[i]) continue;
+        bool sel = (i == act);
+        lv_obj_set_style_bg_color(page_dots[i],
+            sel ? LC(T()->c_accent) : LC(T()->c_muted), 0);
+        uint8_t opa = sel ? (uint8_t)(170 + 70 * br) : 60;
+        lv_obj_set_style_bg_opa(page_dots[i], opa, 0);
+        // selected dot widens slightly into a pill
+        lv_obj_set_size(page_dots[i], sel ? 14 : 6, 6);
+        lv_obj_set_style_radius(page_dots[i], 3, 0);
     }
 }
 
@@ -1629,6 +1733,24 @@ static void build_card_aura(lv_obj_t *tile) {
     lv_obj_set_style_bg_color(tile, LC(T()->c_bg), 0);
     lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
 
+    // v2.1 -- 3 concentric breathing halo arcs (drawn first so they sit behind)
+    for (int i = 0; i < 3; i++) {
+        aura_halo[i] = lv_arc_create(tile);
+        int sz = 200 + i * 50;
+        lv_obj_set_size(aura_halo[i], sz, sz);
+        lv_obj_align(aura_halo[i], LV_ALIGN_CENTER, 0, -30);
+        lv_obj_remove_style(aura_halo[i], NULL, LV_PART_KNOB);
+        lv_obj_clear_flag(aura_halo[i], LV_OBJ_FLAG_CLICKABLE);
+        lv_arc_set_rotation(aura_halo[i], 270 - 45 + i * 10);
+        lv_arc_set_bg_angles(aura_halo[i], 0, 360);
+        lv_arc_set_angles(aura_halo[i], 0, 90 + i * 30);
+        lv_obj_set_style_arc_width(aura_halo[i], 2, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(aura_halo[i], 2, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_opa(aura_halo[i], LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(aura_halo[i], LC(T()->c_accent), LV_PART_INDICATOR);
+        lv_obj_set_style_arc_opa(aura_halo[i], LV_OPA_30, LV_PART_INDICATOR);
+    }
+
     aura_title = lv_label_create(tile);
     lv_label_set_text(aura_title, "AURA ENGINE");
     lv_obj_set_style_text_font(aura_title, &lv_font_montserrat_14, 0);
@@ -1669,6 +1791,20 @@ static void update_card_aura() {
              g_aura.motion_scale, g_aura.glow_scale);
     lv_label_set_text(aura_state_lbl, buf);
     lv_bar_set_value(aura_bar, g_aura.brightness * 100 / 255, LV_ANIM_ON);
+
+    // v2.1 -- breathing halos: each ring rotates at a different speed and
+    // pulses opacity with a slow sin wave. Driven by aura motion scale.
+    float t = millis() / 1000.0f;
+    uint8_t motion = (T()->motion * g_aura.motion_scale) / 100;
+    for (int i = 0; i < 3; i++) {
+        if (!aura_halo[i]) continue;
+        int rot = (int)(t * (8 + i * 6) * (1 + motion / 60.0f)) % 360;
+        int span = 60 + i * 50 + (int)(20 * sinf(t * 0.7f + i));
+        lv_arc_set_angles(aura_halo[i], rot, (rot + span) % 360);
+        uint8_t opa = (uint8_t)(40 + 40 * sinf(t * 0.9f + i * 1.3f));
+        lv_obj_set_style_arc_opa(aura_halo[i], opa, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(aura_halo[i], LC(T()->c_accent), LV_PART_INDICATOR);
+    }
 }
 
 
@@ -1703,6 +1839,17 @@ static void build_card_viz(lv_obj_t *tile) {
     lv_obj_set_style_text_color(kind, LC(T()->c_muted), 0);
     lv_obj_set_style_text_letter_space(kind, 3, 0);
     lv_obj_align(kind, LV_ALIGN_BOTTOM_MID, 0, -70);
+
+    // v2.1 -- live energy bar (tracks audio_energy() in real time)
+    viz_energy_bar = lv_bar_create(tile);
+    lv_obj_set_size(viz_energy_bar, 280, 3);
+    lv_obj_align(viz_energy_bar, LV_ALIGN_BOTTOM_MID, 0, -50);
+    lv_bar_set_range(viz_energy_bar, 0, 100);
+    lv_obj_set_style_bg_color(viz_energy_bar, LC(T()->c_border), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(viz_energy_bar, LV_OPA_40, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(viz_energy_bar, LC(T()->c_accent), LV_PART_INDICATOR);
+    lv_obj_set_style_radius(viz_energy_bar, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(viz_energy_bar, 2, LV_PART_INDICATOR);
 }
 
 // Synthesize "music energy" -- fallback when ES8311 isn't available
@@ -1720,6 +1867,12 @@ static void update_card_viz() {
     if (!viz_canvas || !viz_buf) return;
     if (g_audio_on) g_viz_energy = audio_energy();   // v2.0: real mic energy
     else            synth_music_energy();
+    // v2.1 -- live energy bar mirrors viz_energy (smoothed)
+    if (viz_energy_bar) {
+        int pct = (int)(g_viz_energy * 100.0f);
+        if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+        lv_bar_set_value(viz_energy_bar, pct, LV_ANIM_OFF);
+    }
     lv_canvas_fill_bg(viz_canvas, LC(T()->c_bg), LV_OPA_COVER);
     g_viz_phase += 0.06f * (0.5f + g_viz_energy);
     const char *k = T()->viz_kind;
@@ -1824,9 +1977,17 @@ static void build_card_metronome(lv_obj_t *tile) {
     met_state_lbl = lv_label_create(tile);
     lv_obj_set_style_text_font(met_state_lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(met_state_lbl, LC(T()->c_muted), 0);
-    lv_label_set_text(met_state_lbl, "tap to start  .  BPM");
+    lv_label_set_text(met_state_lbl, "tap to start  .  tap 3x to set BPM");
     lv_obj_set_style_text_letter_space(met_state_lbl, 3, 0);
     lv_obj_align(met_state_lbl, LV_ALIGN_CENTER, 0, 30);
+
+    // v2.1 -- musical tempo classification (Largo / Adagio / .../ Presto)
+    met_tempo_lbl = lv_label_create(tile);
+    lv_obj_set_style_text_font(met_tempo_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(met_tempo_lbl, LC(T()->c_warm), 0);
+    lv_obj_set_style_text_letter_space(met_tempo_lbl, 5, 0);
+    lv_label_set_text(met_tempo_lbl, "");
+    lv_obj_align(met_tempo_lbl, LV_ALIGN_CENTER, 0, 56);
 
     // -- and + pill buttons
     auto mk_btn = [&](const char *txt, lv_align_t al, int ox, lv_event_cb_t cb) {
@@ -1852,8 +2013,56 @@ static void build_card_metronome(lv_obj_t *tile) {
 }
 
 static void met_toggle_cb(lv_event_t *e) {
+    // ---- v2.1 :: TAP-TEMPO + TOGGLE ----------------------------------
+    // Tap the ring repeatedly (gaps < 1500 ms) and we average the last
+    // few intervals into a new BPM. A single isolated tap (no follow-up
+    // within 1500 ms) toggles play/pause via the deferred logic below.
+    static uint32_t taps[6] = {0};
+    static uint8_t  tap_idx = 0;
+    static uint8_t  tap_count = 0;
+
+    uint32_t now = millis();
+    uint32_t last = tap_idx ? taps[(tap_idx - 1) % 6] : 0;
+    uint32_t gap  = last ? (now - last) : 0xFFFFFFFFu;
+
+    if (gap < 1500 && gap > 200) {
+        // tap-tempo mode -- record this gap
+        taps[tap_idx % 6] = now;
+        tap_idx++;
+        if (tap_count < 6) tap_count++;
+
+        if (tap_count >= 3) {
+            // average the last (tap_count - 1) inter-tap intervals
+            uint32_t sum = 0; uint8_t k = 0;
+            uint8_t start = (tap_idx >= tap_count) ? (tap_idx - tap_count) : 0;
+            for (uint8_t i = start + 1; i < tap_idx; i++) {
+                uint32_t a = taps[(i - 1) % 6];
+                uint32_t b = taps[i % 6];
+                if (b > a) { sum += (b - a); k++; }
+            }
+            if (k > 0) {
+                uint32_t avg_ms = sum / k;
+                uint16_t bpm = (uint16_t)(60000UL / avg_ms);
+                if (bpm < 30)  bpm = 30;
+                if (bpm > 200) bpm = 200;
+                g_metro_bpm = bpm;
+                if (met_bpm_lbl) lv_label_set_text_fmt(met_bpm_lbl, "%d", g_metro_bpm);
+                state_save();
+                char buf[24];
+                snprintf(buf, sizeof(buf), "tap tempo . %d", g_metro_bpm);
+                show_toast(buf, 900);
+            }
+        } else {
+            show_toast("tap . tap . tap", 700);
+        }
+        g_metro_last = now;
+        return;
+    }
+
+    // isolated tap -> reset tap-tempo buffer and toggle play/pause
+    tap_idx = 0; tap_count = 0; taps[0] = now;
     g_metro_on = !g_metro_on;
-    g_metro_last = millis();
+    g_metro_last = now;
     state_save();
     show_toast(g_metro_on ? "metronome . on" : "metronome . off", 1200);
 }
@@ -1881,7 +2090,24 @@ static void update_card_metronome() {
     uint8_t opa = 80 + g_metro_pulse * 175 / 255;
     if (opa > 255) opa = 255;
     lv_obj_set_style_arc_opa(met_pulse_arc, opa, LV_PART_INDICATOR);
-    lv_label_set_text(met_state_lbl, g_metro_on ? "playing . BPM" : "tap to start . BPM");
+    lv_label_set_text(met_state_lbl, g_metro_on ? "playing . BPM" : "tap arc . tap 3x to set tempo");
+
+    // v2.1 -- musical tempo classification (Italian dynamics)
+    if (met_tempo_lbl) {
+        const char *t;
+        uint16_t b = g_metro_bpm;
+        if      (b < 40)  t = "GRAVE";
+        else if (b < 60)  t = "LARGO";
+        else if (b < 66)  t = "LARGHETTO";
+        else if (b < 76)  t = "ADAGIO";
+        else if (b < 108) t = "ANDANTE";
+        else if (b < 120) t = "MODERATO";
+        else if (b < 156) t = "ALLEGRO";
+        else if (b < 176) t = "VIVACE";
+        else if (b < 200) t = "PRESTO";
+        else              t = "PRESTISSIMO";
+        lv_label_set_text(met_tempo_lbl, t);
+    }
 }
 
 
@@ -1889,11 +2115,26 @@ static void update_card_metronome() {
 //  CARD 4 :: THEME STUDIO -- pick 1 of 9 emotional environments
 // =============================================================================
 static void rebuild_all_cards();   // forward
+// v2.1 -- richer Theme Studio with live preview on press
+static void theme_swatch_press_cb(lv_event_t *e) {
+    int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= THEME_COUNT) return;
+    // live preview: only update the headline labels, no full rebuild yet
+    if (th_name_lbl) lv_label_set_text(th_name_lbl, THEMES[i].name);
+    if (th_mood_lbl) lv_label_set_text(th_mood_lbl, THEMES[i].mood);
+}
+static void theme_swatch_release_cb(lv_event_t *e) {
+    // restore preview labels to the currently committed theme on release-without-click
+    if (th_name_lbl) lv_label_set_text(th_name_lbl, T()->name);
+    if (th_mood_lbl) lv_label_set_text(th_mood_lbl, T()->mood);
+}
 static void theme_select_cb(lv_event_t *e) {
     int i = (int)(intptr_t)lv_event_get_user_data(e);
     if (i < 0 || i >= THEME_COUNT) return;
     g_theme_idx = i;
     g_metro_bpm = THEMES[i].bpm;
+    g_last_manual_theme_ms = millis();
+    g_theme_since_ms = millis();
     state_save();
     show_toast(THEMES[i].name, 1400);
     rebuild_all_cards();
@@ -1922,46 +2163,96 @@ static void build_card_themes(lv_obj_t *tile) {
     lv_obj_set_style_text_letter_space(th_mood_lbl, 3, 0);
     lv_obj_align(th_mood_lbl, LV_ALIGN_TOP_MID, 0, 140);
 
-    // 3x3 swatch grid (9 themes)
+    // v2.1 -- "press to preview . tap to apply" subtitle hint
+    lv_obj_t *hint = lv_label_create(tile);
+    lv_label_set_text(hint, "press to preview  .  tap to apply");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, LC(T()->c_muted), 0);
+    lv_obj_set_style_text_letter_space(hint, 2, 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_MID, 0, 168);
+
+    // grid (auto-flows for 9 or 10 themes)
     th_swatch_grid = lv_obj_create(tile);
     lv_obj_remove_style_all(th_swatch_grid);
-    lv_obj_set_size(th_swatch_grid, 300, 220);
-    lv_obj_align(th_swatch_grid, LV_ALIGN_CENTER, 0, 40);
+    lv_obj_set_size(th_swatch_grid, 320, 232);
+    lv_obj_align(th_swatch_grid, LV_ALIGN_CENTER, 0, 48);
     lv_obj_set_layout(th_swatch_grid, LV_LAYOUT_FLEX);
     lv_obj_set_flex_flow(th_swatch_grid, LV_FLEX_FLOW_ROW_WRAP);
     lv_obj_set_flex_align(th_swatch_grid, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_gap(th_swatch_grid, 10, 0);
+    lv_obj_set_style_pad_gap(th_swatch_grid, 8, 0);
+    lv_obj_clear_flag(th_swatch_grid, LV_OBJ_FLAG_SCROLLABLE);
 
     for (int i = 0; i < THEME_COUNT; i++) {
+        bool sel = (i == g_theme_idx);
         lv_obj_t *sw = lv_obj_create(th_swatch_grid);
         lv_obj_remove_style_all(sw);
-        lv_obj_set_size(sw, 86, 60);
-        lv_obj_set_style_radius(sw, 12, 0);
+        lv_obj_set_size(sw, 92, 66);
+        lv_obj_set_style_radius(sw, 14, 0);
         lv_obj_set_style_bg_color(sw, LC(THEMES[i].c_card), 0);
         lv_obj_set_style_bg_opa(sw, LV_OPA_COVER, 0);
         lv_obj_set_style_border_color(sw, LC(THEMES[i].c_accent), 0);
-        lv_obj_set_style_border_width(sw, (i == g_theme_idx) ? 2 : 1, 0);
-        lv_obj_set_style_border_opa(sw, (i == g_theme_idx) ? LV_OPA_80 : LV_OPA_40, 0);
+        lv_obj_set_style_border_width(sw, sel ? 3 : 1, 0);
+        lv_obj_set_style_border_opa(sw, sel ? LV_OPA_90 : LV_OPA_30, 0);
+        // glowing shadow on selected swatch
+        if (sel) {
+            lv_obj_set_style_shadow_color(sw, LC(THEMES[i].c_accent), 0);
+            lv_obj_set_style_shadow_opa(sw, LV_OPA_60, 0);
+            lv_obj_set_style_shadow_width(sw, 18, 0);
+            lv_obj_set_style_shadow_spread(sw, 1, 0);
+        }
         lv_obj_clear_flag(sw, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_flag(sw, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_add_event_cb(sw, theme_select_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+        lv_obj_add_event_cb(sw, theme_select_cb,         LV_EVENT_CLICKED,     (void *)(intptr_t)i);
+        lv_obj_add_event_cb(sw, theme_swatch_press_cb,   LV_EVENT_PRESSED,     (void *)(intptr_t)i);
+        lv_obj_add_event_cb(sw, theme_swatch_release_cb, LV_EVENT_PRESS_LOST,  (void *)(intptr_t)i);
+        lv_obj_add_event_cb(sw, theme_swatch_release_cb, LV_EVENT_RELEASED,    (void *)(intptr_t)i);
 
-        // accent dot
-        lv_obj_t *dot = lv_obj_create(sw);
-        lv_obj_remove_style_all(dot);
-        lv_obj_set_size(dot, 8, 8);
-        lv_obj_set_style_radius(dot, 4, 0);
-        lv_obj_set_style_bg_color(dot, LC(THEMES[i].c_accent), 0);
-        lv_obj_set_style_bg_opa(dot, LV_OPA_90, 0);
-        lv_obj_align(dot, LV_ALIGN_TOP_LEFT, 6, 6);
+        // v2.1 -- 3-color palette stripe at the top (accent | warm | text)
+        lv_obj_t *stripe = lv_obj_create(sw);
+        lv_obj_remove_style_all(stripe);
+        lv_obj_set_size(stripe, 76, 6);
+        lv_obj_set_style_radius(stripe, 3, 0);
+        lv_obj_set_style_bg_color(stripe, LC(THEMES[i].c_accent), 0);
+        lv_obj_set_style_bg_opa(stripe, LV_OPA_90, 0);
+        lv_obj_align(stripe, LV_ALIGN_TOP_MID, 0, 6);
 
+        lv_obj_t *stripeB = lv_obj_create(sw);
+        lv_obj_remove_style_all(stripeB);
+        lv_obj_set_size(stripeB, 24, 4);
+        lv_obj_set_style_radius(stripeB, 2, 0);
+        lv_obj_set_style_bg_color(stripeB, LC(THEMES[i].c_warm), 0);
+        lv_obj_set_style_bg_opa(stripeB, LV_OPA_80, 0);
+        lv_obj_align(stripeB, LV_ALIGN_TOP_LEFT, 8, 16);
+
+        lv_obj_t *stripeC = lv_obj_create(sw);
+        lv_obj_remove_style_all(stripeC);
+        lv_obj_set_size(stripeC, 16, 4);
+        lv_obj_set_style_radius(stripeC, 2, 0);
+        lv_obj_set_style_bg_color(stripeC, LC(THEMES[i].c_text), 0);
+        lv_obj_set_style_bg_opa(stripeC, LV_OPA_60, 0);
+        lv_obj_align(stripeC, LV_ALIGN_TOP_LEFT, 36, 16);
+
+        // theme name
         lv_obj_t *l = lv_label_create(sw);
         lv_label_set_text(l, THEMES[i].name);
         lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_color(l, LC(THEMES[i].c_text), 0);
-        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(l, 74);
+        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(l, 80);
         lv_obj_align(l, LV_ALIGN_BOTTOM_LEFT, 6, -4);
+
+        // selected badge (small dot, top-right) for the active theme
+        if (sel) {
+            lv_obj_t *badge = lv_obj_create(sw);
+            lv_obj_remove_style_all(badge);
+            lv_obj_set_size(badge, 10, 10);
+            lv_obj_set_style_radius(badge, 5, 0);
+            lv_obj_set_style_bg_color(badge, LC(THEMES[i].c_accent), 0);
+            lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, 0);
+            lv_obj_set_style_border_color(badge, LC(THEMES[i].c_text), 0);
+            lv_obj_set_style_border_width(badge, 1, 0);
+            lv_obj_align(badge, LV_ALIGN_TOP_RIGHT, -6, 6);
+        }
     }
 }
 
@@ -2101,20 +2392,31 @@ static void build_card_settings(lv_obj_t *tile) {
     lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *lab = lv_label_create(row);
-    lv_label_set_text(lab, "Piano taps");
+    lv_label_set_text(lab, "Silent Mode");
     lv_obj_set_style_text_font(lab, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(lab, LC(T()->c_text), 0);
     lv_obj_align(lab, LV_ALIGN_LEFT_MID, 0, -6);
 
     lv_obj_t *sub = lv_label_create(row);
-    lv_label_set_text(sub, "soft UI sound on touch");
+    lv_label_set_text(sub, "all UI audio is permanently off");
     lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(sub, LC(T()->c_muted), 0);
     lv_obj_set_style_text_letter_space(sub, 2, 0);
     lv_obj_align(sub, LV_ALIGN_LEFT_MID, 0, 12);
 
+    // Static silent-mode indicator on the right (no toggle -- always silent)
+    lv_obj_t *dot = lv_obj_create(row);
+    lv_obj_remove_style_all(dot);
+    lv_obj_set_size(dot, 10, 10);
+    lv_obj_set_style_radius(dot, 5, 0);
+    lv_obj_set_style_bg_color(dot, LC(T()->c_accent), 0);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_90, 0);
+    lv_obj_align(dot, LV_ALIGN_RIGHT_MID, -6, 0);
+
+    // (legacy switch object kept hidden so existing NVS key stays valid)
     lv_obj_t *sw = lv_switch_create(row);
-    lv_obj_set_size(sw, 52, 28);
+    lv_obj_add_flag(sw, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_size(sw, 1, 1);
     lv_obj_align(sw, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_set_style_bg_color(sw, LC(T()->c_border), LV_PART_MAIN);
     lv_obj_set_style_bg_color(sw, LC(T()->c_accent), LV_PART_INDICATOR);
@@ -2196,11 +2498,11 @@ static void update_card_settings() {
     char buf[160];
     int batt = g_has_pmu ? g_pmu.getBatteryPercent() : -1;
     snprintf(buf, sizeof(buf),
-        "Nocturne OS  v2.0\nLauncherOS-compatible  .  AMOLED 2.06\n"
+        "Nocturne OS  v2.1  .  silent build\nLauncherOS-compatible  .  AMOLED 2.06\n"
         "theme: %s  .  aura: %s\n"
-        "audio: %s  .  imu: %s\n%s%s",
+        "mic: %s  .  imu: %s\n%s%s",
         T()->name, AURA_NAMES[g_aura_mode],
-        g_audio_on ? "ES8311 mic" : "synth",
+        g_audio_on ? "ES8311 viz" : "off",
         g_has_imu  ? "QMI8658"    : "off",
         batt >= 0 ? "battery " : "",
         batt >= 0 ? String(String(batt) + "%").c_str() : "");
@@ -2228,6 +2530,20 @@ static void build_card_battery(lv_obj_t *tile) {
     lv_obj_set_style_text_color(eye, LC(T()->c_warm), 0);
     lv_obj_set_style_text_letter_space(eye, 4, 0);
     lv_obj_align(eye, LV_ALIGN_TOP_MID, 0, 90);
+
+    // v2.1 -- pulsing halo arc behind the main arc (only visible while charging)
+    bat_charge_halo = lv_arc_create(tile);
+    lv_obj_set_size(bat_charge_halo, 320, 320);
+    lv_obj_align(bat_charge_halo, LV_ALIGN_CENTER, 0, -10);
+    lv_obj_remove_style(bat_charge_halo, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(bat_charge_halo, LV_OBJ_FLAG_CLICKABLE);
+    lv_arc_set_rotation(bat_charge_halo, 135);
+    lv_arc_set_bg_angles(bat_charge_halo, 0, 270);
+    lv_arc_set_value(bat_charge_halo, 100);
+    lv_obj_set_style_arc_width(bat_charge_halo, 14, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_opa(bat_charge_halo, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(bat_charge_halo, lv_color_hex(0x00FF80), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_opa(bat_charge_halo, LV_OPA_TRANSP, LV_PART_INDICATOR);
 
     bat_arc = lv_arc_create(tile);
     lv_obj_set_size(bat_arc, 280, 280);
@@ -2299,12 +2615,38 @@ static void update_card_battery() {
     if (vbat > 0) lv_label_set_text_fmt(bat_volt_lbl, "%.2f V", vbat);
     else          lv_label_set_text(bat_volt_lbl, "-- V");
     if (pct >= 0) lv_arc_set_value(bat_arc, pct);
-    lv_label_set_text(bat_state_lbl, charging ? "charging" : (pct >= 0 ? "discharging" : "no pmu"));
+
+    // v2.1 -- richer status text + emoji-free state phrase
+    const char *phrase = "discharging";
+    if (pct < 0)              phrase = "no pmu";
+    else if (charging)        phrase = (pct >= 95) ? "trickle charging" : "charging";
+    else if (pct < 10)        phrase = "low . please charge";
+    else if (pct < 25)        phrase = "discharging . low";
+    else if (pct > 90)        phrase = "discharging . full";
+
+    lv_label_set_text(bat_state_lbl, phrase);
     lv_obj_set_style_bg_color(bat_dot, charging ? lv_color_hex(0x00FF80)
                                                 : LC(T()->c_muted), 0);
+
     // gentle breathing on the indicator opacity
     uint8_t breathe = 180 + (uint8_t)(40 * sinf(millis() / 1500.0f));
     lv_obj_set_style_arc_opa(bat_arc, breathe, LV_PART_INDICATOR);
+
+    // v2.1 -- pulsing green halo behind the arc when charging
+    if (bat_charge_halo) {
+        if (charging) {
+            // fast pulse 0.6Hz, opacity 0..LV_OPA_50
+            float p = 0.5f + 0.5f * sinf(millis() / 280.0f);
+            uint8_t opa = (uint8_t)(p * 110);
+            lv_obj_set_style_arc_opa(bat_charge_halo, opa, LV_PART_INDICATOR);
+            // bat dot also pulses brightness
+            uint8_t dopa = (uint8_t)(160 + 80 * p);
+            lv_obj_set_style_bg_opa(bat_dot, dopa, 0);
+        } else {
+            lv_obj_set_style_arc_opa(bat_charge_halo, LV_OPA_TRANSP, LV_PART_INDICATOR);
+            lv_obj_set_style_bg_opa(bat_dot, LV_OPA_80, 0);
+        }
+    }
 }
 
 
@@ -2402,10 +2744,29 @@ static void build_root_ui() {
     lv_obj_align(toast_lbl, LV_ALIGN_BOTTOM_MID, 0, -20);
     lv_obj_add_flag(toast_lbl, LV_OBJ_FLAG_HIDDEN);
 
+    // v2.1 -- bottom page-indicator dots (one per tile) ---------------------
+    page_indicator = lv_obj_create(scr_root);
+    lv_obj_remove_style_all(page_indicator);
+    int dot_pitch = 14;
+    lv_obj_set_size(page_indicator, dot_pitch * CARD_COUNT, 14);
+    lv_obj_align(page_indicator, LV_ALIGN_BOTTOM_MID, 0, -24);
+    lv_obj_set_style_bg_opa(page_indicator, LV_OPA_0, 0);
+    lv_obj_clear_flag(page_indicator, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    for (int i = 0; i < CARD_COUNT; i++) {
+        page_dots[i] = lv_obj_create(page_indicator);
+        lv_obj_remove_style_all(page_dots[i]);
+        lv_obj_set_size(page_dots[i], 6, 6);
+        lv_obj_set_style_radius(page_dots[i], 3, 0);
+        lv_obj_set_style_bg_color(page_dots[i], LC(T()->c_muted), 0);
+        lv_obj_set_style_bg_opa(page_dots[i], LV_OPA_40, 0);
+        lv_obj_set_pos(page_dots[i], i * dot_pitch + 4, 4);
+    }
+
     // particles -- drift on top of everything (slow, theme tinted)
     particles_init(scr_root);
 
     rebuild_all_cards();
+    page_indicator_update();
 }
 
 
@@ -2501,33 +2862,15 @@ void loop() {
         }
     }
 
-    // ~30 Hz: visualizer + metronome
+    // ~30 Hz: visualizer + metronome + page-indicator breath
     static uint32_t g_last_anim = 0;
     if (now - g_last_anim >= 33) {
         g_last_anim = now;
         update_card_viz();
         update_card_metronome();
+        page_indicator_update();
     }
 
     delay(5);
 }
-compute aura every minute
-        static uint8_t prev_hour = 99;
-        time_t t; time(&t); struct tm tm; localtime_r(&t, &tm);
-        if (tm.tm_hour != prev_hour) { prev_hour = tm.tm_hour; aura_recompute(); }
-        if (g_time_valid && now - g_last_save >= 60000UL) {
-            g_last_save = now;
-            state_save();
-        }
-    }
 
-    // ~30 Hz: visualizer + metronome
-    static uint32_t g_last_anim = 0;
-    if (now - g_last_anim >= 33) {
-        g_last_anim = now;
-        update_card_viz();
-        update_card_metronome();
-    }
-
-    delay(5);
-}

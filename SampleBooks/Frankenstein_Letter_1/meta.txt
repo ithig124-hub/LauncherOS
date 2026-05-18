@@ -1,0 +1,4 @@
+TITLE=Frankenstein - Letter 1
+AUTHOR=Mary Shelley
+GENRE=Gothic
+THEME=Crimson

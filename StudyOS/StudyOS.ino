@@ -57,10 +57,64 @@
 //      above the file, so any enum/struct used in a return/arg type must be
 //      defined before those prototypes — i.e. here, at the very top.) ----
 enum Tab { TAB_HOME = 0, TAB_POMO, TAB_TASK, TAB_CARDS, TAB_ANALYTICS };
-enum PomoPhase { PH_IDLE = 0, PH_WORK, PH_BREAK, PH_DONE };
+enum PomoPhase { PH_IDLE = 0, PH_WORK, PH_BREAK, PH_LONG_BREAK, PH_DONE };
 struct PomoPreset { const char *name; int work_min; int break_min; };
 struct Task { char text[64]; bool done; };
 struct Card { char front[80]; char pinyin[80]; char back[80]; bool has_pinyin; };
+
+// ---- v1.1 i18n -- English / 中文 ---------------------------------------------
+// To render Chinese glyphs natively, enable the LVGL built-in CJK font in your
+// lv_conf.h:    #define LV_FONT_SIMSUN_16_CJK 1
+// then flip the macro below to 1. With it OFF (default), the build still
+// switches to Chinese strings but missing glyphs render as boxes -- the
+// language toggle still works for romanized labels.
+#ifndef STUDYOS_ENABLE_CHINESE
+#define STUDYOS_ENABLE_CHINESE 1
+#endif
+
+enum StrId {
+  K_POMODORO, K_FOCUS, K_TASKS, K_CARDS, K_STATS, K_HOME,
+  K_START, K_PAUSE, K_PRESET, K_IDLE_, K_WORK, K_BREAK, K_LONG_BREAK,
+  K_EXAM_MODE, K_EXAM_DESC, K_SUBJECT,
+  K_TODAY, K_STREAK, K_SESSIONS, K_BEST,
+  K_REMEMBERED, K_REVIEW, K_NOTES, K_FOCUS_FLOW,
+  K_DEEP, K_QUICK, K_LANG_NAME,
+  K_COUNT
+};
+// Two-column localization table (0=EN, 1=ZH). Keep romaji-only fallback paths
+// so the OS is still usable if the CJK font isn't compiled in.
+static const char *I18N[K_COUNT][2] = {
+  /* K_POMODORO   */ { "POMODORO",        "番茄钟" },
+  /* K_FOCUS      */ { "FOCUS",           "专注"   },
+  /* K_TASKS      */ { "TASKS",           "任务"   },
+  /* K_CARDS      */ { "CARDS",           "闪卡"   },
+  /* K_STATS      */ { "STATS",           "数据"   },
+  /* K_HOME       */ { "HOME",            "主页"   },
+  /* K_START      */ { "START",           "开始"   },
+  /* K_PAUSE      */ { "PAUSE",           "暂停"   },
+  /* K_PRESET     */ { "PRESET",          "模式"   },
+  /* K_IDLE_      */ { "IDLE",            "待机"   },
+  /* K_WORK       */ { "WORK",            "工作中" },
+  /* K_BREAK      */ { "BREAK",           "休息"   },
+  /* K_LONG_BREAK */ { "LONG BREAK",      "长休息" },
+  /* K_EXAM_MODE  */ { "EXAM MODE",       "考试模式" },
+  /* K_EXAM_DESC  */ { "90 min, no break","90 分钟 . 无休息" },
+  /* K_SUBJECT    */ { "SUBJECT",         "科目"   },
+  /* K_TODAY      */ { "TODAY",           "今天"   },
+  /* K_STREAK     */ { "STREAK",          "连胜"   },
+  /* K_SESSIONS   */ { "SESSIONS",        "次数"   },
+  /* K_BEST       */ { "BEST",            "最佳"   },
+  /* K_REMEMBERED */ { "REMEMBERED",      "已记住" },
+  /* K_REVIEW     */ { "REVIEW",          "需复习" },
+  /* K_NOTES      */ { "NOTES",           "笔记"   },
+  /* K_FOCUS_FLOW */ { "FOCUS FLOW",      "心流"   },
+  /* K_DEEP       */ { "DEEP",            "深度"   },
+  /* K_QUICK      */ { "QUICK",           "短时"   },
+  /* K_LANG_NAME  */ { "ENGLISH",         "中文"   },
+};
+// 0 = English, 1 = 中文. Persisted to NVS key "lang".
+static uint8_t g_lang = 0;
+static inline const char *tr(StrId k) { return I18N[k][g_lang ? 1 : 0]; }
 
 // ---- Pin map (must match LauncherOS) ----------------------------------------
 #define LCD_SDIO0   4
@@ -314,6 +368,7 @@ static bool wifi_sync_once() {
 #define S_ACCENT   0x4FB3FF   // muted blue
 #define S_OK       0x4FFFA0   // streak / done
 #define S_WARN     0xFFB300
+#define S_BAD      0xFF4040   // recording / destructive red
 #define S_CYAN     0x00E5FF   // back-to-launcher only
 #define S_FLOW_BG  0x000000   // flow mode bg
 #define S_FLOW_TXT 0xA0A0A0   // dimmed text in flow
@@ -325,15 +380,24 @@ static const PomoPreset PRESETS[] = {
     { "DEEP",  50, 10 },
     { "FOCUS", 25,  5 },
     { "QUICK", 15,  3 },
-    { "EXAM",  90,  0 }
+    { "EXAM",  90,  0 },
+    { "LONG",  15,  0 }   // v1.1 -- inserted automatically after 4 work pomos
 };
-#define NUM_PRESETS 4
+#define NUM_PRESETS 5
+#define PRESET_LONG_BREAK 4   // index of the LONG preset (used for auto cycle)
 
 static int        g_preset_idx = 1;        // default FOCUS
 static PomoPhase  g_phase      = PH_IDLE;
 static uint32_t   g_phase_t0   = 0;
 static uint32_t   g_phase_len_ms = 0;
 static bool       g_exam_mode  = false;
+
+// v1.1 -- deep-cycle session tracker (4-pomodoro classic cadence)
+static uint8_t    g_session_pomos = 0;     // 0..3, resets after long break
+static uint16_t   g_total_pomos   = 0;     // monotonic, persisted
+static uint32_t   g_bloom_until   = 0;     // ms timestamp for outer ring bloom
+static lv_obj_t  *pomo_session_dots[4] = { nullptr };
+static lv_obj_t  *pomo_bloom_arc       = nullptr;
 
 // Subject tagging
 static const char *SUBJECTS[] = { "GENERAL", "MATH", "SCIENCE", "LANG", "HISTORY", "OTHER" };
@@ -348,6 +412,19 @@ static uint32_t g_today_seconds  = 0;
 static uint32_t g_total_sessions = 0;
 static uint32_t g_streak_days    = 0;
 static uint16_t g_streak_yday    = 0xFFFF;  // last counted day-of-year
+
+// v1.3 -- Reading tracker (daily reading goal + streak + 21:00 nudge)
+static uint16_t g_read_goal_min    = 20;       // daily target, minutes
+static uint16_t g_read_today_min   = 0;        // minutes read today
+static uint16_t g_read_streak      = 0;        // consecutive days hit goal
+static uint16_t g_read_yday        = 0xFFFF;   // last day-of-year touched
+static bool     g_read_active      = false;    // session in progress?
+static uint32_t g_read_t0          = 0;        // session start (millis)
+static uint16_t g_read_reminder_h  = 21;       // 9 PM reminder
+static bool     g_read_nudged_today= false;
+static lv_obj_t *home_read_bar     = nullptr;
+static lv_obj_t *home_read_lbl     = nullptr;
+static lv_obj_t *home_read_btn_lbl = nullptr;
 static uint16_t g_today_yday     = 0xFFFF;
 
 // Flow mode trigger
@@ -376,6 +453,10 @@ static void prefs_load() {
     g_total_sessions = g_prefs.getULong("sessions", 0);
     g_streak_days    = g_prefs.getULong("streak", 0);
     g_streak_yday    = g_prefs.getUShort("syday", 0xFFFF);
+    g_read_goal_min  = g_prefs.getUShort("rdgoal", 20);
+    g_read_today_min = g_prefs.getUShort("rdtoday", 0);
+    g_read_streak    = g_prefs.getUShort("rdstrk", 0);
+    g_read_yday      = g_prefs.getUShort("rdyday", 0xFFFF);
     g_today_yday     = g_prefs.getUShort("tyday", 0xFFFF);
     g_task_done_bits = g_prefs.getULong("tasks_done", 0);
     g_preset_idx     = g_prefs.getUInt("preset", 1);
@@ -384,6 +465,8 @@ static void prefs_load() {
         char k[8]; snprintf(k, sizeof(k), "ss%d", i);
         g_subject_seconds[i] = g_prefs.getULong(k, 0);
     }
+    g_lang        = g_prefs.getUChar("lang", 0);
+    g_total_pomos = g_prefs.getUShort("totpomo", 0);
     g_prefs.end();
 }
 static void prefs_save() {
@@ -392,6 +475,10 @@ static void prefs_save() {
     g_prefs.putULong ("sessions", g_total_sessions);
     g_prefs.putULong ("streak", g_streak_days);
     g_prefs.putUShort("syday", g_streak_yday);
+    g_prefs.putUShort("rdgoal",  g_read_goal_min);
+    g_prefs.putUShort("rdtoday", g_read_today_min);
+    g_prefs.putUShort("rdstrk",  g_read_streak);
+    g_prefs.putUShort("rdyday",  g_read_yday);
     g_prefs.putUShort("tyday", g_today_yday);
     g_prefs.putULong ("tasks_done", g_task_done_bits);
     g_prefs.putUInt  ("preset", g_preset_idx);
@@ -400,6 +487,8 @@ static void prefs_save() {
         char k[8]; snprintf(k, sizeof(k), "ss%d", i);
         g_prefs.putULong(k, g_subject_seconds[i]);
     }
+    g_prefs.putUChar ("lang", g_lang);
+    g_prefs.putUShort("totpomo", g_total_pomos);
     g_prefs.end();
 }
 
@@ -462,37 +551,31 @@ static void load_tasks() {
 
 static void load_cards() {
     g_card_count = 0;
-    File dir = SD_MMC.open("/WATCH/study/cards");
-    if (!dir || !dir.isDirectory()) return;
-    File f = dir.openNextFile();
-    while (f && g_card_count < MAX_CARDS) {
-        String n = f.name(); n.toLowerCase();
-        if (n.endsWith(".txt")) {
-            while (f.available() && g_card_count < MAX_CARDS) {
-                String line = f.readStringUntil('\n'); line.trim();
-                if (!line.length() || line.startsWith("#")) continue;
-                int p1 = line.indexOf('|');
-                if (p1 < 0) continue;
-                int p2 = line.indexOf('|', p1 + 1);
-                Card &c = g_cards[g_card_count];
-                memset(&c, 0, sizeof(c));
-                if (p2 < 0) {
-                    // 2-field: front|back
-                    strncpy(c.front, line.substring(0, p1).c_str(), sizeof(c.front)-1);
-                    strncpy(c.back,  line.substring(p1 + 1).c_str(),  sizeof(c.back)-1);
-                    c.has_pinyin = false;
-                } else {
-                    // 3-field: front|pinyin|back  (Chinese cheat-sheet mode)
-                    strncpy(c.front,  line.substring(0, p1).c_str(),         sizeof(c.front)-1);
-                    strncpy(c.pinyin, line.substring(p1 + 1, p2).c_str(),    sizeof(c.pinyin)-1);
-                    strncpy(c.back,   line.substring(p2 + 1).c_str(),        sizeof(c.back)-1);
-                    c.has_pinyin = true;
-                }
-                g_card_count++;
-            }
+    // v1.2 -- Chinese-learning mode: a single, dedicated deck at
+    //         /WATCH/studyOS/chinese.txt    format: 汉字|pinyin|english
+    File f = SD_MMC.open("/WATCH/studyOS/chinese.txt", FILE_READ);
+    if (!f) return;
+    while (f.available() && g_card_count < MAX_CARDS) {
+        String line = f.readStringUntil('\n'); line.trim();
+        if (!line.length() || line.startsWith("#")) continue;
+        int p1 = line.indexOf('|');
+        if (p1 < 0) continue;
+        int p2 = line.indexOf('|', p1 + 1);
+        Card &c = g_cards[g_card_count];
+        memset(&c, 0, sizeof(c));
+        if (p2 < 0) {
+            strncpy(c.front, line.substring(0, p1).c_str(), sizeof(c.front)-1);
+            strncpy(c.back,  line.substring(p1 + 1).c_str(),  sizeof(c.back)-1);
+            c.has_pinyin = false;
+        } else {
+            strncpy(c.front,  line.substring(0, p1).c_str(),         sizeof(c.front)-1);
+            strncpy(c.pinyin, line.substring(p1 + 1, p2).c_str(),    sizeof(c.pinyin)-1);
+            strncpy(c.back,   line.substring(p2 + 1).c_str(),        sizeof(c.back)-1);
+            c.has_pinyin = true;
         }
-        f = dir.openNextFile();
+        g_card_count++;
     }
+    f.close();
 }
 
 // =============================================================================
@@ -554,15 +637,91 @@ static void tick_toast() {
 // =============================================================================
 //  Pomodoro engine
 // =============================================================================
+// =========================================================================
+//  v1.3 -- Reading tracker  (daily goal, streak, 21:00 nudge)
+// =========================================================================
+static int current_yday() {
+    time_t now = time(nullptr);
+    struct tm tm_now; localtime_r(&now, &tm_now);
+    return tm_now.tm_yday;
+}
+static void reading_rollover_if_needed() {
+    int yd = current_yday();
+    if (g_read_yday != (uint16_t)yd) {
+        // yesterday wrap up: if goal was hit, bump streak; otherwise reset
+        if (g_read_yday != 0xFFFF) {
+            if (g_read_today_min >= g_read_goal_min) g_read_streak++;
+            else                                     g_read_streak = 0;
+        }
+        g_read_today_min   = 0;
+        g_read_yday        = (uint16_t)yd;
+        g_read_nudged_today= false;
+        if (g_read_active) {                                  // close any session
+            uint32_t mins = (millis() - g_read_t0) / 60000UL;
+            g_read_active = false;
+            g_read_t0     = 0;
+            (void)mins;
+        }
+        prefs_save();
+    }
+}
+static void reading_toggle_cb(lv_event_t *) {
+    reading_rollover_if_needed();
+    if (!g_read_active) {
+        g_read_active = true;
+        g_read_t0     = millis();
+        show_toast("READING . session started", 1200);
+        if (home_read_btn_lbl) lv_label_set_text(home_read_btn_lbl, "STOP");
+    } else {
+        uint32_t mins = (millis() - g_read_t0) / 60000UL;
+        if (mins == 0) mins = 1;                               // round up < 1 min
+        g_read_today_min += (uint16_t)mins;
+        if (g_read_today_min > 999) g_read_today_min = 999;
+        g_read_active = false; g_read_t0 = 0;
+        prefs_save();
+        char m[64];
+        snprintf(m, sizeof(m), "READING . +%lu min . %u / %u today",
+                 mins, g_read_today_min, g_read_goal_min);
+        show_toast(m, 1500);
+        if (home_read_btn_lbl) lv_label_set_text(home_read_btn_lbl, "READ");
+    }
+}
+// Called once per minute from the main loop. Detects 21:00 reminder window
+// and triggers a one-shot daily toast if the user hasn't read enough.
+static void reading_tick_minute() {
+    reading_rollover_if_needed();
+    if (g_read_active) {
+        uint32_t mins = (millis() - g_read_t0) / 60000UL;
+        // live update -- but don't double count; just preview
+        if (home_read_lbl) {
+            char m[40];
+            snprintf(m, sizeof(m), "+%lu  ·  goal %u min", mins, g_read_goal_min);
+            lv_label_set_text(home_read_lbl, m);
+        }
+    }
+    time_t now = time(nullptr);
+    struct tm tm_now; localtime_r(&now, &tm_now);
+    if (tm_now.tm_hour == g_read_reminder_h && !g_read_nudged_today
+        && g_read_today_min < g_read_goal_min) {
+        g_read_nudged_today = true;
+        char m[80];
+        snprintf(m, sizeof(m), "📖 reading time . %u / %u min today",
+                 g_read_today_min, g_read_goal_min);
+        show_toast(m, 2500);
+    }
+}
+
 static void pomo_start_phase(PomoPhase ph) {
     g_phase = ph;
     g_phase_t0 = millis();
     int mins = 0;
-    if (ph == PH_WORK)  mins = PRESETS[g_preset_idx].work_min;
-    if (ph == PH_BREAK) mins = PRESETS[g_preset_idx].break_min;
+    if (ph == PH_WORK)        mins = PRESETS[g_preset_idx].work_min;
+    if (ph == PH_BREAK)       mins = PRESETS[g_preset_idx].break_min;
+    if (ph == PH_LONG_BREAK)  mins = 15;     // v1.1 -- fixed 15 min long break
     g_phase_len_ms = (uint32_t)mins * 60UL * 1000UL;
-    if (ph == PH_WORK)  show_toast("Focus started", 1200);
-    if (ph == PH_BREAK) show_toast("Break", 1200);
+    if (ph == PH_WORK)        show_toast("focus started", 1200);
+    if (ph == PH_BREAK)       show_toast("break", 1200);
+    if (ph == PH_LONG_BREAK)  show_toast("long break . 15 min", 1500);
 }
 static void pomo_stop() {
     g_phase = PH_IDLE;
@@ -571,30 +730,48 @@ static void pomo_stop() {
 }
 static void pomo_complete_work() {
     g_total_sessions++;
+    g_total_pomos++;
+    g_session_pomos++;
+    g_bloom_until = millis() + 1800;     // 1.8s outer-ring bloom on completion
     prefs_save();
-    if (PRESETS[g_preset_idx].break_min > 0) pomo_start_phase(PH_BREAK);
-    else { g_phase = PH_DONE; show_toast("Session complete", 1500); }
+    if (g_session_pomos >= 4) {
+        // v1.1 -- after 4 work pomos, force a 15-min LONG BREAK
+        g_session_pomos = 0;
+        int prev = g_preset_idx;
+        g_preset_idx = PRESET_LONG_BREAK;
+        pomo_start_phase(PH_LONG_BREAK);
+        g_preset_idx = prev;             // restore after kicking off long break
+        show_toast(g_lang ? "深度循环完成 . 长休息开始"
+                          : "deep cycle . long break", 1800);
+    } else if (PRESETS[g_preset_idx].break_min > 0) {
+        pomo_start_phase(PH_BREAK);
+    } else {
+        g_phase = PH_DONE;
+        show_toast(g_lang ? "完成" : "session complete", 1500);
+    }
 }
 static void pomo_complete_break() {
     g_phase = PH_DONE;
-    show_toast("Break done", 1200);
+    show_toast(g_lang ? "休息结束" : "break done", 1200);
 }
 
 static void update_pomo_ui() {
     // Arc + time
     uint32_t remain_ms = 0;
     int pct = 0;
-    const char *phase_txt = "IDLE";
+    const char *phase_txt = tr(K_IDLE_);
     uint32_t arc_col = S_DIM;
-    if (g_phase == PH_WORK || g_phase == PH_BREAK) {
+    if (g_phase == PH_WORK || g_phase == PH_BREAK || g_phase == PH_LONG_BREAK) {
         uint32_t elapsed = millis() - g_phase_t0;
         if (elapsed > g_phase_len_ms) elapsed = g_phase_len_ms;
         remain_ms = g_phase_len_ms - elapsed;
         pct = g_phase_len_ms ? (int)((elapsed * 100UL) / g_phase_len_ms) : 0;
-        phase_txt = (g_phase == PH_WORK) ? "FOCUS" : "BREAK";
+        phase_txt = (g_phase == PH_WORK)  ? tr(K_WORK)
+                  : (g_phase == PH_BREAK) ? tr(K_BREAK)
+                                          : tr(K_LONG_BREAK);
         arc_col   = (g_phase == PH_WORK) ? S_ACCENT : S_OK;
     } else if (g_phase == PH_DONE) {
-        phase_txt = "DONE";
+        phase_txt = g_lang ? "完成" : "DONE";
         arc_col = S_OK;
         pct = 100;
     }
@@ -611,12 +788,44 @@ static void update_pomo_ui() {
     snprintf(p, sizeof(p), "%s · %d / %d", PRESETS[g_preset_idx].name,
              PRESETS[g_preset_idx].work_min, PRESETS[g_preset_idx].break_min);
     lv_label_set_text(pomo_preset_lbl, p);
+    bool running = (g_phase == PH_WORK || g_phase == PH_BREAK || g_phase == PH_LONG_BREAK);
     lv_label_set_text(pomo_start_label,
-        (g_phase == PH_WORK || g_phase == PH_BREAK) ? "STOP" : "START");
+        running ? (g_lang ? "停止" : "STOP")
+                : tr(K_START));
+
+    // v1.1 -- session dot tracker (4-pomodoro deep-cycle)
+    for (int i = 0; i < 4; i++) {
+        if (!pomo_session_dots[i]) continue;
+        bool filled = (i < g_session_pomos);
+        bool current = (i == g_session_pomos) && running && g_phase == PH_WORK;
+        lv_obj_set_style_bg_color(pomo_session_dots[i],
+            lv_color_hex(filled ? S_ACCENT : S_BORDER), 0);
+        // current dot breathes
+        uint8_t opa = filled ? 255
+                    : current ? (uint8_t)(120 + 100 * sinf(millis()/450.0f))
+                              : 100;
+        lv_obj_set_style_bg_opa(pomo_session_dots[i], opa, 0);
+    }
+
+    // v1.1 -- outer "bloom" ring animation after a pomo completes
+    if (pomo_bloom_arc) {
+        uint32_t now = millis();
+        if (now < g_bloom_until) {
+            float u = 1.0f - (float)(g_bloom_until - now) / 1800.0f;  // 0..1
+            uint8_t opa = (uint8_t)((1.0f - u) * 220);
+            int span = (int)(20 + u * 340);
+            lv_arc_set_angles(pomo_bloom_arc, 270 - span/2, 270 + span/2);
+            lv_obj_set_style_arc_opa(pomo_bloom_arc, opa, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_color(pomo_bloom_arc, lv_color_hex(S_ACCENT), LV_PART_INDICATOR);
+            lv_obj_clear_flag(pomo_bloom_arc, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(pomo_bloom_arc, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
 }
 
 static void pomo_tick() {
-    if (g_phase != PH_WORK && g_phase != PH_BREAK) return;
+    if (g_phase != PH_WORK && g_phase != PH_BREAK && g_phase != PH_LONG_BREAK) return;
     uint32_t elapsed = millis() - g_phase_t0;
     // accumulate today_seconds during WORK phase only
     static uint32_t last_accum = 0;
@@ -646,8 +855,12 @@ static void pomo_tick() {
     } else last_accum = 0;
 
     if (elapsed >= g_phase_len_ms) {
-        if (g_phase == PH_WORK)  pomo_complete_work();
-        else                     pomo_complete_break();
+        if (g_phase == PH_WORK)            pomo_complete_work();
+        else if (g_phase == PH_LONG_BREAK) {
+            g_phase = PH_DONE;
+            show_toast(g_lang ? "长休息结束 . 准备下一个循环"
+                              : "long break done . ready for next cycle", 1800);
+        } else                             pomo_complete_break();
     }
 
     // [8] Flow Mode trigger
@@ -684,10 +897,13 @@ static void pomo_start_cb(lv_event_t *) {
     update_pomo_ui();
 }
 static void pomo_preset_cb(lv_event_t *) {
-    g_preset_idx = (g_preset_idx + 1) % NUM_PRESETS;
+    // v1.1 -- manual cycle skips LONG (auto-only after 4 work pomos)
+    do { g_preset_idx = (g_preset_idx + 1) % NUM_PRESETS; }
+    while (g_preset_idx == PRESET_LONG_BREAK);
     prefs_save();
     update_pomo_ui();
-    char m[40]; snprintf(m, sizeof(m), "Preset: %s", PRESETS[g_preset_idx].name);
+    char m[40]; snprintf(m, sizeof(m), "%s: %s",
+        g_lang ? "模式" : "preset", PRESETS[g_preset_idx].name);
     show_toast(m, 1200);
 }
 static void pomo_subject_cb(lv_event_t *) {
@@ -892,6 +1108,135 @@ static void voice_btn_cb(lv_event_t *e) {
     if (c == LV_EVENT_PRESSED)  voice_start();
     if (c == LV_EVENT_RELEASED) voice_stop();
 }
+static void open_memo_viewer();  // fwd decl (defined below)
+
+// =============================================================================
+//  v1.3 -- VOICE MEMOS VIEWER (full-screen modal: list, details, delete)
+// =============================================================================
+static lv_obj_t *g_memo_overlay = nullptr;
+static char      g_memo_pending_del[128] = {0};  // path waiting confirm-tap
+
+static void memo_row_cb(lv_event_t *e) {
+    const char *path = (const char *)lv_event_get_user_data(e);
+    if (!path) return;
+    // first tap arms delete, second confirms (1.6 s window)
+    if (strcmp(g_memo_pending_del, path) == 0) {
+        SD_MMC.remove(path);
+        char m[80]; snprintf(m, sizeof(m), "deleted . %s", strrchr(path,'/')+1);
+        show_toast(m, 1200);
+        g_memo_pending_del[0] = 0;
+        // rebuild list
+        lv_obj_t *ov = g_memo_overlay;
+        if (ov) { lv_obj_del(ov); g_memo_overlay = nullptr; }
+        open_memo_viewer();
+    } else {
+        strncpy(g_memo_pending_del, path, sizeof(g_memo_pending_del)-1);
+        show_toast("tap again to DELETE", 1600);
+        lv_obj_t *t = (lv_obj_t *)lv_event_get_target(e);
+        lv_obj_set_style_border_color(t, lv_color_hex(S_BAD), 0);
+        lv_obj_set_style_border_width(t, 2, 0);
+    }
+}
+static void memo_close_cb(lv_event_t *) {
+    if (g_memo_overlay) { lv_obj_del(g_memo_overlay); g_memo_overlay = nullptr; }
+    g_memo_pending_del[0] = 0;
+}
+static void open_memo_viewer() {
+    if (g_memo_overlay) return;
+    lv_obj_t *ov = lv_obj_create(lv_layer_top());
+    g_memo_overlay = ov;
+    lv_obj_set_size(ov, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(ov, lv_color_hex(S_BG), 0);
+    lv_obj_set_style_bg_opa(ov, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(ov, 24, 0);
+    lv_obj_set_style_border_width(ov, 0, 0);
+    lv_obj_set_layout(ov, LV_LAYOUT_FLEX);
+    lv_obj_set_flex_flow(ov, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ov, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    // header
+    lv_obj_t *eye = lv_label_create(ov);
+    lv_label_set_text(eye, "VOICE // MEMOS");
+    lv_obj_set_style_text_color(eye, lv_color_hex(S_MUTE), 0);
+    lv_obj_set_style_text_font(eye, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_letter_space(eye, 3, 0);
+
+    // scan files
+    File dir = SD_MMC.open("/WATCH/study/voice");
+    int count = 0; uint32_t total = 0;
+    if (dir && dir.isDirectory()) {
+        File f = dir.openNextFile();
+        while (f) {
+            if (!f.isDirectory()) {
+                String name = f.name();
+                if (name.endsWith(".wav") || name.endsWith(".WAV")) {
+                    total += f.size(); count++;
+                    char path[160]; snprintf(path, sizeof(path), "/WATCH/study/voice/%s",
+                        strrchr(name.c_str(),'/') ? strrchr(name.c_str(),'/')+1 : name.c_str());
+
+                    lv_obj_t *row = lv_btn_create(ov);
+                    lv_obj_set_size(row, LV_PCT(96), 56);
+                    lv_obj_set_style_bg_color(row, lv_color_hex(S_SURFACE), 0);
+                    lv_obj_set_style_border_color(row, lv_color_hex(S_BORDER), 0);
+                    lv_obj_set_style_border_width(row, 1, 0);
+                    lv_obj_set_style_radius(row, 12, 0);
+                    lv_obj_t *nm = lv_label_create(row);
+                    lv_label_set_text(nm, strrchr(name.c_str(),'/') ? strrchr(name.c_str(),'/')+1 : name.c_str());
+                    lv_obj_set_style_text_color(nm, lv_color_hex(S_TXT), 0);
+                    lv_obj_align(nm, LV_ALIGN_LEFT_MID, 6, -8);
+                    lv_obj_t *sz = lv_label_create(row);
+                    char sb[40]; snprintf(sb, sizeof(sb), "%lu KB  ·  tap 2x to delete", f.size()/1024);
+                    lv_label_set_text(sz, sb);
+                    lv_obj_set_style_text_color(sz, lv_color_hex(S_DIM), 0);
+                    lv_obj_set_style_text_font(sz, &lv_font_montserrat_12, 0);
+                    lv_obj_align(sz, LV_ALIGN_LEFT_MID, 6, 12);
+
+                    // store path on heap (lvgl owns the row, leaks on close — small, ok)
+                    char *kept = (char *)malloc(strlen(path)+1);
+                    if (kept) { strcpy(kept, path);
+                        lv_obj_add_event_cb(row, memo_row_cb, LV_EVENT_CLICKED, kept); }
+                }
+            }
+            f = dir.openNextFile();
+        }
+    }
+    // summary
+    lv_obj_t *sum = lv_label_create(ov);
+    char buf[64]; snprintf(buf, sizeof(buf), "%d memos  ·  %lu KB total",
+                          count, total/1024);
+    lv_label_set_text(sum, count ? buf : "no memos yet . hold REC on home to record");
+    lv_obj_set_style_text_color(sum, lv_color_hex(S_DIM), 0);
+    lv_obj_set_style_text_font(sum, &lv_font_montserrat_12, 0);
+
+    // RECORD pill (hold-to-record, sits above CLOSE)
+    lv_obj_t *rec = lv_btn_create(ov);
+    lv_obj_set_size(rec, 200, 44);
+    lv_obj_set_style_bg_color(rec, lv_color_hex(S_SURFACE), 0);
+    lv_obj_set_style_border_color(rec, lv_color_hex(S_BAD), 0);
+    lv_obj_set_style_border_width(rec, 1, 0);
+    lv_obj_set_style_radius(rec, 22, 0);
+    lv_obj_t *rcl = lv_label_create(rec);
+    lv_label_set_text(rcl, LV_SYMBOL_AUDIO "  HOLD TO RECORD");
+    lv_obj_set_style_text_color(rcl, lv_color_hex(S_BAD), 0);
+    lv_obj_center(rcl);
+    lv_obj_add_event_cb(rec, voice_btn_cb, LV_EVENT_PRESSED,    NULL);
+    lv_obj_add_event_cb(rec, voice_btn_cb, LV_EVENT_RELEASED,   NULL);
+    lv_obj_add_event_cb(rec, voice_btn_cb, LV_EVENT_PRESS_LOST, NULL);
+
+    // close button
+    lv_obj_t *close = lv_btn_create(ov);
+    lv_obj_set_size(close, 180, 44);
+    lv_obj_set_style_bg_color(close, lv_color_hex(S_SURFACE), 0);
+    lv_obj_set_style_border_color(close, lv_color_hex(S_ACCENT), 0);
+    lv_obj_set_style_border_width(close, 1, 0);
+    lv_obj_set_style_radius(close, 22, 0);
+    lv_obj_t *cl = lv_label_create(close);
+    lv_label_set_text(cl, LV_SYMBOL_CLOSE "  CLOSE");
+    lv_obj_set_style_text_color(cl, lv_color_hex(S_ACCENT), 0);
+    lv_obj_center(cl);
+    lv_obj_add_event_cb(close, memo_close_cb, LV_EVENT_CLICKED, NULL);
+}
+static void memo_open_cb(lv_event_t *) { open_memo_viewer(); }
 
 // =============================================================================
 //  UI builders
@@ -909,11 +1254,20 @@ static lv_obj_t *make_card(lv_obj_t *parent, int w, int h) {
     return c;
 }
 
+// v1.1 -- pick the right font when in Chinese mode (falls back to montserrat
+// if the user hasn't compiled in LV_FONT_SIMSUN_16_CJK).
+static const lv_font_t *font_label_for_lang(const lv_font_t *fallback) {
+#if STUDYOS_ENABLE_CHINESE && (defined(LV_FONT_SIMSUN_16_CJK) && LV_FONT_SIMSUN_16_CJK)
+    if (g_lang) return &lv_font_simsun_16_cjk;
+#endif
+    return fallback;
+}
+
 static void make_eyebrow(lv_obj_t *parent, const char *txt) {
     lv_obj_t *l = lv_label_create(parent);
     lv_label_set_text(l, txt);
     lv_obj_set_style_text_color(l, lv_color_hex(S_MUTE), 0);
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(l, font_label_for_lang(&lv_font_montserrat_12), 0);
     lv_obj_set_style_text_letter_space(l, 3, 0);
     lv_obj_align(l, LV_ALIGN_TOP_MID, 0, 14);
 }
@@ -1028,6 +1382,81 @@ static void build_home_tab() {
     lv_obj_center(nl);
     lv_obj_add_event_cb(note, note_btn_cb, LV_EVENT_CLICKED, NULL);
 
+    // v1.3 -- READING widget: eyebrow + progress bar + minutes-today + 1-tap button
+    lv_obj_t *re = lv_label_create(tab_home);
+    lv_label_set_text(re, "READING  ·  daily goal");
+    lv_obj_set_style_text_color(re, lv_color_hex(S_MUTE), 0);
+    lv_obj_set_style_text_font(re, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_letter_space(re, 3, 0);
+    lv_obj_align(re, LV_ALIGN_TOP_MID, 0, 364);
+
+    home_read_bar = lv_bar_create(tab_home);
+    lv_obj_set_size(home_read_bar, 370, 6);
+    lv_obj_align(home_read_bar, LV_ALIGN_TOP_MID, 0, 386);
+    lv_bar_set_range(home_read_bar, 0, g_read_goal_min ? g_read_goal_min : 1);
+    lv_bar_set_value(home_read_bar, g_read_today_min, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(home_read_bar, lv_color_hex(S_BORDER), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(home_read_bar, lv_color_hex(S_OK),     LV_PART_INDICATOR);
+    lv_obj_set_style_radius(home_read_bar, 3, LV_PART_MAIN);
+    lv_obj_set_style_radius(home_read_bar, 3, LV_PART_INDICATOR);
+
+    home_read_lbl = lv_label_create(tab_home);
+    char rb[40];
+    snprintf(rb, sizeof(rb), "%u / %u min  ·  %u d streak",
+             g_read_today_min, g_read_goal_min, g_read_streak);
+    lv_label_set_text(home_read_lbl, rb);
+    lv_obj_set_style_text_color(home_read_lbl, lv_color_hex(S_DIM), 0);
+    lv_obj_set_style_text_font(home_read_lbl, &lv_font_montserrat_12, 0);
+    lv_obj_align(home_read_lbl, LV_ALIGN_TOP_MID, 0, 400);
+
+    lv_obj_t *rb2 = lv_btn_create(tab_home);
+    lv_obj_set_size(rb2, 220, 42);
+    lv_obj_align(rb2, LV_ALIGN_TOP_MID, 0, 422);
+    lv_obj_set_style_bg_color(rb2, lv_color_hex(S_SURFACE), 0);
+    lv_obj_set_style_border_color(rb2, lv_color_hex(S_OK), 0);
+    lv_obj_set_style_border_width(rb2, 1, 0);
+    lv_obj_set_style_radius(rb2, 21, 0);
+    home_read_btn_lbl = lv_label_create(rb2);
+    lv_label_set_text(home_read_btn_lbl,
+        g_read_active ? "STOP" : LV_SYMBOL_PLAY "  READ");
+    lv_obj_set_style_text_color(home_read_btn_lbl, lv_color_hex(S_OK), 0);
+    lv_obj_set_style_text_font(home_read_btn_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_center(home_read_btn_lbl);
+    lv_obj_add_event_cb(rb2, reading_toggle_cb, LV_EVENT_CLICKED, NULL);
+
+    // v1.3 -- MEMOS button (opens full-screen voice memos viewer)
+    lv_obj_t *mb = lv_btn_create(tab_home);
+    lv_obj_set_size(mb, 140, 36);
+    lv_obj_align(mb, LV_ALIGN_TOP_MID, 0, 472);
+    lv_obj_set_style_bg_color(mb, lv_color_hex(S_SURFACE), 0);
+    lv_obj_set_style_border_color(mb, lv_color_hex(S_ACCENT), 0);
+    lv_obj_set_style_border_width(mb, 1, 0);
+    lv_obj_set_style_radius(mb, 18, 0);
+    lv_obj_t *ml = lv_label_create(mb);
+    lv_label_set_text(ml, LV_SYMBOL_AUDIO "  MEMOS");
+    lv_obj_set_style_text_color(ml, lv_color_hex(S_ACCENT), 0);
+    lv_obj_set_style_text_font(ml, &lv_font_montserrat_14, 0);
+    lv_obj_center(ml);
+    lv_obj_add_event_cb(mb, memo_open_cb, LV_EVENT_CLICKED, NULL);
+
+    // v1.4 -- HOLD-TO-RECORD button (sits next to MEMOS)
+    lv_obj_t *rb_rec = lv_btn_create(tab_home);
+    lv_obj_set_size(rb_rec, 140, 36);
+    lv_obj_align(rb_rec, LV_ALIGN_TOP_MID, 0, 514);
+    lv_obj_set_style_bg_color(rb_rec, lv_color_hex(S_SURFACE), 0);
+    lv_obj_set_style_border_color(rb_rec, lv_color_hex(S_BAD), 0);
+    lv_obj_set_style_border_width(rb_rec, 1, 0);
+    lv_obj_set_style_radius(rb_rec, 18, 0);
+    lv_obj_t *rl_rec = lv_label_create(rb_rec);
+    lv_label_set_text(rl_rec, LV_SYMBOL_AUDIO "  HOLD TO REC");
+    lv_obj_set_style_text_color(rl_rec, lv_color_hex(S_BAD), 0);
+    lv_obj_set_style_text_font(rl_rec, &lv_font_montserrat_14, 0);
+    lv_obj_center(rl_rec);
+    // press = start, release = stop  (uses existing voice_btn_cb logic)
+    lv_obj_add_event_cb(rb_rec, voice_btn_cb, LV_EVENT_PRESSED,  NULL);
+    lv_obj_add_event_cb(rb_rec, voice_btn_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(rb_rec, voice_btn_cb, LV_EVENT_PRESS_LOST, NULL);
+
     // Voice Memo button (tap-and-hold to record to WAV on SD)
     lv_obj_t *voice = lv_btn_create(tab_home);
     lv_obj_set_size(voice, 220, 42);
@@ -1048,7 +1477,19 @@ static void build_home_tab() {
 }
 
 static void build_pomo_tab() {
-    make_eyebrow(tab_pomo, "POMODORO");
+    make_eyebrow(tab_pomo, tr(K_POMODORO));
+
+    // v1.1 -- soft outer bloom arc (hidden by default, flashes on phase complete)
+    pomo_bloom_arc = lv_arc_create(tab_pomo);
+    lv_obj_set_size(pomo_bloom_arc, 340, 340);
+    lv_obj_align(pomo_bloom_arc, LV_ALIGN_TOP_MID, 0, 30);
+    lv_obj_remove_style(pomo_bloom_arc, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(pomo_bloom_arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_arc_set_bg_angles(pomo_bloom_arc, 0, 360);
+    lv_obj_set_style_arc_opa(pomo_bloom_arc, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(pomo_bloom_arc, 12, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(pomo_bloom_arc, lv_color_hex(S_ACCENT), LV_PART_INDICATOR);
+    lv_obj_add_flag(pomo_bloom_arc, LV_OBJ_FLAG_HIDDEN);
 
     pomo_arc = lv_arc_create(tab_pomo);
     lv_obj_set_size(pomo_arc, 300, 300);
@@ -1082,6 +1523,18 @@ static void build_pomo_tab() {
     lv_obj_set_style_text_font(pomo_preset_lbl, &lv_font_montserrat_14, 0);
     lv_obj_align(pomo_preset_lbl, LV_ALIGN_TOP_MID, 0, 222);
 
+    // v1.1 -- 4-dot deep-cycle tracker (visualises 4-pomo classic cadence)
+    for (int i = 0; i < 4; i++) {
+        pomo_session_dots[i] = lv_obj_create(tab_pomo);
+        lv_obj_remove_style_all(pomo_session_dots[i]);
+        lv_obj_set_size(pomo_session_dots[i], 10, 10);
+        lv_obj_set_style_radius(pomo_session_dots[i], 5, 0);
+        lv_obj_set_style_bg_color(pomo_session_dots[i], lv_color_hex(S_BORDER), 0);
+        lv_obj_set_style_bg_opa(pomo_session_dots[i], LV_OPA_60, 0);
+        // 4 dots centred, 18px pitch
+        lv_obj_align(pomo_session_dots[i], LV_ALIGN_TOP_MID, -27 + i * 18, 244);
+    }
+
     // Start button
     pomo_start_btn = lv_btn_create(tab_pomo);
     lv_obj_set_size(pomo_start_btn, 175, 48);
@@ -1089,7 +1542,7 @@ static void build_pomo_tab() {
     lv_obj_set_style_bg_color(pomo_start_btn, lv_color_hex(S_ACCENT), 0);
     lv_obj_set_style_radius(pomo_start_btn, 24, 0);
     pomo_start_label = lv_label_create(pomo_start_btn);
-    lv_label_set_text(pomo_start_label, "START");
+    lv_label_set_text(pomo_start_label, tr(K_START));
     lv_obj_set_style_text_color(pomo_start_label, lv_color_hex(0x000000), 0);
     lv_obj_set_style_text_font(pomo_start_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_letter_space(pomo_start_label, 3, 0);
@@ -1105,7 +1558,7 @@ static void build_pomo_tab() {
     lv_obj_set_style_border_width(pomo_preset_btn, 1, 0);
     lv_obj_set_style_radius(pomo_preset_btn, 24, 0);
     lv_obj_t *pl = lv_label_create(pomo_preset_btn);
-    lv_label_set_text(pl, "PRESET");
+    lv_label_set_text(pl, tr(K_PRESET));
     lv_obj_set_style_text_color(pl, lv_color_hex(S_ACCENT), 0);
     lv_obj_set_style_text_font(pl, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_letter_space(pl, 3, 0);
@@ -1124,7 +1577,9 @@ static void build_pomo_tab() {
     lv_obj_set_style_radius(exam_row, 12, 0);
     lv_obj_set_style_pad_all(exam_row, 10, 0);
     lv_obj_t *exam_lbl = lv_label_create(exam_row);
-    lv_label_set_text(exam_lbl, "EXAM MODE (90 min, no break)");
+    char exam_text[64];
+    snprintf(exam_text, sizeof(exam_text), "%s (%s)", tr(K_EXAM_MODE), tr(K_EXAM_DESC));
+    lv_label_set_text(exam_lbl, exam_text);
     lv_obj_set_style_text_color(exam_lbl, lv_color_hex(S_TXT), 0);
     lv_obj_set_style_text_font(exam_lbl, &lv_font_montserrat_14, 0);
     lv_obj_align(exam_lbl, LV_ALIGN_LEFT_MID, 4, 0);
@@ -1153,7 +1608,7 @@ static void build_pomo_tab() {
 }
 
 static void build_task_tab() {
-    make_eyebrow(tab_task, "TASKS // TODAY");
+    make_eyebrow(tab_task, tr(K_TASKS));
 
     task_summary = lv_label_create(tab_task);
     lv_label_set_text(task_summary, "0 / 0 complete");
@@ -1218,7 +1673,7 @@ static void build_task_tab() {
 }
 
 static void build_cards_tab() {
-    make_eyebrow(tab_cards, "FLASHCARDS");
+    make_eyebrow(tab_cards, "中文 // CHARACTERS");
 
     card_face = make_card(tab_cards, 370, 280);
     lv_obj_align(card_face, LV_ALIGN_TOP_MID, 0, 50);
@@ -1226,7 +1681,7 @@ static void build_cards_tab() {
 
     card_text = lv_label_create(card_face);
     lv_label_set_text(card_text,
-        g_card_count == 0 ? "No cards loaded.\n/WATCH/study/cards/*.txt\nformat: front|back\nor: hanzi|pinyin|english"
+        g_card_count == 0 ? "No Chinese cards loaded.\n\nCreate:\n/WATCH/studyOS/chinese.txt\n\nformat:\n汉字 | pinyin | english"
                           : g_cards[0].front);
     lv_obj_set_style_text_color(card_text, lv_color_hex(S_TXT), 0);
     // SimSun CJK font handles Chinese hanzi AND Latin/pinyin in one glyph set.
@@ -1293,7 +1748,7 @@ static void build_cards_tab() {
 }
 
 static void build_analytics_tab() {
-    make_eyebrow(tab_analytics, "FOCUS // ANALYTICS");
+    make_eyebrow(tab_analytics, tr(K_STATS));
 
     // Today minutes (big)
     an_today = lv_label_create(tab_analytics);
@@ -1500,6 +1955,30 @@ static void update_home_panel() {
         if (mins > 240) mins = 240;
         lv_bar_set_value(home_goal_bar, mins, LV_ANIM_ON);
     }
+    // v1.3 -- reading widget refresh
+    if (home_read_bar) {
+        lv_bar_set_range(home_read_bar, 0, g_read_goal_min ? g_read_goal_min : 1);
+        uint16_t v = g_read_today_min;
+        if (g_read_active) {
+            uint32_t live = (millis() - g_read_t0) / 60000UL;
+            if (live > 999) live = 999;
+            v = g_read_today_min + (uint16_t)live;
+        }
+        if (v > g_read_goal_min) v = g_read_goal_min;
+        lv_bar_set_value(home_read_bar, v, LV_ANIM_ON);
+    }
+    if (home_read_lbl) {
+        char rl[48];
+        if (g_read_active) {
+            uint32_t live = (millis() - g_read_t0) / 60000UL;
+            snprintf(rl, sizeof(rl), "+%lu  ·  goal %u min  ·  %u d streak",
+                     live, g_read_goal_min, g_read_streak);
+        } else {
+            snprintf(rl, sizeof(rl), "%u / %u min  ·  %u d streak",
+                     g_read_today_min, g_read_goal_min, g_read_streak);
+        }
+        lv_label_set_text(home_read_lbl, rl);
+    }
     if (g_has_pmu) {
         int p = g_pmu.getBatteryPercent();
         bool ch = g_pmu.isCharging();
@@ -1520,11 +1999,15 @@ static void update_card_face() {
     Card &c = g_cards[g_card_idx];
     char buf[280];
     if (c.has_pinyin) {
-        // Chinese-style card: characters / pinyin always shown; English revealed on flip
+        // Front: 汉字 BIG, pinyin in muted line below, gentle "tap to flip" hint.
+        // Back : full reveal -- 汉字 + pinyin + english translation.
         if (g_card_flipped) {
-            snprintf(buf, sizeof(buf), "%s\n\n%s\n\n%s", c.front, c.pinyin, c.back);
+            snprintf(buf, sizeof(buf),
+                     "%s\n%s\n\n— %s —",
+                     c.front, c.pinyin, c.back);
         } else {
-            snprintf(buf, sizeof(buf), "%s\n\n%s\n\n( tap FLIP for English )",
+            snprintf(buf, sizeof(buf),
+                     "%s\n\n%s\n\n· tap FLIP for english ·",
                      c.front, c.pinyin);
         }
         lv_label_set_text(card_text, buf);
@@ -1580,6 +2063,8 @@ void setup() {
     SD_MMC.mkdir("/WATCH/study/cards");
     SD_MMC.mkdir("/WATCH/study/voice");
     SD_MMC.mkdir("/WATCH/study/exports");
+    // v1.2 -- Chinese learning deck lives in its own folder
+    SD_MMC.mkdir("/WATCH/studyOS");
 
     // First-run scaffolding: seed example tasks + flashcards so the app
     // doesn't boot into empty screens. Skipped if user files already exist.
@@ -1604,63 +2089,96 @@ void setup() {
             f.close();
         }
     }
-    // Chinese conversation cheat-sheet (3-field: hanzi|pinyin|english)
+    // v1.2 -- Chinese-learning deck (single canonical file)
+    if (!SD_MMC.exists("/WATCH/studyOS/chinese.txt")) {
+        File f = SD_MMC.open("/WATCH/studyOS/chinese.txt", FILE_WRITE);
+        if (f) {
+            f.println("# Chinese-learning flashcards");
+            f.println("# format: 汉字|pinyin|english");
+            f.println("# tap card to flip (front shows hanzi + pinyin, back shows english)");
+            f.println("# swipe / press next to move on");
+            f.println("#");
+            f.println("# ---- greetings ----");
+            f.println("你好|nǐ hǎo|hello");
+            f.println("你好吗|nǐ hǎo ma|how are you?");
+            f.println("我很好|wǒ hěn hǎo|I'm good");
+            f.println("早上好|zǎo shàng hǎo|good morning");
+            f.println("晚安|wǎn ān|good night");
+            f.println("再见|zài jiàn|goodbye");
+            f.println("谢谢|xiè xie|thank you");
+            f.println("不客气|bú kè qi|you're welcome");
+            f.println("对不起|duì bu qǐ|sorry");
+            f.println("没关系|méi guān xi|it's ok / no problem");
+            f.println("# ---- identity ----");
+            f.println("我叫...|wǒ jiào ...|my name is ...");
+            f.println("你叫什么名字|nǐ jiào shén me míng zi|what's your name?");
+            f.println("我是美国人|wǒ shì měi guó rén|I'm American");
+            f.println("你是哪国人|nǐ shì nǎ guó rén|where are you from?");
+            f.println("# ---- survival ----");
+            f.println("我不懂|wǒ bù dǒng|I don't understand");
+            f.println("请再说一遍|qǐng zài shuō yí biàn|please say it again");
+            f.println("你会说英语吗|nǐ huì shuō yīng yǔ ma|do you speak English?");
+            f.println("洗手间在哪里|xǐ shǒu jiān zài nǎ lǐ|where is the bathroom?");
+            f.println("多少钱|duō shao qián|how much money?");
+            f.println("太贵了|tài guì le|too expensive");
+            f.println("便宜一点|pián yi yì diǎn|cheaper please");
+            f.println("# ---- food ----");
+            f.println("我饿了|wǒ è le|I'm hungry");
+            f.println("我要这个|wǒ yào zhè ge|I want this one");
+            f.println("好吃|hǎo chī|delicious");
+            f.println("不要辣|bú yào là|not spicy please");
+            f.println("买单|mǎi dān|the bill please");
+            f.println("水|shuǐ|water");
+            f.println("茶|chá|tea");
+            f.println("咖啡|kā fēi|coffee");
+            f.println("# ---- numbers ----");
+            f.println("一|yī|one");
+            f.println("二|èr|two");
+            f.println("三|sān|three");
+            f.println("四|sì|four");
+            f.println("五|wǔ|five");
+            f.println("六|liù|six");
+            f.println("七|qī|seven");
+            f.println("八|bā|eight");
+            f.println("九|jiǔ|nine");
+            f.println("十|shí|ten");
+            f.println("一百|yì bǎi|one hundred");
+            f.println("# ---- directions ----");
+            f.println("左|zuǒ|left");
+            f.println("右|yòu|right");
+            f.println("直走|zhí zǒu|straight ahead");
+            f.println("这里|zhè lǐ|here");
+            f.println("那里|nà lǐ|there");
+            f.println("# ---- useful verbs / particles ----");
+            f.println("是|shì|yes / is");
+            f.println("不是|bú shì|no / is not");
+            f.println("有|yǒu|to have");
+            f.println("没有|méi yǒu|don't have");
+            f.println("可以|kě yǐ|can / may");
+            f.println("好的|hǎo de|ok / good");
+            f.println("帮我|bāng wǒ|help me");
+            f.println("# ---- time / days ----");
+            f.println("今天|jīn tiān|today");
+            f.println("明天|míng tiān|tomorrow");
+            f.println("昨天|zuó tiān|yesterday");
+            f.println("现在|xiàn zài|now");
+            f.println("# ---- emotion ----");
+            f.println("我爱你|wǒ ài nǐ|I love you");
+            f.println("我累了|wǒ lèi le|I'm tired");
+            f.println("加油|jiā yóu|keep going / you got this");
+            f.close();
+        }
+    }
+    // legacy v1.1 decks (kept for backwards compatibility — the *new* Chinese
+    // learning deck above lives at /WATCH/studyOS/chinese.txt and is what
+    // the Cards tab loads. These remain so old data isn't lost.)
     if (!SD_MMC.exists("/WATCH/study/cards/chinese_basics.txt")) {
         File f = SD_MMC.open("/WATCH/study/cards/chinese_basics.txt", FILE_WRITE);
         if (f) {
             f.println("# Mandarin conversation cheat sheet");
             f.println("# format: hanzi|pinyin|english");
-            // Greetings
             f.println("你好|ni3 hao3|hello");
-            f.println("你好吗|ni3 hao3 ma|how are you?");
-            f.println("我很好|wo3 hen3 hao3|I'm good");
-            f.println("早上好|zao3 shang4 hao3|good morning");
-            f.println("晚安|wan3 an1|good night");
-            f.println("再见|zai4 jian4|goodbye");
             f.println("谢谢|xie4 xie4|thank you");
-            f.println("不客气|bu2 ke4 qi4|you're welcome");
-            f.println("对不起|dui4 bu4 qi3|sorry");
-            f.println("没关系|mei2 guan1 xi4|it's ok / no problem");
-            // Identity
-            f.println("我叫...|wo3 jiao4 ...|my name is ...");
-            f.println("你叫什么名字|ni3 jiao4 shen2 me ming2 zi|what's your name?");
-            f.println("我是美国人|wo3 shi4 mei3 guo2 ren2|I'm American");
-            f.println("你是哪国人|ni3 shi4 na3 guo2 ren2|where are you from?");
-            // Survival
-            f.println("我不懂|wo3 bu4 dong3|I don't understand");
-            f.println("请再说一遍|qing3 zai4 shuo1 yi2 bian4|please say it again");
-            f.println("你会说英语吗|ni3 hui4 shuo1 ying1 yu3 ma|do you speak English?");
-            f.println("洗手间在哪里|xi3 shou3 jian1 zai4 na3 li3|where is the bathroom?");
-            f.println("多少钱|duo1 shao qian2|how much money?");
-            f.println("太贵了|tai4 gui4 le|too expensive");
-            f.println("便宜一点|pian2 yi yi4 dian3|cheaper please");
-            // Food
-            f.println("我饿了|wo3 e4 le|I'm hungry");
-            f.println("我要这个|wo3 yao4 zhe4 ge4|I want this one");
-            f.println("好吃|hao3 chi1|delicious");
-            f.println("不要辣|bu2 yao4 la4|not spicy please");
-            f.println("买单|mai3 dan1|the bill please");
-            f.println("水|shui3|water");
-            f.println("茶|cha2|tea");
-            // Numbers
-            f.println("一 二 三|yi1 er4 san1|1 2 3");
-            f.println("四 五 六|si4 wu3 liu4|4 5 6");
-            f.println("七 八 九 十|qi1 ba1 jiu3 shi2|7 8 9 10");
-            f.println("一百|yi4 bai3|one hundred");
-            // Directions
-            f.println("左|zuo3|left");
-            f.println("右|you4|right");
-            f.println("直走|zhi2 zou3|straight ahead");
-            f.println("这里|zhe4 li3|here");
-            f.println("那里|na4 li3|there");
-            // Useful
-            f.println("是|shi4|yes / is");
-            f.println("不是|bu2 shi4|no / is not");
-            f.println("有|you3|to have");
-            f.println("没有|mei2 you3|don't have");
-            f.println("可以|ke3 yi3|can / may");
-            f.println("好的|hao3 de|ok / good");
-            f.println("帮我|bang1 wo3|help me");
             f.close();
         }
     }
@@ -1799,6 +2317,13 @@ void loop() {
         update_card_face();
         update_analytics();
         update_flow_overlay();
+    }
+
+    // v1.3 -- reading tracker: minute-grained check for nudge + live label
+    static uint32_t read_t = 0;
+    if (now - read_t >= 30000UL) {       // every 30 s is enough
+        read_t = now;
+        reading_tick_minute();
     }
 
     delay(5);

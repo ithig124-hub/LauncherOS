@@ -1,0 +1,4 @@
+TITLE=A Scandal in Bohemia
+AUTHOR=Arthur Conan Doyle
+GENRE=Mystery
+THEME=Navy
