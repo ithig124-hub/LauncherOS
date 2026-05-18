@@ -43,6 +43,22 @@
 #include <esp32-hal-cpu.h>
 #include <Update.h>
 
+// =====================================================================
+//   GameEntry struct  (moved to TOP of file so Arduino's auto-prototype
+//   generator sees it before it emits prototypes for make_game_card()
+//   and the click-handler lambda that reference 'const GameEntry*'.
+//   This fixes the 'GameEntry does not name a type' compile error.)
+// =====================================================================
+struct GameEntry {
+    const char* name;
+    const char* desc;
+    const char  icon;        // initial / glyph
+    uint32_t    accent;
+    void      (*open)();
+    uint8_t     cat;         // 0 = built-in, 1 = easy, 2 = medium, 3 = showpiece
+};
+
+
 // ---- Pin map ---------------------------------------------------------
 #define LCD_SDIO0 4
 #define LCD_SDIO1 5
@@ -429,18 +445,6 @@ static void open_snake(){
 #include "games_pack1.h"
 #include "games_pack2.h"
 #include "games_pack3.h"
-
-// =====================================================================
-//   GAME REGISTRY  (drives launcher list + categories)
-// =====================================================================
-struct GameEntry {
-    const char* name;
-    const char* desc;
-    const char  icon;        // initial / glyph
-    uint32_t    accent;
-    void      (*open)();
-    uint8_t     cat;         // 0 = built-in, 1 = easy, 2 = medium, 3 = showpiece
-};
 
 static const GameEntry GAMES[] = {
     // built-ins
