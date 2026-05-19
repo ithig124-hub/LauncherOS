@@ -1273,21 +1273,11 @@ static void make_eyebrow(lv_obj_t *parent, const char *txt) {
 }
 
 static void build_back_btn(lv_obj_t *parent) {
-    back_btn = lv_btn_create(parent);
-    lv_obj_set_size(back_btn, 220, 46);
-    lv_obj_align(back_btn, LV_ALIGN_BOTTOM_MID, 0, -16);
-    lv_obj_set_style_bg_color(back_btn, lv_color_hex(0x141414), 0);
-    lv_obj_set_style_border_color(back_btn, lv_color_hex(S_CYAN), 0);
-    lv_obj_set_style_border_width(back_btn, 1, 0);
-    lv_obj_set_style_radius(back_btn, 23, 0);
-    lv_obj_t *bl = lv_label_create(back_btn);
-    lv_label_set_text(bl, LV_SYMBOL_LEFT "  Back to Launcher");
-    lv_obj_set_style_text_color(bl, lv_color_hex(S_CYAN), 0);
-    lv_obj_set_style_text_font(bl, &lv_font_montserrat_16, 0);
-    lv_obj_center(bl);
-    lv_obj_add_event_cb(back_btn, back_btn_cb, LV_EVENT_PRESSED,      NULL);
-    lv_obj_add_event_cb(back_btn, back_btn_cb, LV_EVENT_LONG_PRESSED, NULL);
-    lv_obj_add_event_cb(back_btn, back_btn_cb, LV_EVENT_RELEASED,     NULL);
+    // v1.1: pill removed.  BOOT button is the only exit path now.
+    // (return_to_launcher() is still wired to LONG_PRESS on BOOT inside the
+    //  shared boot block, so 1.5 s on BOOT still drops back to LauncherOS.)
+    (void)parent;
+    back_btn = nullptr;
 }
 
 static void build_home_tab() {

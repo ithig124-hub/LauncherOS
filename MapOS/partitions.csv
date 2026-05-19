@@ -1,0 +1,11 @@
+# MapOS partition table for ESP32-S3 16 MB flash.
+# Matches the LauncherOS shared layout so MapOS can hand control back to the
+# factory (launcher) partition via esp_ota_set_boot_partition().
+#
+# Name,   Type, SubType,  Offset,   Size,     Flags
+nvs,      data, nvs,      0x9000,   0x5000,
+otadata,  data, ota,      0xe000,   0x2000,
+factory,  app,  factory,  0x10000,  0x300000,
+ota_0,    app,  ota_0,    0x310000, 0x300000,
+ota_1,    app,  ota_1,    0x610000, 0x300000,
+spiffs,   data, spiffs,   0x910000, 0x6F0000,

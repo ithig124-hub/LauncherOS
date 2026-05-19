@@ -1,14 +1,22 @@
 // =============================================================================
-// TacticalOS.ino v2.1 -- LauncherOS-compatible operator / adventure OS
+// TacticalOS.ino v2.2 -- LauncherOS-compatible operator / adventure OS
 // Target  : Waveshare ESP32-S3 Touch AMOLED 2.06 (410 x 502, CO5300, FT3168)
 // Compile : ESP32-S3 Dev Module / PSRAM=OPI / Flash=16MB / Minimal SPIFFS
-// PIN     : default 6030  (4-digit lock at boot, NVS-stored)
+// PIN     : default 6030  (4-digit lock at boot, NVS-stored, toggleable
+//           from the Settings card in the TOOLS tab)
 // -----------------------------------------------------------------------------
-// v2.1 ADDS:
-//   [P] TRAIL BREADCRUMBS - last 64 positions drawn on NAV canvas (retrace!)
-//   [Q] PACE COUNTER      - military Ranger 100m pace beads in TOOLS
-//   [R] 3 CAMO THEMES     - RED / GREEN / AMBER (cycle in TOOLS)
-//   [S] STRIDE CALIBRATE  - walk 100m, tap twice, auto-saves stride to NVS
+// v2.2 ADDS:
+//   * Back-to-launcher pill REMOVED on every tab.  Long-press BOOT (1.5 s)
+//     is now the only exit path -- same as StudyOS.
+//   * TAP-EDGE NAV: tap the leftmost ~20% of the screen -> previous tab,
+//     rightmost ~20% -> next tab.  Center band keeps the existing
+//     double-tap flashlight gesture.  No animation, instant snap to tab.
+//   * Tabview swipe-slide DISABLED + glitch overlay no longer fires on
+//     tab change -- the OS feels snappy like LauncherOS now.
+//   * SETTINGS CARD in TOOLS tab with a "PIN LOCK ARMED/DISARMED" switch.
+//     Toggle saved to NVS (tac-pin/enabled).  Takes effect next boot --
+//     when DISARMED the keypad overlay is skipped entirely.
+// v2.1: TRAIL BREADCRUMBS, PACE COUNTER, 3 CAMO THEMES, STRIDE CALIBRATE
 // v2.0 features (PIN, watchfaces, NAV waypoints, Morse keyer, beacon, etc.)
 // remain intact -- see /app/memory/PRD.md.
 // =============================================================================
@@ -656,6 +664,10 @@ static lv_color_t *graph_buf = nullptr;
 // Back-to-launcher pill
 static lv_obj_t *back_btn;
 
+// v2.2 Settings card (PIN toggle) -- file-scope so the toggle callback
+// can refresh the ARMED/DISARMED label without LVGL class-introspection.
+static lv_obj_t *s_pin_state_lbl = nullptr;
+
 // Glitch transition overlay
 static lv_obj_t *glitch_overlay = nullptr;
 static uint32_t  g_glitch_until  = 0;
@@ -1251,14 +1263,39 @@ static void home_face_cycle() {
   show_toast(m, 1000);
 }
 
-// Double-tap flashlight
+// v2.2 -- Tap-edge nav.
+//   * Tap on left ~20 % of the screen  -> previous tab (snappy, no anim)
+//   * Tap on right ~20 % of the screen -> next tab     (snappy, no anim)
+//   * Center band remains the double-tap flashlight zone.
+// We read the last-known touch X recorded by my_touchpad_read (g_touch_x).
+// Tab change uses LV_ANIM_OFF -> instant switch, same feel as LauncherOS.
+#define EDGE_NAV_PX  (LCD_WIDTH / 5)        // ~82 px on a 410 px panel
+
+static void nav_relative(int delta) {
+  if (g_locked) return;                     // don't nav while PIN screen up
+  uint32_t cur = lv_tabview_get_tab_act(tabv);
+  int32_t  nxt = (int32_t)cur + delta;
+  if (nxt < 0) nxt = M_NTABS - 1;           // wrap edges, feels nicer than clamp
+  if (nxt >= M_NTABS) nxt = 0;
+  lv_tabview_set_act(tabv, (uint32_t)nxt, LV_ANIM_OFF);
+}
+
 static uint32_t g_last_tap_t = 0;
 static void scr_clicked_cb(lv_event_t *) {
   uint32_t now = millis();
+  int32_t  x   = g_touch_x;
+
+  // Edge tap = nav, never trigger the flashlight double-tap there.
+  if (x >= 0 && x < EDGE_NAV_PX)             { nav_relative(-1); g_last_tap_t = 0; return; }
+  if (x > LCD_WIDTH - EDGE_NAV_PX && x <= LCD_WIDTH) { nav_relative(+1); g_last_tap_t = 0; return; }
+
+  // Center band: keep the existing double-tap flashlight behaviour.
   if (now - g_last_tap_t < 350) {
     if (!g_flashlight) flash_on(); else flash_off();
     g_last_tap_t = 0;
-  } else g_last_tap_t = now;
+  } else {
+    g_last_tap_t = now;
+  }
 }
 
 // =============================================================================
@@ -1300,11 +1337,36 @@ static void tick_beacon() {
 // =============================================================================
 // PIN LOCK
 // =============================================================================
-static String g_stored_pin = "6030";
+static String g_stored_pin     = "6030";
+static bool   g_pin_enabled    = true;   // v2.2: user-toggleable from Settings
 static void pin_load() {
   Preferences p; p.begin("tac-pin", true);
-  g_stored_pin = p.getString("pin", "6030");
+  g_stored_pin  = p.getString("pin", "6030");
+  g_pin_enabled = p.getBool  ("enabled", true);
   p.end();
+}
+static void pin_save_enabled(bool en) {
+  g_pin_enabled = en;
+  Preferences p; p.begin("tac-pin", false);
+  p.putBool("enabled", en);
+  p.end();
+}
+
+// v2.2 -- Settings card switch callback.  Persists the new state and
+// updates the ARMED/DISARMED label on the same card.  The change takes
+// effect on the next boot; the current session is unaffected so a user
+// who just typed their PIN doesn't get kicked out mid-use.
+static void pin_toggle_cb(lv_event_t *e) {
+  lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+  bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  pin_save_enabled(on);
+  if (s_pin_state_lbl) {
+    lv_label_set_text(s_pin_state_lbl, on ? "ARMED" : "DISARMED");
+    lv_obj_set_style_text_color(s_pin_state_lbl,
+        lv_color_hex(on ? T_RED : T_MUTE), 0);
+  }
+  show_toast(on ? "PIN LOCK ARMED (next boot)" : "PIN LOCK DISARMED", 1600);
+  log_event(on ? "PIN ENABLED" : "PIN DISABLED");
 }
 static void pin_update_dots() {
   for (int i = 0; i < 4; i++) {
@@ -1582,22 +1644,11 @@ static lv_obj_t *make_eyebrow(lv_obj_t *parent, const char *txt, lv_align_t a, i
   return l;
 }
 static void build_back_btn(lv_obj_t *parent) {
-  lv_obj_t *bb = lv_btn_create(parent);
-  lv_obj_set_size(bb, 220, 46);
-  lv_obj_align(bb, LV_ALIGN_BOTTOM_MID, 0, -16);
-  lv_obj_set_style_bg_color(bb, lv_color_hex(0x0E0E0E), 0);
-  lv_obj_set_style_border_color(bb, lv_color_hex(T_CYAN), 0);
-  lv_obj_set_style_border_width(bb, 1, 0);
-  lv_obj_set_style_radius(bb, 23, 0);
-  lv_obj_t *bl = lv_label_create(bb);
-  lv_label_set_text(bl, LV_SYMBOL_LEFT "  Back to Launcher");
-  lv_obj_set_style_text_color(bl, lv_color_hex(T_CYAN), 0);
-  lv_obj_set_style_text_font (bl, &lv_font_montserrat_16, 0);
-  lv_obj_center(bl);
-  lv_obj_add_event_cb(bb, back_btn_cb, LV_EVENT_PRESSED, NULL);
-  lv_obj_add_event_cb(bb, back_btn_cb, LV_EVENT_LONG_PRESSED, NULL);
-  lv_obj_add_event_cb(bb, back_btn_cb, LV_EVENT_RELEASED, NULL);
-  back_btn = bb;
+  // v2.2: pill removed.  BOOT button is the only exit path now -- held
+  // for >1.5 s in loop() calls return_to_launcher().  Keeping the function
+  // around as a no-op so the 7 build_back_btn(...) call sites still compile.
+  (void)parent;
+  back_btn = nullptr;
 }
 
 // ---- HOME with 3 watchfaces -------------------------------------------------
@@ -2123,6 +2174,35 @@ static void build_tools_tab() {
   lv_obj_center(cll2);
   lv_obj_add_event_cb(cal_btn, stride_cal_cb, LV_EVENT_CLICKED, NULL);
 
+  // v2.2 -- SETTINGS card: PIN lock toggle.
+  // Sits along the bottom strip that the removed "Back to Launcher" pill
+  // used to occupy.  Layout: card title top-left, ARMED/DISARMED status
+  // text bottom-left, lv_switch on the right.
+  lv_obj_t *sc = make_card(tab_tools, LCD_WIDTH - 40, 52);
+  lv_obj_align(sc, LV_ALIGN_BOTTOM_MID, 0, -10);
+  lv_obj_t *sl = lv_label_create(sc);
+  lv_label_set_text(sl, "PIN LOCK");
+  lv_obj_set_style_text_color(sl, lv_color_hex(T_DIM_RED), 0);
+  lv_obj_set_style_text_font (sl, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_letter_space(sl, 2, 0);
+  lv_obj_align(sl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+  s_pin_state_lbl = lv_label_create(sc);
+  lv_label_set_text(s_pin_state_lbl, g_pin_enabled ? "ARMED" : "DISARMED");
+  lv_obj_set_style_text_color(s_pin_state_lbl,
+      lv_color_hex(g_pin_enabled ? T_RED : T_MUTE), 0);
+  lv_obj_set_style_text_font (s_pin_state_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_align(s_pin_state_lbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+  lv_obj_t *pin_sw = lv_switch_create(sc);
+  lv_obj_set_size(pin_sw, 56, 28);
+  lv_obj_align(pin_sw, LV_ALIGN_RIGHT_MID, 0, 0);
+  lv_obj_set_style_bg_color(pin_sw, lv_color_hex(0x200000), 0);                // off track
+  lv_obj_set_style_bg_color(pin_sw, lv_color_hex(T_RED),    LV_PART_INDICATOR); // on track
+  lv_obj_set_style_bg_color(pin_sw, lv_color_hex(0xFFFFFF), LV_PART_KNOB);
+  if (g_pin_enabled) lv_obj_add_state(pin_sw, LV_STATE_CHECKED);
+  lv_obj_add_event_cb(pin_sw, pin_toggle_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
   build_back_btn(tab_tools);
 }
 
@@ -2344,7 +2424,7 @@ static void update_page_dots(int active) {
 static void tab_changed_cb(lv_event_t *e) {
   uint32_t a = lv_tabview_get_tab_act((lv_obj_t*)lv_event_get_target(e));
   update_page_dots((int)a);
-  trigger_glitch();
+  // v2.2: no glitch overlay on tab change -- user asked for snappy.
 }
 
 static void build_ui() {
@@ -2357,6 +2437,15 @@ static void build_ui() {
   lv_obj_set_size(tabv, LCD_WIDTH, LCD_HEIGHT);
   lv_obj_set_style_bg_color(tabv, lv_color_hex(T_BG), 0);
   lv_obj_set_style_bg_opa  (tabv, LV_OPA_COVER, 0);
+  // v2.2: kill the tabview's built-in slide animation between tabs.
+  // We drive navigation ourselves via tap-edge -> lv_tabview_set_act(LV_ANIM_OFF),
+  // so the content wrapper doesn't need to be horizontally swipeable at all.
+  // Disabling SCROLLABLE on the content removes the slide entirely; tab
+  // switches feel instant (matches LauncherOS' snappy fade-cut feel).
+  {
+    lv_obj_t *content = lv_tabview_get_content(tabv);
+    if (content) lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+  }
 
   tab_home    = lv_tabview_add_tab(tabv, "HOME");
   tab_compass = lv_tabview_add_tab(tabv, "CMP");
@@ -2480,6 +2569,13 @@ void setup() {
 
   build_ui();
   setCpuFrequencyMhz(160);
+
+  // v2.2: honour the user's "PIN ON/OFF" toggle from the Settings card.
+  // When disabled we never block the UI behind the keypad on boot.
+  if (!g_pin_enabled) {
+    g_locked = false;
+    if (pin_overlay) lv_obj_add_flag(pin_overlay, LV_OBJ_FLAG_HIDDEN);
+  }
 
   time_t now; time(&now);
   bool need_ntp = !g_time_valid || (now < 1700000000)

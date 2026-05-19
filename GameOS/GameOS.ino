@@ -612,26 +612,68 @@ static void sd_ensure_dirs(){
 
 static void hw_boot(){
     Serial.begin(115200);
-    pinMode(BOOT_BTN,INPUT_PULLUP); pinMode(PWR_BTN,INPUT_PULLUP); btStop();
+    pinMode(BOOT_BTN, INPUT_PULLUP);
+    pinMode(PWR_BTN,  INPUT_PULLUP);
+    btStop();
+
+    // (1) Display first - cheap, no I2C, gives us a visual heartbeat
+    //     even if I2C bring-up later goes wrong.
     if(!gfx->begin()) Serial.println("gfx begin fail");
     gfx->fillScreen(0x0000);
-    pinMode(IIC_SCL,OUTPUT);
-    for(int i=0;i<9;i++){digitalWrite(IIC_SCL,LOW);delayMicroseconds(5);digitalWrite(IIC_SCL,HIGH);delayMicroseconds(5);}
-    Wire.begin(IIC_SDA,IIC_SCL);
-    pinMode(TP_RESET,OUTPUT); digitalWrite(TP_RESET,LOW); delay(50); digitalWrite(TP_RESET,HIGH); delay(200);
+
+    // (2) Bring the I2C bus up cleanly (9-clock unstick in case the
+    //     previous app left a slave mid-transaction).
+    pinMode(IIC_SCL, OUTPUT);
+    for(int i = 0; i < 9; i++){
+        digitalWrite(IIC_SCL, LOW);  delayMicroseconds(5);
+        digitalWrite(IIC_SCL, HIGH); delayMicroseconds(5);
+    }
+    Wire.begin(IIC_SDA, IIC_SCL);
+    Wire.setClock(400000);
+
+    // (3) AXP2101 FIRST.  The FT3168 touch IC is powered by an AXP LDO
+    //     rail on the Waveshare 2.06 board.  Starting touch before this
+    //     rail is on leaves the driver's internal state undefined and
+    //     the first LVGL touch poll then faults with LoadProhibited
+    //     (the boot loop / Guru Meditation we were chasing).
+    if(g_pmu.begin(Wire, AXP2101_SLAVE_ADDRESS, IIC_SDA, IIC_SCL)){
+        g_has_pmu = true;
+        g_pmu.disableTSPinMeasure();
+        g_pmu.enableBattVoltageMeasure();
+        // Force the touch / sensor rails ON explicitly.  No-ops if the
+        // launcher already had them on; critical after cold boot or
+        // wake from deep sleep where they may be off.
+        g_pmu.setALDO1Voltage(3300); g_pmu.enableALDO1();
+        g_pmu.setBLDO1Voltage(3300); g_pmu.enableBLDO1();
+        delay(40);   // rail settle before we pulse TP_RESET
+    }
+
+    // (4) NOW reset and start the touch controller.
+    pinMode(TP_RESET, OUTPUT);
+    digitalWrite(TP_RESET, LOW);  delay(50);
+    digitalWrite(TP_RESET, HIGH); delay(200);
     FT3168->begin();
-    if(g_pmu.begin(Wire,AXP2101_SLAVE_ADDRESS,IIC_SDA,IIC_SCL)){g_has_pmu=true; g_pmu.disableTSPinMeasure(); g_pmu.enableBattVoltageMeasure();}
+
+    // (5) LVGL last - safe to poll touch from here on.
     lv_init();
-    size_t px=LCD_W*60;
-    g_lvbuf=(lv_color_t*)heap_caps_malloc(px*sizeof(lv_color_t),MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
-    if(!g_lvbuf) g_lvbuf=(lv_color_t*)heap_caps_malloc(px*sizeof(lv_color_t),MALLOC_CAP_8BIT);
-    lv_disp_draw_buf_init(&g_db,g_lvbuf,NULL,px);
-    lv_disp_drv_init(&g_dd); g_dd.flush_cb=lv_flush; g_dd.draw_buf=&g_db; g_dd.hor_res=LCD_W; g_dd.ver_res=LCD_H;
+    size_t px = LCD_W * 60;
+    g_lvbuf = (lv_color_t*)heap_caps_malloc(px * sizeof(lv_color_t),
+                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if(!g_lvbuf)
+        g_lvbuf = (lv_color_t*)heap_caps_malloc(px * sizeof(lv_color_t),
+                    MALLOC_CAP_8BIT);
+    lv_disp_draw_buf_init(&g_db, g_lvbuf, NULL, px);
+    lv_disp_drv_init(&g_dd);
+    g_dd.flush_cb = lv_flush; g_dd.draw_buf = &g_db;
+    g_dd.hor_res  = LCD_W;    g_dd.ver_res  = LCD_H;
     lv_disp_drv_register(&g_dd);
-    lv_indev_drv_init(&g_id); g_id.type=LV_INDEV_TYPE_POINTER; g_id.read_cb=lv_touch_gesture;
+    lv_indev_drv_init(&g_id);
+    g_id.type = LV_INDEV_TYPE_POINTER;
+    g_id.read_cb = lv_touch_gesture;
     lv_indev_drv_register(&g_id);
-    SD_MMC.setPins(SDMMC_CLK,SDMMC_CMD,SDMMC_DATA);
-    SD_MMC.begin("/sdcard",true);
+
+    SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_DATA);
+    SD_MMC.begin("/sdcard", true);
     sd_ensure_dirs();
     load_wifi_config();
 }
@@ -674,11 +716,21 @@ static void splash_show(){
     lv_obj_align(gc,LV_ALIGN_CENTER,0,90);
     lv_scr_load(s);
     const char *steps[]={"MOUNT SD","SCAN /games","LOAD SAVES","SYNC RTC","READY"};
+    uint32_t boot_held = 0;
     for(int p=0;p<=100;p+=4){
         lv_bar_set_value(bar,p,LV_ANIM_OFF);
         if(p%20==0) lv_label_set_text(t2,steps[p/20>4?4:p/20]);
         lv_timer_handler(); delay(28);
         if(p==40) wifi_quick_sync();
+
+        // Hardware safety exit during splash: hold BOOT 1.5 s -> launcher.
+        // Without this, if anything later in setup() panics the user is
+        // trapped in a boot loop because the loop()-level BOOT handler
+        // never gets to run.
+        if(digitalRead(BOOT_BTN) == LOW){
+            if(!boot_held) boot_held = millis();
+            else if(millis() - boot_held > 1500) return_to_launcher();
+        } else boot_held = 0;
     }
 }
 
