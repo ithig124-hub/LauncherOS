@@ -1198,6 +1198,7 @@ static void open_splits(){
     mk_pill(s, 200, 48, COL_CARD, ACCENT_CYAN, "BACK", ACCENT_CYAN,
             &lv_font_montserrat_16, LV_ALIGN_BOTTOM_MID, 0, -30,
             [](lv_event_t*){ open_workout_active(); });
+    open_app_screen(s);
 }
 
 // =====================================================================
@@ -1275,6 +1276,7 @@ static void open_summary(int xp_gain){
             ACCENT_SPORT, &lv_font_montserrat_16,
             LV_ALIGN_BOTTOM_MID, 0, -22,
             [](lv_event_t*){ open_home(); });
+    open_app_screen(s);
 }
 
 static void finish_workout(){
@@ -1756,6 +1758,7 @@ static void open_stats(){
             ACCENT_CYAN, &lv_font_montserrat_16,
             LV_ALIGN_BOTTOM_MID, 0, -22,
             [](lv_event_t*){ open_home(); });
+    open_app_screen(s);
 }
 
 // =====================================================================
@@ -1815,6 +1818,7 @@ static void open_settings(){
             ACCENT_CYAN, &lv_font_montserrat_16,
             LV_ALIGN_BOTTOM_MID, 0, -22,
             [](lv_event_t*){ open_home(); });
+    open_app_screen(s);
 }
 
 // =====================================================================
@@ -2066,22 +2070,28 @@ static void lv_touch_gesture(lv_indev_drv_t *, lv_indev_data_t *d){
 static void goto_screen(int s){
     while(s < 0)            s += NUM_SCREENS;
     while(s >= NUM_SCREENS) s -= NUM_SCREENS;
-    if(s == current_screen) return;
+    if(s == current_screen && g_transient_screen == nullptr) return;
     current_screen  = s;
     g_pending_swipe = 0;
-    if(g_transient_screen){
-        lv_obj_del_async(g_transient_screen);
-        g_transient_screen = nullptr;
-    }
+    // If we are leaving a transient (custom) screen, let lv_scr_load_anim
+    // delete it AFTER the fade completes (auto_del=true).  Deleting it
+    // ourselves via lv_obj_del_async while the fade still references the
+    // "from" screen causes a use-after-free and reboots the watch.
+    bool had_transient = (g_transient_screen != nullptr);
+    g_transient_screen = nullptr;
     if(screens[s])
         lv_scr_load_anim(screens[s], LV_SCR_LOAD_ANIM_FADE_ON,
-                         SCREEN_SWITCH_ANIM_MS, 0, false);
+                         SCREEN_SWITCH_ANIM_MS, 0, had_transient);
 }
 static void open_app_screen(lv_obj_t *s){
+    // CRITICAL: pass auto_del=true when there is a previous transient screen
+    // so LVGL deletes it AFTER the fade animation completes.  Doing
+    // lv_obj_del_async(prev) ourselves runs at the start of the next
+    // lv_timer_handler() pass — while the fade still holds a pointer to the
+    // "from" screen — and crashes/reboots the watch on every workout start.
     lv_obj_t *prev = g_transient_screen;
     g_transient_screen = s;
-    lv_scr_load_anim(s, LV_SCR_LOAD_ANIM_FADE_ON, 250, 0, false);
-    if(prev) lv_obj_del_async(prev);
+    lv_scr_load_anim(s, LV_SCR_LOAD_ANIM_FADE_ON, 250, 0, prev != nullptr);
 }
 
 // =====================================================================
