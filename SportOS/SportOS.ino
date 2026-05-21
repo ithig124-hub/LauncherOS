@@ -70,6 +70,11 @@ static void unlock_ach(int id);
 static void daily_rollover_tick();
 static void show_ach_toast(int id);
 
+// v4: forward decl so Arduino IDE auto-generated prototypes
+//     (e.g. apply_preset_to_wk / start_with_preset) can reference this type
+//     before its full definition appears later in the file.
+struct XcPreset;
+
 #define LCD_SDIO0 4
 #define LCD_SDIO1 5
 #define LCD_SDIO2 6
@@ -475,6 +480,10 @@ struct Settings {
     int   step_hist[7]    = {0,0,0,0,0,0,0}; // last 7 finished days, hist[0]=oldest
     // v3: achievements bitmap (bit per badge, see ACH_* enum below)
     uint32_t ach_unlocked = 0;
+    // v4: XC tuning
+    float stride_cal_xc   = 1.00f;     // multiplier on SPORTS[SP_XC].stride_m
+    int   xc_alert_band   = 5;         // +/- sec/km tolerance before alert
+    bool  xc_alerts_on    = true;      // master alert toggle
 };
 static Settings S;
 static Preferences nvs;
@@ -496,6 +505,10 @@ static void load_settings(){
         S.step_hist[i] = nvs.getInt(k, 0);
     }
     S.ach_unlocked   = nvs.getUInt ("ach",    0);
+    // v4
+    S.stride_cal_xc  = nvs.getFloat("strxc",  1.00f);
+    S.xc_alert_band  = nvs.getInt  ("xcab",   5);
+    S.xc_alerts_on   = nvs.getBool ("xcao",   true);
     nvs.end();
 }
 static void save_settings(){
@@ -515,6 +528,10 @@ static void save_settings(){
         nvs.putInt(k, S.step_hist[i]);
     }
     nvs.putUInt ("ach",   S.ach_unlocked);
+    // v4
+    nvs.putFloat("strxc", S.stride_cal_xc);
+    nvs.putInt  ("xcab",  S.xc_alert_band);
+    nvs.putBool ("xcao",  S.xc_alerts_on);
     nvs.end();
 }
 static int iso_week_now(){
@@ -605,7 +622,7 @@ static const SportProfile SPORTS[] = {
     /* WALK  */ {"WALK", "W", ACCENT_CYAN,  3.8f, 0.72f, 105, 720, 18.0f},
     /* CYCLE */ {"CYCLE","C", ACCENT_AMBER, 7.5f, 0.00f,   0, 180, 14.0f},
     /* HIIT  */ {"HIIT", "H", ACCENT_DANGER,10.0f,0.00f,   0,   0, 28.0f},
-    /* XC    */ {"XC",   "X", ACCENT_XC,    11.5f,1.00f, 160, 420, 40.0f}
+    /* XC    */ {"XC",   "X", ACCENT_XC,    11.5f,1.55f, 160, 420, 40.0f}   // stride bumped 1.00 -> 1.55m (teen race stride)
 };
 
 // =====================================================================
@@ -644,6 +661,11 @@ struct Workout {
     // XC
     float bumpiness = 0;        // smoothed IMU jerk magnitude
     bool  on_hill   = false;    // gravity-z tilt heuristic
+    // v4: XC per-km pace plan (set via preset or custom builder)
+    bool  xc_plan_active = false;
+    int   xc_plan_n      = 0;           // number of km segments (1..12)
+    int   xc_plan_sec[12]= {0};         // target sec/km for km 1..N
+    int   xc_plan_km_done= 0;           // last whole km we switched on
 };
 static Workout WK;
 
@@ -701,7 +723,10 @@ static void imu_tick(){
             const SportProfile &sp = SPORTS[WK.sport];
             if(sp.stride_m > 0.0f){
                 WK.steps++;
-                WK.km += sp.stride_m / 1000.0f;
+                // v4: per-sport stride calibration (currently only XC exposed in UI)
+                float stride = sp.stride_m;
+                if(WK.sport == SP_XC) stride *= S.stride_cal_xc;
+                WK.km += stride / 1000.0f;
             }
         }
     }
@@ -727,6 +752,11 @@ static void imu_tick(){
 static lv_timer_t *aw_t = nullptr;
 static lv_obj_t *aw_time,*aw_dist,*aw_pace,*aw_steps,*aw_cal,*aw_paceband;
 static lv_obj_t *aw_hud,*aw_phase,*aw_lap,*aw_extra,*aw_partner;
+// v4: Lap Pace / Lap Distance widgets (XC-friendly metrics)
+static lv_obj_t *aw_lappace = nullptr, *aw_lapdist = nullptr;
+// v4: ±5s alert state
+static int  g_last_alert_state = 0;     // -1 too fast, 0 in band, +1 too slow
+static uint32_t g_last_alert_ms = 0;
 
 static bool workout_active(){ return aw_t != nullptr; }
 
@@ -921,6 +951,9 @@ static void open_summary(int xp_gain);
 static void open_splits();
 
 static void aw_tick(lv_timer_t*){
+    // v4: safety — if widgets were destroyed by another screen, abort.
+    // (Belt + braces; open_splits() also nukes the timer itself.)
+    if(!aw_time || !aw_dist || !aw_pace) return;
     // -- auto-pause logic (RUN/WALK/XC only; cycle/hiit not triggered) --
     if((WK.sport==SP_RUN||WK.sport==SP_WALK||WK.sport==SP_XC) && !WK.paused){
         uint32_t since = millis() - IMU.last_motion_ms;
@@ -1031,6 +1064,58 @@ static void aw_tick(lv_timer_t*){
         lv_label_set_text(aw_lap,b);
     }
 
+    // -- v4: Lap Pace + Lap Distance widgets (the two XC-friendly stats) --
+    {
+        float lap_km  = WK.km - WK.lap_start_km;            // distance into current lap
+        uint32_t lap_sec = elapsed_sec() - WK.lap_start_sec; // time spent in current lap
+        int lap_pace = (lap_km > 0.01f) ? (int)((float)lap_sec / lap_km) : 0;
+        if(aw_lappace){
+            int pu = pace_sec_to_user(lap_pace);
+            if(pu>0) snprintf(b,36,"LAP %d:%02d", pu/60, pu%60);
+            else     snprintf(b,36,"LAP --:--");
+            lv_label_set_text(aw_lappace,b);
+        }
+        if(aw_lapdist){
+            int m_into = (int)(lap_km * 1000.0f);
+            int auto_lap_m = (S.auto_lap_m>0) ? S.auto_lap_m : 1000;
+            snprintf(b,36,"%d / %d m", m_into, auto_lap_m);
+            lv_label_set_text(aw_lapdist,b);
+        }
+    }
+
+    // -- v4: XC per-km plan switching (after each whole km cross target updates) --
+    if(WK.xc_plan_active && WK.sport == SP_XC){
+        int km_done = (int)WK.km;
+        if(km_done > WK.xc_plan_km_done && km_done < WK.xc_plan_n){
+            WK.xc_plan_km_done = km_done;
+            WK.target_pace_sec = WK.xc_plan_sec[km_done];   // next km's target
+        } else if(km_done == 0 && WK.xc_plan_n > 0){
+            // ensure km 1's target is loaded at start
+            WK.target_pace_sec = WK.xc_plan_sec[0];
+        }
+    }
+
+    // -- v4: ±N sec pace alert (XC mode) → flash pace band + buzz target --
+    if(WK.sport == SP_XC && S.xc_alerts_on && WK.xc_plan_active && pkm>0){
+        int diff = pkm - WK.target_pace_sec;
+        int state = 0;
+        if(diff < -S.xc_alert_band) state = -1;        // too fast → save legs
+        else if(diff >  S.xc_alert_band) state = +1;   // too slow → pick it up
+        uint32_t now = millis();
+        if(state != 0 && state != g_last_alert_state && (now - g_last_alert_ms) > 2500){
+            g_last_alert_state = state;
+            g_last_alert_ms    = now;
+            // flash the pace band white briefly as a visual buzz
+            lv_obj_set_style_bg_color(aw_paceband,
+                lv_color_hex(state<0?ACCENT_CYAN:ACCENT_DANGER), 0);
+            lv_obj_set_style_bg_opa(aw_paceband, LV_OPA_COVER, 0);
+            lv_obj_set_size(aw_paceband, LCD_W, 14);   // beefier band
+        } else if(state == 0){
+            g_last_alert_state = 0;
+            lv_obj_set_size(aw_paceband, LCD_W, 6);
+        }
+    }
+
     // -- auto-pause indicator --
     if(WK.auto_paused){
         lv_obj_set_style_bg_color(aw_paceband,lv_color_hex(ACCENT_AMBER),0);
@@ -1067,8 +1152,19 @@ static void aw_tick(lv_timer_t*){
         } else if(WK.mode == M_CROSS){
             const char *terrain = WK.bumpiness < 0.04f ? "smooth" :
                                   WK.bumpiness < 0.10f ? "uneven" : "technical";
-            snprintf(b,36,"%s  %s",
-                     WK.on_hill ? "HILL " : "FLAT ", terrain);
+            // v4: if a per-km plan is active, show "KM 2/4  TGT 3:35" instead
+            if(WK.xc_plan_active){
+                int km_now = (int)WK.km + 1;
+                if(km_now > WK.xc_plan_n) km_now = WK.xc_plan_n;
+                int tgt = WK.target_pace_sec;
+                int pu  = pace_sec_to_user(tgt);
+                snprintf(b,36,"KM %d/%d  TGT %d:%02d  %s",
+                         km_now, WK.xc_plan_n, pu/60, pu%60,
+                         WK.on_hill ? "HILL" : "FLAT");
+            } else {
+                snprintf(b,36,"%s  %s",
+                         WK.on_hill ? "HILL " : "FLAT ", terrain);
+            }
             lv_label_set_text(aw_extra,b);
         } else if(WK.mode == M_TRAINING){
             const char *plans[]={"EASY","TEMPO","LONG","INTERVAL","FARTLEK"};
@@ -1109,6 +1205,13 @@ static void open_workout_active(){
 
     aw_lap   = mk_label(s, "LAP 1",   &lv_font_montserrat_14, sp.color,
                         LV_ALIGN_TOP_MID, 0, 226, 3);
+
+    // v4: Lap Pace (avg pace for current km) — much more stable than current pace on grass
+    aw_lappace = mk_label(s, "LAP --:--", &lv_font_montserrat_18, sp.color,
+                          LV_ALIGN_TOP_LEFT, 40, 222, 2);
+    // v4: Lap Distance (how deep into the current km you are)
+    aw_lapdist = mk_label(s, "0 m",       &lv_font_montserrat_18, ACCENT_AMBER,
+                          LV_ALIGN_TOP_RIGHT, -40, 222, 2);
 
     aw_steps = mk_label(s, "0 steps", &lv_font_montserrat_14, COL_MUTED2,
                         LV_ALIGN_TOP_LEFT, 40, 250);
@@ -1168,6 +1271,14 @@ static void open_workout_active(){
 //  Splits screen (live during workout)
 // =====================================================================
 static void open_splits(){
+    // v4: critical fix — kill the active-workout timer before the screen it
+    // points at gets deleted (otherwise aw_tick keeps writing into freed
+    // LVGL labels → LoadProhibited @ 0xa1b2c3d4 (LVGL freed-poison)).
+    if(aw_t){ lv_timer_del(aw_t); aw_t = nullptr; }
+    aw_time=aw_dist=aw_pace=aw_steps=aw_cal=aw_paceband=nullptr;
+    aw_hud=aw_phase=aw_lap=aw_extra=aw_partner=nullptr;
+    aw_lappace=aw_lapdist=nullptr;
+
     lv_obj_t *s=lv_obj_create(NULL);
     lv_obj_set_style_bg_color(s,lv_color_hex(COL_BG),0);
     lv_obj_set_style_bg_opa(s,LV_OPA_COVER,0);
@@ -1316,6 +1427,9 @@ static void start_active_now(){
     WK.intv_idx=0; WK.intv_in_recov=false; WK.intv_phase_km=0;
     WK.intv_phase_start=millis();
     WK.hiit_phase=0; WK.hiit_phase_start=millis();
+    WK.xc_plan_km_done = 0;
+    g_last_alert_state = 0; g_last_alert_ms = 0;
+    if(WK.xc_plan_active && WK.xc_plan_n > 0) WK.target_pace_sec = WK.xc_plan_sec[0];
     IMU.last_motion_ms = millis();
     open_workout_active();
 }
@@ -1579,34 +1693,238 @@ static void xc_refresh(){
 
 // fwd
 static void open_pace_picker(const char *title, uint32_t accent, const char *start_lbl);
+static void open_xc_menu();
+static void open_xc_dist_picker();
+static void open_xc_preset_picker();
+static void open_xc_builder();
+static void open_xc_saved_list();
+static void open_xc_countdown();
+
+// =====================================================================
+//  v4.1: READY · SET · GO! countdown for every XC start
+// =====================================================================
+static lv_obj_t  *rsg_lbl   = nullptr;
+static lv_obj_t  *rsg_sub   = nullptr;
+static lv_timer_t*rsg_t     = nullptr;
+static int        rsg_step  = 0;   // 0=READY, 1=SET, 2=GO!, 3=launch
+
+static void rsg_tick(lv_timer_t*){
+    rsg_step++;
+    if(rsg_step == 1){
+        if(rsg_lbl){
+            lv_label_set_text(rsg_lbl, "SET");
+            lv_obj_set_style_text_color(rsg_lbl, lv_color_hex(ACCENT_AMBER), 0);
+        }
+        if(rsg_sub) lv_label_set_text(rsg_sub, "on the line");
+    } else if(rsg_step == 2){
+        if(rsg_lbl){
+            lv_label_set_text(rsg_lbl, "GO!");
+            lv_obj_set_style_text_color(rsg_lbl, lv_color_hex(ACCENT_SPORT), 0);
+        }
+        if(rsg_sub) lv_label_set_text(rsg_sub, "hammer the kick");
+    } else {
+        if(rsg_t){ lv_timer_del(rsg_t); rsg_t = nullptr; }
+        rsg_lbl = rsg_sub = nullptr;
+        start_active_now();
+    }
+}
+static void open_xc_countdown(){
+    if(workout_active()){ start_active_now(); return; }
+
+    lv_obj_t *s=lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s,lv_color_hex(COL_BG),0);
+    lv_obj_set_style_bg_opa(s,LV_OPA_COVER,0);
+    lv_obj_clear_flag(s,LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *band = lv_obj_create(s); lv_obj_remove_style_all(band);
+    lv_obj_set_size(band, LCD_W, 14); lv_obj_align(band, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(band, lv_color_hex(ACCENT_DANGER), 0);
+    lv_obj_set_style_bg_opa(band, LV_OPA_COVER, 0);
+
+    mk_label(s, "CROSS COUNTRY", &lv_font_montserrat_18, ACCENT_XC,
+             LV_ALIGN_TOP_MID, 0, 40, 4);
+
+    rsg_lbl = mk_label(s, "READY", &lv_font_montserrat_48, ACCENT_DANGER,
+                       LV_ALIGN_CENTER, 0, -20, 6);
+    rsg_sub = mk_label(s, "settle into stance", &lv_font_montserrat_18, COL_MUTED2,
+                       LV_ALIGN_CENTER, 0, 40, 3);
+
+    if(WK.xc_plan_active && WK.xc_plan_n > 0){
+        char sum[96]; int off = 0;
+        for(int k=0; k<WK.xc_plan_n && k<6; k++){
+            int pu = pace_sec_to_user(WK.xc_plan_sec[k]);
+            off += snprintf(sum+off, 96-off, "%s%d:%02d",
+                            k?" · ":"", pu/60, pu%60);
+        }
+        if(WK.xc_plan_n > 6) snprintf(sum+off, 96-off, "  +%d", WK.xc_plan_n-6);
+        mk_label(s, sum, &lv_font_montserrat_14, ACCENT_XC,
+                 LV_ALIGN_BOTTOM_MID, 0, -60, 1);
+    }
+
+    mk_pill(s, 120, 40, COL_CARD, COL_MUTED2, "SKIP", COL_MUTED2,
+            &lv_font_montserrat_14, LV_ALIGN_BOTTOM_MID, 0, -16,
+            [](lv_event_t*){
+        if(rsg_t){ lv_timer_del(rsg_t); rsg_t = nullptr; }
+        rsg_lbl = rsg_sub = nullptr;
+        start_active_now();
+    });
+
+    rsg_step = 0;
+    if(rsg_t) lv_timer_del(rsg_t);
+    rsg_t = lv_timer_create(rsg_tick, 800, NULL);  // READY → SET → GO! → launch (2.4s total)
+    open_app_screen(s);
+}
+
+// ---------- v4: XC pacing presets (built-in + user-saved) ----------
+struct XcPreset {
+    char  name[28];
+    int   n;
+    int   sec[12];   // sec/km per km
+    bool  builtin;
+};
+
+// built-in presets (the ones we ship)
+static const XcPreset XC_PRESETS_BUILTIN[] = {
+    { "ACC 4K  CONTROLLED/STRONG", 4, {206, 215, 218, 202, 0,0,0,0,0,0,0,0}, true },
+    //                          1km 3:26  2km 3:35  3km 3:38  4km 3:22 hammer
+    { "EVEN 5K  (5:00/km)",        5, {300,300,300,300,300,0,0,0,0,0,0,0}, true },
+    { "NEGATIVE SPLIT 3K",         3, {225,215,200, 0,0,0,0,0,0,0,0,0},    true },
+    { "HILL REPEAT XC (4K)",       4, {210,230,210,230, 0,0,0,0,0,0,0,0},  true }
+};
+static const int XC_PRESETS_BUILTIN_N =
+    (int)(sizeof(XC_PRESETS_BUILTIN)/sizeof(XC_PRESETS_BUILTIN[0]));
+
+#define MAX_USER_PRESETS 8
+static XcPreset g_user_presets[MAX_USER_PRESETS];
+static int      g_user_presets_n = 0;
+
+static void load_user_presets(){
+    nvs.begin("sportos", true);
+    g_user_presets_n = nvs.getInt("upn", 0);
+    if(g_user_presets_n < 0) g_user_presets_n = 0;
+    if(g_user_presets_n > MAX_USER_PRESETS) g_user_presets_n = MAX_USER_PRESETS;
+    for(int i=0;i<g_user_presets_n;i++){
+        char k[12];
+        snprintf(k,12,"upN%d",i);
+        String name = nvs.getString(k,"PRESET");
+        strncpy(g_user_presets[i].name, name.c_str(), 27);
+        g_user_presets[i].name[27] = 0;
+        snprintf(k,12,"upC%d",i);
+        g_user_presets[i].n = nvs.getInt(k, 4);
+        for(int j=0;j<12;j++){
+            snprintf(k,12,"u%d_%d",i,j);
+            g_user_presets[i].sec[j] = nvs.getInt(k, 300);
+        }
+        g_user_presets[i].builtin = false;
+    }
+    nvs.end();
+}
+static void save_user_presets(){
+    nvs.begin("sportos", false);
+    nvs.putInt("upn", g_user_presets_n);
+    for(int i=0;i<g_user_presets_n;i++){
+        char k[12];
+        snprintf(k,12,"upN%d",i); nvs.putString(k, g_user_presets[i].name);
+        snprintf(k,12,"upC%d",i); nvs.putInt(k,   g_user_presets[i].n);
+        for(int j=0;j<12;j++){
+            snprintf(k,12,"u%d_%d",i,j); nvs.putInt(k, g_user_presets[i].sec[j]);
+        }
+    }
+    nvs.end();
+}
+static void apply_preset_to_wk(const XcPreset &p){
+    WK.xc_plan_active = true;
+    WK.xc_plan_n      = p.n;
+    for(int i=0;i<12;i++) WK.xc_plan_sec[i] = p.sec[i];
+    WK.xc_plan_km_done = 0;
+    WK.target_pace_sec = p.sec[0];
+    // race target = N km
+    WK.race_target_km  = (float)p.n;
+}
+
+// ---------- start_xc now opens the XC top menu (4 options) ----------
 static void start_xc(){
     WK.sport = SP_XC; WK.mode = M_CROSS;
-    // open custom distance picker
+    WK.xc_plan_active = false;
+    WK.xc_plan_n      = 0;
+    WK.xc_plan_km_done= 0;
+    open_xc_menu();
+}
+
+static void open_xc_menu(){
     lv_obj_t *s=lv_obj_create(NULL);
     lv_obj_set_style_bg_color(s,lv_color_hex(COL_BG),0);
     lv_obj_set_style_bg_opa(s,LV_OPA_COVER,0);
     lv_obj_clear_flag(s,LV_OBJ_FLAG_SCROLLABLE);
 
     mk_label(s,"CROSS COUNTRY",&lv_font_montserrat_22, ACCENT_XC,
+             LV_ALIGN_TOP_MID,0,26,4);
+    mk_label(s,"choose how to pace",&lv_font_montserrat_12, COL_MUTED,
+             LV_ALIGN_TOP_MID,0,60,1);
+
+    lv_obj_t *list=lv_obj_create(s); lv_obj_remove_style_all(list);
+    lv_obj_set_size(list, LCD_W-50, LCD_H-160);
+    lv_obj_align(list,LV_ALIGN_CENTER,0,30);
+    lv_obj_set_flex_flow(list,LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(list,12,0);
+    lv_obj_set_style_pad_all(list,8,0);
+    lv_obj_set_scrollbar_mode(list,LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_scroll_dir(list,LV_DIR_VER);
+
+    mk_card(list, ACCENT_RACE,  "P", "RACE PRESET",
+            "ACC 4K · Even 5K · neg split · hill rep",
+            [](lv_event_t*){ if(millis()-lastSwipeMs<CLICK_AFTER_SWIPE_MS)return; open_xc_preset_picker(); });
+    mk_card(list, ACCENT_AMBER, "B", "BUILD CUSTOM",
+            "pick km · set sec/km · save as preset",
+            [](lv_event_t*){ if(millis()-lastSwipeMs<CLICK_AFTER_SWIPE_MS)return; open_xc_builder(); });
+    mk_card(list, ACCENT_CYAN,  "S", "MY SAVED PLANS",
+            "your custom XC presets",
+            [](lv_event_t*){ if(millis()-lastSwipeMs<CLICK_AFTER_SWIPE_MS)return; open_xc_saved_list(); });
+    mk_card(list, ACCENT_XC,    "F", "FREE XC",
+            "just distance · hills · bumpiness",
+            [](lv_event_t*){ if(millis()-lastSwipeMs<CLICK_AFTER_SWIPE_MS)return; open_xc_dist_picker(); });
+
+    open_app_screen(s);
+}
+
+// ----- the old XC distance picker (now reachable via "FREE XC") -----
+static lv_obj_t *xc_dist_lbl_v2 = nullptr;
+static void xc_refresh_v2(){
+    char b[32];
+    if(XC_DIST_KM[xc_dist_idx] > 0)
+        snprintf(b,32,"%s  (%.1f %s)",
+                 XC_DIST_NAME[xc_dist_idx],
+                 to_user_dist(XC_DIST_KM[xc_dist_idx]), unit_dist());
+    else
+        snprintf(b,32,"%s  (no target)", XC_DIST_NAME[xc_dist_idx]);
+    if(xc_dist_lbl_v2) lv_label_set_text(xc_dist_lbl_v2,b);
+}
+static void open_xc_dist_picker(){
+    lv_obj_t *s=lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s,lv_color_hex(COL_BG),0);
+    lv_obj_set_style_bg_opa(s,LV_OPA_COVER,0);
+    lv_obj_clear_flag(s,LV_OBJ_FLAG_SCROLLABLE);
+
+    mk_label(s,"FREE XC",&lv_font_montserrat_22, ACCENT_XC,
              LV_ALIGN_TOP_MID,0,32,4);
     mk_label(s,"choose race distance",&lv_font_montserrat_12, COL_MUTED,
              LV_ALIGN_TOP_MID,0,66,2);
 
-    xc_dist_lbl = mk_label(s,"",&lv_font_montserrat_28, 0xFFFFFF,
-                           LV_ALIGN_TOP_MID,0,120);
-    xc_refresh();
+    xc_dist_lbl_v2 = mk_label(s,"",&lv_font_montserrat_28, 0xFFFFFF,
+                              LV_ALIGN_TOP_MID,0,120);
+    xc_refresh_v2();
 
     mk_pill(s,90,90,COL_CARD,ACCENT_XC,"<",ACCENT_XC,
             &lv_font_montserrat_28, LV_ALIGN_CENTER,-110,0,
             [](lv_event_t*){
         xc_dist_idx = (xc_dist_idx + XC_DIST_N - 1) % XC_DIST_N;
-        xc_refresh();
+        xc_refresh_v2();
     });
     mk_pill(s,90,90,COL_CARD,ACCENT_XC,">",ACCENT_XC,
             &lv_font_montserrat_28, LV_ALIGN_CENTER,110,0,
             [](lv_event_t*){
         xc_dist_idx = (xc_dist_idx + 1) % XC_DIST_N;
-        xc_refresh();
+        xc_refresh_v2();
     });
 
     mk_label(s, "hills · bumpiness · shake to lap",
@@ -1616,12 +1934,302 @@ static void start_xc(){
     mk_solid_btn(s, 240, 54, ACCENT_XC, "START XC", COL_BG,
                  LV_ALIGN_BOTTOM_MID, 0, -22,
                  [](lv_event_t*){
-        // commit XC distance choice and jump straight in
-        WK.race_target_km  = XC_DIST_KM[xc_dist_idx];     // 0 means free
+        WK.race_target_km  = XC_DIST_KM[xc_dist_idx];
         WK.target_pace_sec = 420;
-        start_active_now();
+        WK.xc_plan_active  = false;
+        open_xc_countdown();
     });
     open_app_screen(s);
+}
+
+// ----- preset picker -----
+static void start_with_preset(const XcPreset &p){
+    apply_preset_to_wk(p);
+    open_xc_countdown();
+}
+static void open_xc_preset_picker(){
+    lv_obj_t *s=lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s,lv_color_hex(COL_BG),0);
+    lv_obj_set_style_bg_opa(s,LV_OPA_COVER,0);
+    lv_obj_clear_flag(s,LV_OBJ_FLAG_SCROLLABLE);
+
+    mk_label(s,"RACE PRESETS",&lv_font_montserrat_22, ACCENT_RACE,
+             LV_ALIGN_TOP_MID,0,26,4);
+    mk_label(s,"tap to load · then START XC",&lv_font_montserrat_12, COL_MUTED,
+             LV_ALIGN_TOP_MID,0,60,1);
+
+    lv_obj_t *list=lv_obj_create(s); lv_obj_remove_style_all(list);
+    lv_obj_set_size(list, LCD_W-40, LCD_H-160);
+    lv_obj_align(list,LV_ALIGN_CENTER,0,30);
+    lv_obj_set_flex_flow(list,LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(list,10,0);
+    lv_obj_set_style_pad_all(list,6,0);
+    lv_obj_set_scrollbar_mode(list,LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_scroll_dir(list,LV_DIR_VER);
+
+    for(int i=0;i<XC_PRESETS_BUILTIN_N;i++){
+        const XcPreset &p = XC_PRESETS_BUILTIN[i];
+        // build a one-line summary "4 km  3:26 / 3:35 / 3:38 / 3:22"
+        char sum[60]; int off = 0;
+        for(int k=0;k<p.n && k<4;k++){
+            int pu = pace_sec_to_user(p.sec[k]);
+            off += snprintf(sum+off, 60-off, "%s%d:%02d", k?" · ":"", pu/60, pu%60);
+        }
+        if(p.n>4) snprintf(sum+off,60-off,"  +%d", p.n-4);
+
+        lv_obj_t *card = lv_obj_create(list);
+        lv_obj_remove_style_all(card);
+        lv_obj_set_size(card, LCD_W-50, 70);
+        lv_obj_set_style_bg_color(card, lv_color_hex(COL_CARD), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(card, 14, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(ACCENT_RACE), 0);
+        lv_obj_set_style_border_width(card, 2, 0);
+        lv_obj_set_style_border_opa(card, 120, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+        mk_label(card, p.name, &lv_font_montserrat_14, 0xFFFFFF,
+                 LV_ALIGN_TOP_LEFT, 16, 10, 1);
+        mk_label(card, sum,    &lv_font_montserrat_14, ACCENT_AMBER,
+                 LV_ALIGN_BOTTOM_LEFT, 16, -10, 1);
+
+        // capture i via user_data
+        lv_obj_set_user_data(card, (void*)(intptr_t)i);
+        lv_obj_add_event_cb(card, [](lv_event_t *e){
+            if(millis()-lastSwipeMs<CLICK_AFTER_SWIPE_MS) return;
+            int idx = (int)(intptr_t)lv_obj_get_user_data(
+                (lv_obj_t*)lv_event_get_target(e));
+            start_with_preset(XC_PRESETS_BUILTIN[idx]);
+        }, LV_EVENT_CLICKED, NULL);
+    }
+
+    mk_pill(s, 200, 46, COL_CARD, ACCENT_CYAN, LV_SYMBOL_LEFT "  XC MENU",
+            ACCENT_CYAN, &lv_font_montserrat_14,
+            LV_ALIGN_BOTTOM_MID, 0, -16,
+            [](lv_event_t*){ open_xc_menu(); });
+    open_app_screen(s);
+}
+
+// ----- saved (user) presets list with delete -----
+static void open_xc_saved_list(){
+    lv_obj_t *s=lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s,lv_color_hex(COL_BG),0);
+    lv_obj_set_style_bg_opa(s,LV_OPA_COVER,0);
+    lv_obj_clear_flag(s,LV_OBJ_FLAG_SCROLLABLE);
+
+    mk_label(s,"MY SAVED PLANS",&lv_font_montserrat_22, ACCENT_CYAN,
+             LV_ALIGN_TOP_MID,0,26,4);
+    char hdr[32]; snprintf(hdr,32,"%d / %d slots used",
+                           g_user_presets_n, MAX_USER_PRESETS);
+    mk_label(s,hdr,&lv_font_montserrat_12, COL_MUTED, LV_ALIGN_TOP_MID,0,60,1);
+
+    if(g_user_presets_n == 0){
+        mk_label(s,"no saved plans yet — build one!",
+                 &lv_font_montserrat_14, COL_MUTED2, LV_ALIGN_CENTER, 0, 0, 1);
+    } else {
+        lv_obj_t *list=lv_obj_create(s); lv_obj_remove_style_all(list);
+        lv_obj_set_size(list, LCD_W-40, LCD_H-180);
+        lv_obj_align(list,LV_ALIGN_CENTER,0,30);
+        lv_obj_set_flex_flow(list,LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_style_pad_row(list,10,0);
+        lv_obj_set_style_pad_all(list,6,0);
+        lv_obj_set_scrollbar_mode(list,LV_SCROLLBAR_MODE_OFF);
+        lv_obj_set_scroll_dir(list,LV_DIR_VER);
+
+        for(int i=0;i<g_user_presets_n;i++){
+            const XcPreset &p = g_user_presets[i];
+            char sum[60]; int off=0;
+            for(int k=0;k<p.n && k<4;k++){
+                int pu = pace_sec_to_user(p.sec[k]);
+                off += snprintf(sum+off, 60-off, "%s%d:%02d", k?" · ":"", pu/60, pu%60);
+            }
+            if(p.n>4) snprintf(sum+off,60-off,"  +%d", p.n-4);
+
+            lv_obj_t *card = lv_obj_create(list);
+            lv_obj_remove_style_all(card);
+            lv_obj_set_size(card, LCD_W-50, 76);
+            lv_obj_set_style_bg_color(card, lv_color_hex(COL_CARD), 0);
+            lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+            lv_obj_set_style_radius(card, 14, 0);
+            lv_obj_set_style_border_color(card, lv_color_hex(ACCENT_CYAN), 0);
+            lv_obj_set_style_border_width(card, 2, 0);
+            lv_obj_set_style_border_opa(card, 120, 0);
+            lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+            mk_label(card, p.name, &lv_font_montserrat_14, 0xFFFFFF,
+                     LV_ALIGN_TOP_LEFT, 14, 8, 1);
+            mk_label(card, sum,    &lv_font_montserrat_14, ACCENT_AMBER,
+                     LV_ALIGN_BOTTOM_LEFT, 14, -8, 1);
+
+            lv_obj_set_user_data(card, (void*)(intptr_t)i);
+            lv_obj_add_event_cb(card, [](lv_event_t *e){
+                if(millis()-lastSwipeMs<CLICK_AFTER_SWIPE_MS) return;
+                int idx = (int)(intptr_t)lv_obj_get_user_data(
+                    (lv_obj_t*)lv_event_get_target(e));
+                start_with_preset(g_user_presets[idx]);
+            }, LV_EVENT_CLICKED, NULL);
+
+            // long-press → delete
+            lv_obj_add_event_cb(card, [](lv_event_t *e){
+                int idx = (int)(intptr_t)lv_obj_get_user_data(
+                    (lv_obj_t*)lv_event_get_target(e));
+                if(idx<0 || idx>=g_user_presets_n) return;
+                for(int k=idx;k<g_user_presets_n-1;k++)
+                    g_user_presets[k] = g_user_presets[k+1];
+                g_user_presets_n--;
+                save_user_presets();
+                open_xc_saved_list();
+            }, LV_EVENT_LONG_PRESSED, NULL);
+        }
+    }
+
+    mk_label(s,"tap = start  ·  long-press = delete",
+             &lv_font_montserrat_12, COL_MUTED, LV_ALIGN_BOTTOM_MID, 0, -70, 1);
+    mk_pill(s, 200, 46, COL_CARD, ACCENT_CYAN, LV_SYMBOL_LEFT "  XC MENU",
+            ACCENT_CYAN, &lv_font_montserrat_14,
+            LV_ALIGN_BOTTOM_MID, 0, -16,
+            [](lv_event_t*){ open_xc_menu(); });
+    open_app_screen(s);
+}
+
+// ----- custom builder: pick km count, then set sec/km per km -----
+static int  bld_n      = 4;
+static int  bld_idx    = 0;
+static int  bld_sec[12]= {210,215,215,210,300,300,300,300,300,300,300,300};
+static lv_obj_t *bld_lbl_n = nullptr;
+static lv_obj_t *bld_lbl_km = nullptr;
+static lv_obj_t *bld_lbl_pace = nullptr;
+static lv_obj_t *bld_lbl_summary = nullptr;
+
+static void bld_refresh(){
+    char b[28];
+    snprintf(b,28,"%d KM", bld_n);
+    if(bld_lbl_n) lv_label_set_text(bld_lbl_n, b);
+    if(bld_lbl_km){
+        snprintf(b,28,"KM %d / %d", bld_idx+1, bld_n);
+        lv_label_set_text(bld_lbl_km, b);
+    }
+    if(bld_lbl_pace){
+        int pu = pace_sec_to_user(bld_sec[bld_idx]);
+        snprintf(b,28,"%d:%02d %s", pu/60, pu%60, unit_pace());
+        lv_label_set_text(bld_lbl_pace, b);
+    }
+    if(bld_lbl_summary){
+        char sum[120]; int off=0;
+        for(int k=0;k<bld_n && k<6;k++){
+            int pu = pace_sec_to_user(bld_sec[k]);
+            off += snprintf(sum+off, 120-off, "%s%d:%02d",
+                            k?" · ":"", pu/60, pu%60);
+        }
+        if(bld_n>6) snprintf(sum+off, 120-off, "  +%d", bld_n-6);
+        lv_label_set_text(bld_lbl_summary, sum);
+    }
+}
+static void open_xc_builder_save_screen();
+
+static void open_xc_builder(){
+    bld_idx = 0;
+    if(bld_n < 1) bld_n = 1; if(bld_n > 12) bld_n = 12;
+    lv_obj_t *s=lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s,lv_color_hex(COL_BG),0);
+    lv_obj_set_style_bg_opa(s,LV_OPA_COVER,0);
+    lv_obj_clear_flag(s,LV_OBJ_FLAG_SCROLLABLE);
+
+    mk_label(s,"BUILD CUSTOM",&lv_font_montserrat_22, ACCENT_AMBER,
+             LV_ALIGN_TOP_MID,0,22,4);
+
+    // distance picker row (KM count)
+    mk_label(s,"DISTANCE",&lv_font_montserrat_12, COL_MUTED,
+             LV_ALIGN_TOP_MID,0,56,2);
+    bld_lbl_n = mk_label(s,"4 KM",&lv_font_montserrat_28, 0xFFFFFF,
+                         LV_ALIGN_TOP_MID,0,76);
+    mk_pill(s,60,40,COL_CARD,ACCENT_AMBER,"-",ACCENT_AMBER,
+            &lv_font_montserrat_22, LV_ALIGN_TOP_MID,-110,80,
+            [](lv_event_t*){ bld_n = max(1, bld_n-1); if(bld_idx>=bld_n) bld_idx=bld_n-1; bld_refresh(); });
+    mk_pill(s,60,40,COL_CARD,ACCENT_AMBER,"+",ACCENT_AMBER,
+            &lv_font_montserrat_22, LV_ALIGN_TOP_MID,110,80,
+            [](lv_event_t*){ bld_n = min(12,bld_n+1); bld_refresh(); });
+
+    // per-km section
+    bld_lbl_km = mk_label(s,"KM 1 / 4",&lv_font_montserrat_18, ACCENT_XC,
+                          LV_ALIGN_TOP_MID,0,132,2);
+    bld_lbl_pace = mk_label(s,"3:30 / km",&lv_font_montserrat_28, 0xFFFFFF,
+                            LV_ALIGN_TOP_MID,0,162);
+    mk_pill(s,60,46,COL_CARD,ACCENT_XC,"-5",ACCENT_XC,
+            &lv_font_montserrat_18, LV_ALIGN_TOP_MID,-130,170,
+            [](lv_event_t*){ bld_sec[bld_idx] = max(150, bld_sec[bld_idx]-5); bld_refresh(); });
+    mk_pill(s,60,46,COL_CARD,ACCENT_XC,"+5",ACCENT_XC,
+            &lv_font_montserrat_18, LV_ALIGN_TOP_MID,130,170,
+            [](lv_event_t*){ bld_sec[bld_idx] = min(900, bld_sec[bld_idx]+5); bld_refresh(); });
+
+    mk_pill(s,90,40,COL_CARD,ACCENT_CYAN,"< PREV",ACCENT_CYAN,
+            &lv_font_montserrat_12, LV_ALIGN_TOP_MID,-90,228,
+            [](lv_event_t*){ if(bld_idx>0) bld_idx--; bld_refresh(); });
+    mk_pill(s,90,40,COL_CARD,ACCENT_CYAN,"NEXT >",ACCENT_CYAN,
+            &lv_font_montserrat_12, LV_ALIGN_TOP_MID, 90,228,
+            [](lv_event_t*){ if(bld_idx<bld_n-1) bld_idx++; bld_refresh(); });
+
+    bld_lbl_summary = mk_label(s,"",&lv_font_montserrat_14, ACCENT_AMBER,
+                               LV_ALIGN_TOP_MID,0,278,1);
+
+    bld_refresh();
+
+    mk_pill(s, 130, 46, COL_CARD, ACCENT_RACE, "SAVE", ACCENT_RACE,
+            &lv_font_montserrat_14, LV_ALIGN_BOTTOM_MID, -85, -22,
+            [](lv_event_t*){ open_xc_builder_save_screen(); });
+    mk_solid_btn(s, 180, 46, ACCENT_XC, "START XC", COL_BG,
+                 LV_ALIGN_BOTTOM_MID, 60, -22,
+                 [](lv_event_t*){
+        WK.xc_plan_active = true;
+        WK.xc_plan_n      = bld_n;
+        for(int i=0;i<12;i++) WK.xc_plan_sec[i] = bld_sec[i];
+        WK.xc_plan_km_done = 0;
+        WK.race_target_km  = (float)bld_n;
+        WK.target_pace_sec = bld_sec[0];
+        open_xc_countdown();
+    });
+    open_app_screen(s);
+}
+
+// quick save: auto-name like "MY PLAN 4K (1)"
+static void open_xc_builder_save_screen(){
+    if(g_user_presets_n >= MAX_USER_PRESETS){
+        // overwrite last slot
+        g_user_presets_n = MAX_USER_PRESETS;
+    }
+    int slot = (g_user_presets_n < MAX_USER_PRESETS) ? g_user_presets_n
+                                                     : MAX_USER_PRESETS - 1;
+    XcPreset &p = g_user_presets[slot];
+    snprintf(p.name, 28, "MY PLAN %dK #%d", bld_n, slot+1);
+    p.n = bld_n;
+    for(int i=0;i<12;i++) p.sec[i] = bld_sec[i];
+    p.builtin = false;
+    if(slot == g_user_presets_n) g_user_presets_n++;
+    save_user_presets();
+
+    // toast screen
+    lv_obj_t *s=lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s,lv_color_hex(COL_BG),0);
+    lv_obj_set_style_bg_opa(s,LV_OPA_COVER,0);
+    lv_obj_clear_flag(s,LV_OBJ_FLAG_SCROLLABLE);
+
+    mk_label(s,"SAVED",&lv_font_montserrat_28, ACCENT_SPORT,
+             LV_ALIGN_CENTER,0,-30,3);
+    mk_label(s,p.name,&lv_font_montserrat_18, 0xFFFFFF,
+             LV_ALIGN_CENTER,0,10,2);
+    mk_label(s,"open MY SAVED PLANS to rename later",
+             &lv_font_montserrat_12, COL_MUTED, LV_ALIGN_CENTER,0,50,1);
+
+    mk_pill(s, 200, 46, COL_CARD, ACCENT_CYAN, "BACK", ACCENT_CYAN,
+            &lv_font_montserrat_14, LV_ALIGN_BOTTOM_MID, 0, -22,
+            [](lv_event_t*){ open_xc_builder(); });
+    open_app_screen(s);
+}
+
+static void start_xc_orig_unused(){
+    (void)0;  // v4: superseded by start_xc() → open_xc_menu(); kept as no-op stub
 }
 
 // =====================================================================
@@ -1765,14 +2373,26 @@ static void open_stats(){
 //  Settings screen
 // =====================================================================
 static lv_obj_t *set_unit_lbl=nullptr,*set_wt_lbl=nullptr,*set_goal_lbl=nullptr,*set_lap_lbl=nullptr;
+static lv_obj_t *set_strxc_lbl=nullptr,*set_xcband_lbl=nullptr,*set_xcao_lbl=nullptr;
 static void set_refresh(){
-    char b[24];
+    char b[28];
     lv_label_set_text(set_unit_lbl, S.use_miles ? "MILES" : "KILOMETRES");
-    snprintf(b,24,"%d kg", S.weight_kg);              lv_label_set_text(set_wt_lbl,  b);
-    snprintf(b,24,"%d %s/wk",
+    snprintf(b,28,"%d kg", S.weight_kg);              lv_label_set_text(set_wt_lbl,  b);
+    snprintf(b,28,"%d %s/wk",
              (int)to_user_dist(S.weekly_goal_km), unit_dist());
     lv_label_set_text(set_goal_lbl,b);
-    snprintf(b,24,"%d m", S.auto_lap_m);              lv_label_set_text(set_lap_lbl, b);
+    snprintf(b,28,"%d m", S.auto_lap_m);              lv_label_set_text(set_lap_lbl, b);
+    if(set_strxc_lbl){
+        snprintf(b,28,"x %.2f", S.stride_cal_xc);
+        lv_label_set_text(set_strxc_lbl, b);
+    }
+    if(set_xcband_lbl){
+        snprintf(b,28,"+/- %d s", S.xc_alert_band);
+        lv_label_set_text(set_xcband_lbl, b);
+    }
+    if(set_xcao_lbl){
+        lv_label_set_text(set_xcao_lbl, S.xc_alerts_on ? "ON" : "OFF");
+    }
 }
 static void open_settings(){
     lv_obj_t *s=lv_obj_create(NULL);
@@ -1781,37 +2401,59 @@ static void open_settings(){
     lv_obj_clear_flag(s,LV_OBJ_FLAG_SCROLLABLE);
 
     mk_label(s,"SETTINGS",&lv_font_montserrat_22, ACCENT_CYAN,
-             LV_ALIGN_TOP_MID,0,30,4);
+             LV_ALIGN_TOP_MID,0,16,4);
+
+    // v4: scrollable container so we can add new rows without crowding
+    lv_obj_t *cont = lv_obj_create(s);
+    lv_obj_remove_style_all(cont);
+    lv_obj_set_size(cont, LCD_W-20, LCD_H-130);
+    lv_obj_align(cont, LV_ALIGN_TOP_MID, 0, 50);
+    lv_obj_set_scroll_dir(cont, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(cont, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(cont, LV_OBJ_FLAG_SCROLL_ELASTIC);
 
     auto row = [&](int y, const char *name, uint32_t accent,
                    lv_event_cb_t cb_minus, lv_event_cb_t cb_plus,
                    lv_obj_t **lbl_out){
-        mk_label(s,name,&lv_font_montserrat_14, COL_MUTED,
+        mk_label(cont,name,&lv_font_montserrat_14, COL_MUTED,
                  LV_ALIGN_TOP_LEFT,30,y,2);
-        *lbl_out = mk_label(s,"-",&lv_font_montserrat_18, 0xFFFFFF,
+        *lbl_out = mk_label(cont,"-",&lv_font_montserrat_18, 0xFFFFFF,
                             LV_ALIGN_TOP_MID,0,y);
-        mk_pill(s,52,38,COL_CARD,accent,"-",accent,
+        mk_pill(cont,52,38,COL_CARD,accent,"-",accent,
                 &lv_font_montserrat_18, LV_ALIGN_TOP_RIGHT,-90,y-8, cb_minus);
-        mk_pill(s,52,38,COL_CARD,accent,"+",accent,
+        mk_pill(cont,52,38,COL_CARD,accent,"+",accent,
                 &lv_font_montserrat_18, LV_ALIGN_TOP_RIGHT,-30,y-8, cb_plus);
     };
 
-    row(82,  "UNITS",     ACCENT_CYAN,
+    row(20,  "UNITS",     ACCENT_CYAN,
         [](lv_event_t*){ S.use_miles=!S.use_miles; save_settings(); set_refresh(); },
         [](lv_event_t*){ S.use_miles=!S.use_miles; save_settings(); set_refresh(); },
         &set_unit_lbl);
-    row(140, "WEIGHT",    ACCENT_SPORT,
+    row(78, "WEIGHT",    ACCENT_SPORT,
         [](lv_event_t*){ S.weight_kg=max(30, S.weight_kg-1); save_settings(); set_refresh(); },
         [](lv_event_t*){ S.weight_kg=min(200,S.weight_kg+1); save_settings(); set_refresh(); },
         &set_wt_lbl);
-    row(198, "WEEKLY GOAL", ACCENT_TRAIN,
+    row(136, "WEEKLY GOAL", ACCENT_TRAIN,
         [](lv_event_t*){ S.weekly_goal_km=max(1, S.weekly_goal_km-1); save_settings(); set_refresh(); },
         [](lv_event_t*){ S.weekly_goal_km=min(500,S.weekly_goal_km+1); save_settings(); set_refresh(); },
         &set_goal_lbl);
-    row(256, "AUTO LAP",  ACCENT_AMBER,
+    row(194, "AUTO LAP",  ACCENT_AMBER,
         [](lv_event_t*){ S.auto_lap_m=max(0,   S.auto_lap_m-100); save_settings(); set_refresh(); },
         [](lv_event_t*){ S.auto_lap_m=min(5000,S.auto_lap_m+100); save_settings(); set_refresh(); },
         &set_lap_lbl);
+    // v4: XC-specific rows
+    row(252, "XC STRIDE CAL", ACCENT_XC,
+        [](lv_event_t*){ S.stride_cal_xc = max(0.60f, S.stride_cal_xc - 0.05f); save_settings(); set_refresh(); },
+        [](lv_event_t*){ S.stride_cal_xc = min(2.50f, S.stride_cal_xc + 0.05f); save_settings(); set_refresh(); },
+        &set_strxc_lbl);
+    row(310, "XC ALERT BAND", ACCENT_XC,
+        [](lv_event_t*){ S.xc_alert_band = max(2,  S.xc_alert_band - 1); save_settings(); set_refresh(); },
+        [](lv_event_t*){ S.xc_alert_band = min(30, S.xc_alert_band + 1); save_settings(); set_refresh(); },
+        &set_xcband_lbl);
+    row(368, "XC ALERTS", ACCENT_XC,
+        [](lv_event_t*){ S.xc_alerts_on = !S.xc_alerts_on; save_settings(); set_refresh(); },
+        [](lv_event_t*){ S.xc_alerts_on = !S.xc_alerts_on; save_settings(); set_refresh(); },
+        &set_xcao_lbl);
     set_refresh();
 
     mk_pill(s, 220, 50, COL_CARD, ACCENT_CYAN, LV_SYMBOL_LEFT "  HOME",
@@ -1855,7 +2497,7 @@ static void build_screen_apps(){
             "target distance + virtual partner",
             [](lv_event_t*){ if(millis()-lastSwipeMs<CLICK_AFTER_SWIPE_MS)return; open_race_day(); });
     mk_card(list, ACCENT_XC,    "X", "CROSS COUNTRY",
-            "3/4/5/6/8/10 km · hills · bumpiness",
+            "presets · custom builder · ±s alerts",
             [](lv_event_t*){ if(millis()-lastSwipeMs<CLICK_AFTER_SWIPE_MS)return; start_xc(); });
     mk_card(list, ACCENT_TRAIN, "T", "TRAINING",
             "easy / tempo / long / intervals / fartlek",
@@ -1886,48 +2528,27 @@ static void build_screen_face(){
     lv_obj_clear_flag(s,LV_OBJ_FLAG_SCROLLABLE);
     make_wallpaper_bg(s);
 
-    // Weekly goal ring
-    wf_arc = lv_arc_create(s);
-    lv_obj_set_size(wf_arc, 360, 360);
-    lv_obj_align(wf_arc, LV_ALIGN_CENTER, 0, 0);
-    lv_arc_set_rotation(wf_arc, 135);
-    lv_arc_set_bg_angles(wf_arc, 0, 270);
-    lv_arc_set_range(wf_arc, 0, 100);
-    lv_arc_set_value(wf_arc, 0);
-    lv_obj_remove_style(wf_arc, NULL, LV_PART_KNOB);
-    lv_obj_clear_flag(wf_arc, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_arc_color(wf_arc, lv_color_hex(0x101010), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(wf_arc, 5, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(wf_arc, lv_color_hex(ACCENT_SPORT), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(wf_arc, 5, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_opa(wf_arc, 200, LV_PART_INDICATOR);
+    // v4: rings removed — clean type-only watch face with big goal/steps
+    wf_arc      = nullptr;
+    wf_step_arc = nullptr;
 
     wf_clk = mk_label(s, "--:--",   &lv_font_montserrat_48, 0xFFFFFF,
-                      LV_ALIGN_CENTER, 0, -30);
+                      LV_ALIGN_CENTER, 0, -90);
     lv_obj_set_style_text_opa(wf_clk, 240, 0);
     wf_dt  = mk_label(s, "no sync", &lv_font_montserrat_18, COL_MUTED3,
-                      LV_ALIGN_CENTER, 0, 20);
-    wf_goal= mk_label(s, "0 / 0 km",&lv_font_montserrat_14, ACCENT_SPORT,
-                      LV_ALIGN_CENTER, 0, 60, 2);
+                      LV_ALIGN_CENTER, 0, -40);
 
-    // v3: inner daily-step ring + label
-    wf_step_arc = lv_arc_create(s);
-    lv_obj_set_size(wf_step_arc, 290, 290);
-    lv_obj_align(wf_step_arc, LV_ALIGN_CENTER, 0, 0);
-    lv_arc_set_rotation(wf_step_arc, 135);
-    lv_arc_set_bg_angles(wf_step_arc, 0, 270);
-    lv_arc_set_range(wf_step_arc, 0, 100);
-    lv_arc_set_value(wf_step_arc, 0);
-    lv_obj_remove_style(wf_step_arc, NULL, LV_PART_KNOB);
-    lv_obj_clear_flag(wf_step_arc, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_arc_color(wf_step_arc, lv_color_hex(0x0A0A0A), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(wf_step_arc, 3, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(wf_step_arc, lv_color_hex(ACCENT_CYAN), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(wf_step_arc, 3, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_opa(wf_step_arc, 200, LV_PART_INDICATOR);
+    // BIG weekly km goal (was tiny under the ring)
+    wf_goal = mk_label(s, "0 / 0 km", &lv_font_montserrat_28, ACCENT_SPORT,
+                       LV_ALIGN_CENTER, 0, 25, 3);
+    mk_label(s, "WEEKLY GOAL", &lv_font_montserrat_12, COL_MUTED2,
+             LV_ALIGN_CENTER, 0, 60, 3);
 
-    wf_step_lbl = mk_label(s, "0 / 0 steps", &lv_font_montserrat_12,
-                           ACCENT_CYAN, LV_ALIGN_CENTER, 0, 85, 2);
+    // BIG daily steps (was tiny under the inner ring)
+    wf_step_lbl = mk_label(s, "0 / 0 steps", &lv_font_montserrat_28, ACCENT_CYAN,
+                           LV_ALIGN_CENTER, 0, 105, 3);
+    mk_label(s, "TODAY", &lv_font_montserrat_12, COL_MUTED2,
+             LV_ALIGN_CENTER, 0, 140, 3);
 
     mk_label(s, "swipe " LV_SYMBOL_RIGHT " for apps",
              &lv_font_montserrat_12, COL_MUTED, LV_ALIGN_BOTTOM_MID, 0, -40, 2);
@@ -2150,6 +2771,7 @@ void setup(){
     splash_show();
     load_player();
     load_settings();
+    load_user_presets();
     build_screen_face();
     build_screen_apps();
     build_screen_battery();
