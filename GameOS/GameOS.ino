@@ -102,6 +102,15 @@ void Arduino_IIC_Touch_Interrupt(void);
 std::unique_ptr<Arduino_IIC> FT3168(new Arduino_FT3x68(g_iic,FT3168_DEVICE_ADDRESS,DRIVEBUS_DEFAULT_VALUE,TP_INT,Arduino_IIC_Touch_Interrupt));
 void Arduino_IIC_Touch_Interrupt(void){FT3168->IIC_Interrupt_Flag=true;}
 XPowersPMU g_pmu; bool g_has_pmu=false;
+// CRASH FIX: track whether the FT3168 touch IC actually ACKed on I2C.
+// If it didn't, reading from FT3168->IIC_Read_Device_Value() dereferences
+// a half-initialised driver field and faults with LoadProhibited @
+// EXCVADDR 0x22 (the boot-loop crash we were chasing).
+static bool g_has_touch=false;
+static bool i2c_ping(uint8_t addr){
+    Wire.beginTransmission(addr);
+    return (Wire.endTransmission() == 0);
+}
 
 // ---- LVGL plumbing ---------------------------------------------------
 static lv_disp_draw_buf_t g_db; static lv_color_t *g_lvbuf=nullptr;
@@ -648,11 +657,24 @@ static void hw_boot(){
         delay(40);   // rail settle before we pulse TP_RESET
     }
 
-    // (4) NOW reset and start the touch controller.
-    pinMode(TP_RESET, OUTPUT);
-    digitalWrite(TP_RESET, LOW);  delay(50);
-    digitalWrite(TP_RESET, HIGH); delay(200);
-    FT3168->begin();
+    // (4) Ping the touch controller before talking to it. If it NACKs
+    //     (loose flex, dead rail, wrong board variant), DO NOT call
+    //     ->begin() or any IIC_Read_Device_Value() — those crash with
+    //     LoadProhibited inside the driver. Set g_has_touch=false and
+    //     run "headless touch" (BOOT button still exits to launcher).
+    bool ack = i2c_ping(FT3168_DEVICE_ADDRESS);
+    if(!ack){ delay(120); ack = i2c_ping(FT3168_DEVICE_ADDRESS); }
+    if(ack){
+        // (4b) NOW reset and start the touch controller.
+        pinMode(TP_RESET, OUTPUT);
+        digitalWrite(TP_RESET, LOW);  delay(50);
+        digitalWrite(TP_RESET, HIGH); delay(200);
+        FT3168->begin();
+        g_has_touch = true;
+    } else {
+        g_has_touch = false;
+        Serial.println("[GameOS] FT3168 NACK -- skipping touch driver init.");
+    }
 
     // (5) LVGL last - safe to poll touch from here on.
     lv_init();
@@ -1037,6 +1059,8 @@ static void build_screen_battery(){
 
 // ---- Screen lifecycle ------------------------------------------------
 static void lv_touch_gesture(lv_indev_drv_t *, lv_indev_data_t *d){
+    // CRASH FIX: never touch the FT3168 driver if it failed to ACK at boot.
+    if(!g_has_touch){ d->state = LV_INDEV_STATE_REL; return; }
     int32_t x = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
     int32_t y = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_Y);
     int     f = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);

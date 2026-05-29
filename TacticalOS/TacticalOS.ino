@@ -1,21 +1,40 @@
 // =============================================================================
-// TacticalOS.ino v2.2 -- LauncherOS-compatible operator / adventure OS
+// TacticalOS.ino v2.4 -- LauncherOS-compatible operator / adventure OS
 // Target  : Waveshare ESP32-S3 Touch AMOLED 2.06 (410 x 502, CO5300, FT3168)
 // Compile : ESP32-S3 Dev Module / PSRAM=OPI / Flash=16MB / Minimal SPIFFS
-// PIN     : default 6030  (4-digit lock at boot, NVS-stored, toggleable
-//           from the Settings card in the TOOLS tab)
 // -----------------------------------------------------------------------------
+// v2.4 CHANGES (user requested):
+//   * TOOLS tab SPLIT into TWO SUB-CARDS, mirroring the S3 MiniOS pattern
+//     (left/right swipe = switch category, up/down swipe = switch sub-card
+//     within the current category).
+//       Page 1 - "SURVIVAL // TOOLS"  : Flash, Beacon, Mission Timer,
+//                                       Countdown, Morse Keyer.
+//       Page 2 - "SETTINGS // PREFS"  : Night/Stealth toggles, Pace pill,
+//                                       Theme cycle, Stride Cal, Watch Face.
+//     Swipe UP   -> reveal Settings (page 2).
+//     Swipe DOWN -> back to Tools  (page 1).
+//     Transition is an INSTANT SNAP -- no animation, no lag.  Children of
+//     both sub-pages get LV_OBJ_FLAG_EVENT_BUBBLE so the gesture reaches
+//     the page container no matter which control was pressed first.
+//     Horizontal swipes still bubble to the tabview (we only consume
+//     LV_DIR_TOP / LV_DIR_BOTTOM).
+// v2.3 CHANGES (user requested):
+//   * PIN LOCK fully REMOVED.  No boot keypad, no overlay, no Settings toggle.
+//     Watch boots straight into the home tab -- same first-touch feel as
+//     LauncherOS.  Old `tac-pin` NVS namespace is left untouched on disk.
+//   * WATCH FACE is no longer cycled by tapping the home centre.  The face
+//     can ONLY be changed from the new "WATCH FACE" card in the TOOLS tab
+//     (settings).  Choice persists across reboots via NVS (tac-face/idx).
+//   * SWIPE NAVIGATION re-enabled across every tab.  The tabview's content
+//     wrapper is scrollable again so left/right swipe moves between
+//     HOME / CMP / NAV / TOOLS / CAMP / WALK / DATA the way LVGL intends.
+//     Tap-edge nav is kept as a secondary input for gloved use.
 // v2.2 ADDS:
 //   * Back-to-launcher pill REMOVED on every tab.  Long-press BOOT (1.5 s)
 //     is now the only exit path -- same as StudyOS.
 //   * TAP-EDGE NAV: tap the leftmost ~20% of the screen -> previous tab,
 //     rightmost ~20% -> next tab.  Center band keeps the existing
 //     double-tap flashlight gesture.  No animation, instant snap to tab.
-//   * Tabview swipe-slide DISABLED + glitch overlay no longer fires on
-//     tab change -- the OS feels snappy like LauncherOS now.
-//   * SETTINGS CARD in TOOLS tab with a "PIN LOCK ARMED/DISARMED" switch.
-//     Toggle saved to NVS (tac-pin/enabled).  Takes effect next boot --
-//     when DISARMED the keypad overlay is skipped entirely.
 // v2.1: TRAIL BREADCRUMBS, PACE COUNTER, 3 CAMO THEMES, STRIDE CALIBRATE
 // v2.0 features (PIN, watchfaces, NAV waypoints, Morse keyer, beacon, etc.)
 // remain intact -- see /app/memory/PRD.md.
@@ -32,6 +51,7 @@
 #include <esp_partition.h>
 #include <esp_ota_ops.h>
 #include <esp_system.h>
+#include <esp_sleep.h>
 #include <memory>
 #include <math.h>
 
@@ -366,12 +386,18 @@ static void heading_zero() { g_heading_deg = 0.0f; }
 
 // =============================================================================
 // Step counter + dead-reckoning position + 7-day history
+// v2.3: detector rewritten -- AC-coupled peak detector + minimum-interval
+//   refractory window, ported from SportOS.  The previous single-threshold
+//   detector double-counted on bumps and triggered on hand-jitter; this one
+//   ignores DC gravity via a running mean and rejects bursts faster than
+//   ~3.5 Hz which is well above human cadence.
 // =============================================================================
 static uint32_t g_steps        = 0;
 static uint16_t g_steps_yday   = 0xFFFF;
 static Preferences g_steps_prefs;
-static float    g_lp_mag       = 1.0f;
-static bool     g_above        = false;
+static float    g_acc_mean     = 1.0f;   // EMA of |a| -- tracks gravity DC
+static float    g_acc_prev_ac  = 0.0f;   // previous AC-coupled sample (for slope)
+static uint32_t g_last_step_ms = 0;      // refractory timestamp
 static float    g_stride_m     = 0.75f;  // meters per step (configurable)
 static float    g_pos_x_m      = 0.0f;   // dead-reckoning X (east+)
 static float    g_pos_y_m      = 0.0f;   // dead-reckoning Y (north+)
@@ -441,11 +467,14 @@ static void steps_rollover_check() {
 static void update_steps() {
   AccG a = qmi_acc();
   float mag = sqrtf(a.x*a.x + a.y*a.y + a.z*a.z);
-  g_lp_mag = g_lp_mag * 0.9f + mag * 0.1f;
-  float delta = mag - g_lp_mag;
 
-  // Panic-tap detection (sharp spikes >1.6g)
-  if (g_panic_armed && fabsf(delta) > 0.6f) {
+  // Running mean tracks gravity DC ~0.95s window @50Hz -> AC = mag - mean.
+  // Slow enough that walking peaks survive, fast enough to absorb tilt.
+  g_acc_mean = 0.95f * g_acc_mean + 0.05f * mag;
+  float ac = mag - g_acc_mean;
+
+  // Panic-tap detection (sharp spikes > ~0.6 g on either side, x3 quick).
+  if (g_panic_armed && fabsf(ac) > 0.6f) {
     uint32_t now = millis();
     if (g_tap_idx == 0 || (now - g_tap_times[g_tap_idx-1]) > 80) {
       g_tap_times[g_tap_idx++] = now;
@@ -458,11 +487,18 @@ static void update_steps() {
       }
     }
   }
-  // reset tap window if too long
   if (g_tap_idx > 0 && (millis() - g_tap_times[g_tap_idx-1]) > 1500) g_tap_idx = 0;
 
-  if (!g_above && delta > 0.15f) {
-    g_above = true;
+  // Peak detector (positive-going) with refractory.
+  //   * peak when previous AC sample was lower AND current is above threshold
+  //   * 0.18 g threshold rejects idle hand wobble (~0.03-0.08 g)
+  //   * 280 ms gap = max ~3.5 steps/sec (fastest sustainable cadence)
+  uint32_t now = millis();
+  bool peak = (g_acc_prev_ac < ac) && (ac > 0.18f);
+  g_acc_prev_ac = ac;
+
+  if (peak && (now - g_last_step_ms) > 280) {
+    g_last_step_ms = now;
     g_steps++;
     g_steps_hist[0] = g_steps;
     // dead-reckoning
@@ -480,7 +516,6 @@ static void update_steps() {
     }
     if ((g_steps & 0x1F) == 0) hist_save();
   }
-  else if (g_above && delta < 0.05f) g_above = false;
 }
 
 // =============================================================================
@@ -535,7 +570,7 @@ static int wp_first_free() {
 // =============================================================================
 // Mode state
 // =============================================================================
-enum Mode { M_HOME = 0, M_COMPASS, M_NAV, M_TOOLS, M_CAMP, M_WALK, M_DATA, M_NTABS };
+enum Mode { M_HOME = 0, M_COMPASS, M_NAV, M_TOOLS, M_CAMP, M_WALK, M_DATA, M_BATT, M_NTABS };
 static Mode g_mode = M_HOME;
 static bool g_night          = false;
 static bool g_stealth        = false;
@@ -603,7 +638,7 @@ static const char* MORSE_TBL[36] = {
 // =============================================================================
 static lv_obj_t *scr_root;
 static lv_obj_t *tabv;
-static lv_obj_t *tab_home, *tab_compass, *tab_nav, *tab_tools, *tab_camp, *tab_walk, *tab_data;
+static lv_obj_t *tab_home, *tab_compass, *tab_nav, *tab_tools, *tab_camp, *tab_walk, *tab_data, *tab_batt;
 static lv_obj_t *flash_scr;
 static lv_obj_t *toast_lbl;
 static lv_obj_t *page_dots[M_NTABS] = {0};
@@ -614,7 +649,7 @@ static lv_obj_t *pin_dots[4] = {0};
 static lv_obj_t *pin_msg = nullptr;
 static char      g_pin_buf[5] = "";
 static uint8_t   g_pin_len    = 0;
-static bool      g_locked     = true;
+static bool      g_locked     = false;   // v2.3: PIN lock removed -- always unlocked
 
 // Home widgets (multiple watchfaces)
 static lv_obj_t *home_face_digital, *home_face_radar, *home_face_minimal;
@@ -1247,9 +1282,27 @@ static void stride_cal_cb(lv_event_t *) {
   }
 }
 
-// Home watchface cycling
-static void home_face_cycle() {
-  g_watchface = (g_watchface + 1) % 3;
+// Home watchface selection (v2.3)
+//   * `home_face_apply(idx)` shows the requested face (0..2), updates the
+//     global `g_watchface`, and persists the choice to NVS so the next
+//     boot opens to the same face.  Called from the WATCH FACE card in
+//     the TOOLS tab only -- there is no more centre-tap shortcut.
+//   * `home_face_load_idx()` reads the saved index at boot (default 0).
+static uint8_t home_face_load_idx() {
+  Preferences p; p.begin("tac-face", true);
+  uint8_t idx = p.getUChar("idx", 0);
+  p.end();
+  if (idx > 2) idx = 0;
+  return idx;
+}
+static void home_face_save_idx(uint8_t idx) {
+  Preferences p; p.begin("tac-face", false);
+  p.putUChar("idx", idx);
+  p.end();
+}
+static void home_face_apply(uint8_t idx, bool toast = true) {
+  if (idx > 2) idx = 0;
+  g_watchface = idx;
   lv_obj_add_flag(home_face_digital, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(home_face_radar,   LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_flag(home_face_minimal, LV_OBJ_FLAG_HIDDEN);
@@ -1258,9 +1311,12 @@ static void home_face_cycle() {
     case 1: lv_obj_clear_flag(home_face_radar,   LV_OBJ_FLAG_HIDDEN); break;
     case 2: lv_obj_clear_flag(home_face_minimal, LV_OBJ_FLAG_HIDDEN); break;
   }
-  const char* nm[] = {"DIGITAL","RADAR","MINIMAL"};
-  char m[32]; snprintf(m, sizeof(m), "FACE: %s", nm[g_watchface]);
-  show_toast(m, 1000);
+  home_face_save_idx(g_watchface);
+  if (toast) {
+    const char* nm[] = {"DIGITAL","RADAR","MINIMAL"};
+    char m[32]; snprintf(m, sizeof(m), "FACE: %s", nm[g_watchface]);
+    show_toast(m, 1000);
+  }
 }
 
 // v2.2 -- Tap-edge nav.
@@ -1695,7 +1751,7 @@ static void build_home_face_digital() {
   lv_obj_align(home_status_d, LV_ALIGN_CENTER, 0, 60);
 
   lv_obj_t *sub = lv_label_create(home_face_digital);
-  lv_label_set_text(sub, "tap center to cycle face // swipe to tabs");
+  lv_label_set_text(sub, "swipe left/right to change tabs");
   lv_obj_set_style_text_color(sub, lv_color_hex(T_MUTE), 0);
   lv_obj_set_style_text_font (sub, &lv_font_montserrat_12, 0);
   lv_obj_align(sub, LV_ALIGN_CENTER, 0, 100);
@@ -1776,20 +1832,17 @@ static void build_home_face_minimal() {
   lv_obj_align(home_min_label, LV_ALIGN_CENTER, 0, 50);
 }
 
-static void home_tap_cb(lv_event_t *) { home_face_cycle(); }
+// v2.3: home_tap_cb removed -- watchface is picked from TOOLS card now.
 
 static void build_home_tab() {
   build_home_face_digital();
   build_home_face_radar();
   build_home_face_minimal();
-  // invisible tap target in center
-  lv_obj_t *tap = lv_obj_create(tab_home);
-  lv_obj_remove_style_all(tap);
-  lv_obj_set_size(tap, 200, 200);
-  lv_obj_align(tap, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_bg_opa(tap, LV_OPA_TRANSP, 0);
-  lv_obj_add_flag(tap, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(tap, home_tap_cb, LV_EVENT_CLICKED, NULL);
+  // v2.3: invisible centre tap target REMOVED.  It used to cycle the
+  // watchface, but the user now picks the face from the WATCH FACE card
+  // in the TOOLS tab only.  Removing it also frees the home centre for
+  // the tabview's horizontal swipe nav -- a clickable child object was
+  // eating the gesture before LVGL could route it.
   build_back_btn(tab_home);
 }
 
@@ -1981,16 +2034,100 @@ static lv_obj_t *toggle_row(lv_obj_t *parent, const char *txt, lv_event_cb_t cb,
   return sw;
 }
 
+// -----------------------------------------------------------------------------
+// v2.4 -- TOOLS tab sub-paging (Tools <-> Settings, swipe up/down, instant)
+// -----------------------------------------------------------------------------
+// The TOOLS tab now hosts two full-size sub-pages.  Page 0 = Survival/Tools
+// (timers, beacon, morse).  Page 1 = Settings/Prefs (night/stealth, theme,
+// stride, watchface).  A vertical swipe flips between them with NO animation.
+static lv_obj_t *tools_page_1 = nullptr;   // SURVIVAL // TOOLS
+static lv_obj_t *tools_page_2 = nullptr;   // SETTINGS // PREFS
+static uint8_t   tools_page   = 0;         // 0 -> page1 visible, 1 -> page2
+
+static void tools_show_page(uint8_t p) {
+  if (p > 1) p = 1;
+  tools_page = p;
+  if (tools_page_1) {
+    if (p == 0) lv_obj_clear_flag(tools_page_1, LV_OBJ_FLAG_HIDDEN);
+    else        lv_obj_add_flag  (tools_page_1, LV_OBJ_FLAG_HIDDEN);
+  }
+  if (tools_page_2) {
+    if (p == 1) lv_obj_clear_flag(tools_page_2, LV_OBJ_FLAG_HIDDEN);
+    else        lv_obj_add_flag  (tools_page_2, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+// Recursively enable event bubbling so a swipe that starts on any child
+// (button, switch, label, card) is delivered to the sub-page container.
+static void tools_enable_bubble(lv_obj_t *obj) {
+  if (!obj) return;
+  lv_obj_add_flag(obj, LV_OBJ_FLAG_EVENT_BUBBLE);
+  uint32_t n = lv_obj_get_child_cnt(obj);
+  for (uint32_t i = 0; i < n; i++) {
+    tools_enable_bubble(lv_obj_get_child(obj, i));
+  }
+}
+
+// Vertical-swipe gesture handler.  Only consumes LV_DIR_TOP / LV_DIR_BOTTOM
+// so the tabview's horizontal scroll-snap keeps working unchanged.
+static void tools_gesture_cb(lv_event_t *e) {
+  (void)e;
+  lv_indev_t *idv = lv_indev_get_act();
+  if (!idv) return;
+  lv_dir_t d = lv_indev_get_gesture_dir(idv);
+  if (d == LV_DIR_TOP) {                 // swipe UP  -> show settings
+    if (tools_page == 0) {
+      lv_indev_wait_release(idv);        // one flip per swipe
+      tools_show_page(1);
+    }
+  } else if (d == LV_DIR_BOTTOM) {       // swipe DOWN -> back to tools
+    if (tools_page == 1) {
+      lv_indev_wait_release(idv);
+      tools_show_page(0);
+    }
+  }
+  // LV_DIR_LEFT / LV_DIR_RIGHT: ignored, tabview handles them.
+}
+
+static lv_obj_t *make_tools_subpage(lv_obj_t *parent) {
+  lv_obj_t *p = lv_obj_create(parent);
+  lv_obj_remove_style_all(p);
+  lv_obj_set_size(p, LCD_WIDTH, LCD_HEIGHT);
+  lv_obj_set_pos (p, 0, 0);
+  lv_obj_set_style_bg_color(p, lv_color_hex(T_BG), 0);
+  lv_obj_set_style_bg_opa  (p, LV_OPA_COVER, 0);
+  lv_obj_set_style_pad_all (p, 0, 0);
+  lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(p, tools_gesture_cb, LV_EVENT_GESTURE, NULL);
+  return p;
+}
+
 static void build_tools_tab() {
-  make_eyebrow(tab_tools, "SURVIVAL // TOOLS", LV_ALIGN_TOP_MID, 0, 14);
+  // v2.4: two full-size sub-pages, swipe up/down between them.
+  // Make sure tab_tools itself doesn't intercept vertical scroll, and that
+  // its own children fill the screen edge-to-edge.
+  lv_obj_clear_flag(tab_tools, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_pad_all(tab_tools, 0, 0);
+
+  tools_page_1 = make_tools_subpage(tab_tools);
+  tools_page_2 = make_tools_subpage(tab_tools);
+  lv_obj_add_flag(tools_page_2, LV_OBJ_FLAG_HIDDEN);   // boot on page 1
+  tools_page = 0;
+
+  // ===========================================================================
+  // PAGE 1 -- SURVIVAL // TOOLS  (Flash, Beacon, Timer, Countdown, Morse)
+  // The little "  UP" hint in the eyebrow tells the user a swipe-up reveals
+  // the Settings sub-card.  No dot indicator (per user spec).
+  // ===========================================================================
+  make_eyebrow(tools_page_1, "SURVIVAL // TOOLS    UP", LV_ALIGN_TOP_MID, 0, 14);
 
   // Row 1: Flash + Beacon
-  tool_btn(tab_tools, LV_SYMBOL_EYE_OPEN " FLASH", tools_flash_cb,        20, 38, 175, 60, T_RED);
-  tool_btn(tab_tools, LV_SYMBOL_WARNING  " BEACON", tools_sos_cb,         215, 38, 105, 60, T_AMBER);
-  tool_btn(tab_tools, "MODE",                        tools_beacon_mode_cb, 325, 38, 65,  60, T_AMBER);
+  tool_btn(tools_page_1, LV_SYMBOL_EYE_OPEN " FLASH", tools_flash_cb,        20, 38, 175, 60, T_RED);
+  tool_btn(tools_page_1, LV_SYMBOL_WARNING  " BEACON", tools_sos_cb,         215, 38, 105, 60, T_AMBER);
+  tool_btn(tools_page_1, "MODE",                        tools_beacon_mode_cb, 325, 38, 65,  60, T_AMBER);
 
   // TIMER card
-  lv_obj_t *tc = make_card(tab_tools, 175, 130);
+  lv_obj_t *tc = make_card(tools_page_1, 175, 130);
   lv_obj_align(tc, LV_ALIGN_TOP_LEFT, 20, 108);
   lv_obj_t *tl = lv_label_create(tc);
   lv_label_set_text(tl, "MISSION TIMER");
@@ -2027,7 +2164,7 @@ static void build_tools_tab() {
   lv_obj_add_event_cb(btn_l, timer_lap_cb, LV_EVENT_CLICKED, NULL);
 
   // COUNTDOWN card
-  lv_obj_t *cc = make_card(tab_tools, 175, 130);
+  lv_obj_t *cc = make_card(tools_page_1, 175, 130);
   lv_obj_align(cc, LV_ALIGN_TOP_LEFT, 215, 108);
   lv_obj_t *cl = lv_label_create(cc);
   lv_label_set_text(cl, "COUNTDOWN");
@@ -2072,7 +2209,7 @@ static void build_tools_tab() {
   lv_obj_add_event_cb(go, cd_start_cb, LV_EVENT_CLICKED, NULL);
 
   // MORSE keyer card
-  lv_obj_t *mc = make_card(tab_tools, 370, 90);
+  lv_obj_t *mc = make_card(tools_page_1, 370, 90);
   lv_obj_align(mc, LV_ALIGN_TOP_LEFT, 20, 248);
   lv_obj_t *mt = lv_label_create(mc);
   lv_label_set_text(mt, "MORSE KEYER");
@@ -2124,14 +2261,27 @@ static void build_tools_tab() {
   lv_obj_set_style_text_color(sndl, lv_color_hex(T_AMBER), 0); lv_obj_center(sndl);
   lv_obj_add_event_cb(snd, keyer_send_cb, LV_EVENT_CLICKED, NULL);
 
-  // Night / Stealth toggles
-  tools_night_sw   = toggle_row(tab_tools, "NIGHT MODE",   tools_night_cb,   348, &g_night);
-  tools_stealth_sw = toggle_row(tab_tools, "STEALTH MODE", tools_stealth_cb, 390, &g_stealth);
+  // "SWIPE UP FOR SETTINGS" footer hint (subtle, single line)
+  lv_obj_t *hint1 = lv_label_create(tools_page_1);
+  lv_label_set_text(hint1, "SWIPE UP  -  SETTINGS");
+  lv_obj_set_style_text_color(hint1, lv_color_hex(T_DIM_RED), 0);
+  lv_obj_set_style_text_font (hint1, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_letter_space(hint1, 3, 0);
+  lv_obj_align(hint1, LV_ALIGN_BOTTOM_MID, 0, -16);
 
-  // PACE COUNTER pill (bottom row) + theme + stride cal
-  lv_obj_t *pace_btn = lv_btn_create(tab_tools);
+  // ===========================================================================
+  // PAGE 2 -- SETTINGS // PREFS  (Night, Stealth, Pace, Theme, Stride, Face)
+  // ===========================================================================
+  make_eyebrow(tools_page_2, "DOWN    SETTINGS // PREFS", LV_ALIGN_TOP_MID, 0, 14);
+
+  // Night / Stealth toggles -- moved to top of the settings page
+  tools_night_sw   = toggle_row(tools_page_2, "NIGHT MODE",   tools_night_cb,   48, &g_night);
+  tools_stealth_sw = toggle_row(tools_page_2, "STEALTH MODE", tools_stealth_cb, 92, &g_stealth);
+
+  // Pace / Theme / Stride Cal row
+  lv_obj_t *pace_btn = lv_btn_create(tools_page_2);
   lv_obj_set_size(pace_btn, 110, 36);
-  lv_obj_align(pace_btn, LV_ALIGN_BOTTOM_LEFT, 18, -70);
+  lv_obj_align(pace_btn, LV_ALIGN_TOP_LEFT, 18, 150);
   lv_obj_set_style_bg_color(pace_btn, lv_color_hex(T_SURFACE), 0);
   lv_obj_set_style_border_color(pace_btn, lv_color_hex(T_AMBER), 0);
   lv_obj_set_style_border_width(pace_btn, 1, 0);
@@ -2144,9 +2294,9 @@ static void build_tools_tab() {
   lv_obj_add_event_cb(pace_btn, pace_bump_cb, LV_EVENT_CLICKED, NULL);
   lv_obj_add_event_cb(pace_btn, pace_reset_cb, LV_EVENT_LONG_PRESSED, NULL);
 
-  lv_obj_t *theme_btn = lv_btn_create(tab_tools);
+  lv_obj_t *theme_btn = lv_btn_create(tools_page_2);
   lv_obj_set_size(theme_btn, 110, 36);
-  lv_obj_align(theme_btn, LV_ALIGN_BOTTOM_MID, 0, -70);
+  lv_obj_align(theme_btn, LV_ALIGN_TOP_MID, 0, 150);
   lv_obj_set_style_bg_color(theme_btn, lv_color_hex(T_SURFACE), 0);
   lv_obj_set_style_border_color(theme_btn, lv_color_hex(T_DIM_RED), 0);
   lv_obj_set_style_border_width(theme_btn, 1, 0);
@@ -2159,9 +2309,9 @@ static void build_tools_tab() {
   lv_obj_center(thl);
   lv_obj_add_event_cb(theme_btn, theme_cycle_cb, LV_EVENT_CLICKED, NULL);
 
-  lv_obj_t *cal_btn = lv_btn_create(tab_tools);
+  lv_obj_t *cal_btn = lv_btn_create(tools_page_2);
   lv_obj_set_size(cal_btn, 110, 36);
-  lv_obj_align(cal_btn, LV_ALIGN_BOTTOM_RIGHT, -18, -70);
+  lv_obj_align(cal_btn, LV_ALIGN_TOP_RIGHT, -18, 150);
   lv_obj_set_style_bg_color(cal_btn, lv_color_hex(T_SURFACE), 0);
   lv_obj_set_style_border_color(cal_btn, lv_color_hex(T_DIM_RED), 0);
   lv_obj_set_style_border_width(cal_btn, 1, 0);
@@ -2174,34 +2324,64 @@ static void build_tools_tab() {
   lv_obj_center(cll2);
   lv_obj_add_event_cb(cal_btn, stride_cal_cb, LV_EVENT_CLICKED, NULL);
 
-  // v2.2 -- SETTINGS card: PIN lock toggle.
-  // Sits along the bottom strip that the removed "Back to Launcher" pill
-  // used to occupy.  Layout: card title top-left, ARMED/DISARMED status
-  // text bottom-left, lv_switch on the right.
-  lv_obj_t *sc = make_card(tab_tools, LCD_WIDTH - 40, 52);
-  lv_obj_align(sc, LV_ALIGN_BOTTOM_MID, 0, -10);
+  // WATCH FACE selector card (DIGITAL / RADAR / MINIMAL pills)
+  lv_obj_t *sc = make_card(tools_page_2, LCD_WIDTH - 40, 100);
+  lv_obj_align(sc, LV_ALIGN_TOP_MID, 0, 210);
+
   lv_obj_t *sl = lv_label_create(sc);
-  lv_label_set_text(sl, "PIN LOCK");
+  lv_label_set_text(sl, "WATCH FACE");
   lv_obj_set_style_text_color(sl, lv_color_hex(T_DIM_RED), 0);
   lv_obj_set_style_text_font (sl, &lv_font_montserrat_12, 0);
   lv_obj_set_style_text_letter_space(sl, 2, 0);
   lv_obj_align(sl, LV_ALIGN_TOP_LEFT, 0, 0);
 
-  s_pin_state_lbl = lv_label_create(sc);
-  lv_label_set_text(s_pin_state_lbl, g_pin_enabled ? "ARMED" : "DISARMED");
-  lv_obj_set_style_text_color(s_pin_state_lbl,
-      lv_color_hex(g_pin_enabled ? T_RED : T_MUTE), 0);
-  lv_obj_set_style_text_font (s_pin_state_lbl, &lv_font_montserrat_14, 0);
-  lv_obj_align(s_pin_state_lbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+  const char *face_names[3] = { "DIGITAL", "RADAR", "MINIMAL" };
+  static lv_obj_t *face_pills[3] = { nullptr, nullptr, nullptr };
+  for (int i = 0; i < 3; i++) {
+    lv_obj_t *b = lv_btn_create(sc);
+    lv_obj_set_size(b, 108, 34);
+    lv_obj_align(b, LV_ALIGN_BOTTOM_LEFT, i * 116, 0);
+    lv_obj_set_style_radius(b, 17, 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    bool active = (g_watchface == i);
+    lv_obj_set_style_bg_color(b, lv_color_hex(active ? T_RED : T_SURFACE), 0);
+    lv_obj_set_style_border_color(b, lv_color_hex(active ? T_RED : T_DIM_RED), 0);
+    lv_obj_t *bl = lv_label_create(b);
+    lv_label_set_text(bl, face_names[i]);
+    lv_obj_set_style_text_color(bl, lv_color_hex(active ? 0x000000 : T_RED), 0);
+    lv_obj_set_style_text_font (bl, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_letter_space(bl, 2, 0);
+    lv_obj_center(bl);
+    face_pills[i] = b;
+    lv_obj_add_event_cb(b, [](lv_event_t *ev) {
+      int idx = (int)(intptr_t)lv_event_get_user_data(ev);
+      home_face_apply((uint8_t)idx);
+      for (int j = 0; j < 3; j++) {
+        if (!face_pills[j]) continue;
+        bool act = (g_watchface == j);
+        lv_obj_set_style_bg_color(face_pills[j],
+          lv_color_hex(act ? T_RED : T_SURFACE), 0);
+        lv_obj_set_style_border_color(face_pills[j],
+          lv_color_hex(act ? T_RED : T_DIM_RED), 0);
+        lv_obj_t *lbl = lv_obj_get_child(face_pills[j], 0);
+        if (lbl) lv_obj_set_style_text_color(lbl,
+          lv_color_hex(act ? 0x000000 : T_RED), 0);
+      }
+    }, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+  }
 
-  lv_obj_t *pin_sw = lv_switch_create(sc);
-  lv_obj_set_size(pin_sw, 56, 28);
-  lv_obj_align(pin_sw, LV_ALIGN_RIGHT_MID, 0, 0);
-  lv_obj_set_style_bg_color(pin_sw, lv_color_hex(0x200000), 0);                // off track
-  lv_obj_set_style_bg_color(pin_sw, lv_color_hex(T_RED),    LV_PART_INDICATOR); // on track
-  lv_obj_set_style_bg_color(pin_sw, lv_color_hex(0xFFFFFF), LV_PART_KNOB);
-  if (g_pin_enabled) lv_obj_add_state(pin_sw, LV_STATE_CHECKED);
-  lv_obj_add_event_cb(pin_sw, pin_toggle_cb, LV_EVENT_VALUE_CHANGED, NULL);
+  // "SWIPE DOWN FOR TOOLS" footer hint
+  lv_obj_t *hint2 = lv_label_create(tools_page_2);
+  lv_label_set_text(hint2, "SWIPE DOWN  -  TOOLS");
+  lv_obj_set_style_text_color(hint2, lv_color_hex(T_DIM_RED), 0);
+  lv_obj_set_style_text_font (hint2, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_letter_space(hint2, 3, 0);
+  lv_obj_align(hint2, LV_ALIGN_BOTTOM_MID, 0, -16);
+
+  // v2.4: enable gesture-event bubbling on every descendant so a swipe
+  // that started on a button or switch still flips the sub-page.
+  tools_enable_bubble(tools_page_1);
+  tools_enable_bubble(tools_page_2);
 
   build_back_btn(tab_tools);
 }
@@ -2371,6 +2551,189 @@ static void build_data_tab() {
   build_back_btn(tab_data);
 }
 
+// =============================================================================
+// BATTERY tab (v2.3)
+//   * Inspired by LauncherOS' battery screen: big % arc, charging state,
+//     voltage, runtime estimate, and a manual deep-sleep button.
+//   * Runtime estimate is a 6-sample linear-fit on (pct, millis) pairs --
+//     no static "%/hour" lookup table, it adapts to the user's actual drain
+//     rate.  Returns -1 when there isn't enough data yet or charging.
+// =============================================================================
+static lv_obj_t *batt_arc      = nullptr;
+static lv_obj_t *batt_pct_lbl  = nullptr;
+static lv_obj_t *batt_state_lbl= nullptr;
+static lv_obj_t *batt_remain_lbl=nullptr;
+static lv_obj_t *batt_volt_lbl = nullptr;
+static lv_obj_t *batt_steps_lbl= nullptr;
+
+#define BATT_SAMP_N 6
+static int      g_batt_pct_s[BATT_SAMP_N] = { -1,-1,-1,-1,-1,-1 };
+static uint32_t g_batt_ms_s [BATT_SAMP_N] = {  0, 0, 0, 0, 0, 0 };
+static uint8_t  g_batt_si   = 0;
+
+static void batt_sample_push(int pct, uint32_t ms) {
+  g_batt_pct_s[g_batt_si] = pct;
+  g_batt_ms_s [g_batt_si] = ms;
+  g_batt_si = (g_batt_si + 1) % BATT_SAMP_N;
+}
+
+static int batt_minutes_left(int pct, bool charging) {
+  if (charging || pct < 0) return -1;
+  // collect samples in chronological order
+  int   px[BATT_SAMP_N]; uint32_t mx[BATT_SAMP_N]; int n = 0;
+  for (int k = 0; k < BATT_SAMP_N; k++) {
+    int i = (g_batt_si + k) % BATT_SAMP_N;
+    if (g_batt_pct_s[i] < 0) continue;
+    px[n] = g_batt_pct_s[i]; mx[n] = g_batt_ms_s[i]; n++;
+  }
+  if (n < 3) return -1;
+  // need a real downward drop, otherwise the slope is just ADC jitter
+  int drop = px[0] - px[n-1];
+  uint32_t dt = mx[n-1] - mx[0];
+  if (drop < 1 || dt < 60UL*1000UL) return -1;
+  // minutes-per-percent at the observed rate
+  float mins_per_pct = (dt / 60000.0f) / drop;
+  float left = mins_per_pct * pct;
+  if (left < 0)        return 0;
+  if (left > 60*72)    return 60*72;   // clamp at 72 h
+  return (int)left;
+}
+
+static lv_color_t batt_color_for(int pct) {
+  if (pct <= 15) return lv_color_hex(0xFF4040);
+  if (pct <= 30) return lv_color_hex(0xFFB300);
+  return lv_color_hex(T_RED);   // tactical theme stays red on healthy state
+}
+
+static void update_battery_panel() {
+  if (!batt_arc) return;
+  if (!g_has_pmu) {
+    lv_label_set_text(batt_pct_lbl,   "--%");
+    lv_label_set_text(batt_state_lbl, "NO PMU");
+    lv_label_set_text(batt_remain_lbl,"");
+    lv_label_set_text(batt_volt_lbl,  "");
+    return;
+  }
+  int  pct = g_pmu.getBatteryPercent();
+  bool ch  = g_pmu.isCharging();
+  int  mv  = g_pmu.getBattVoltage();
+  if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+
+  // sample for the runtime estimator (once per call, ~5 s cadence from loop)
+  batt_sample_push(pct, millis());
+
+  lv_arc_set_value(batt_arc, pct);
+  char b[16]; snprintf(b, sizeof(b), "%d%%", pct);
+  lv_label_set_text(batt_pct_lbl, b);
+  lv_color_t col = batt_color_for(pct);
+  lv_obj_set_style_arc_color (batt_arc,     col, LV_PART_INDICATOR);
+  lv_obj_set_style_text_color(batt_pct_lbl, col, 0);
+
+  if (ch) {
+    lv_label_set_text(batt_state_lbl, "CHARGING");
+    lv_obj_set_style_text_color(batt_state_lbl, lv_color_hex(T_OK), 0);
+    lv_label_set_text(batt_remain_lbl, "");
+  } else {
+    lv_label_set_text(batt_state_lbl, "ON BATTERY");
+    lv_obj_set_style_text_color(batt_state_lbl, lv_color_hex(T_DIM_RED), 0);
+    int mins = batt_minutes_left(pct, ch);
+    if (mins < 0) lv_label_set_text(batt_remain_lbl, "EST ~ --");
+    else {
+      char r[48];
+      int h = mins / 60, m = mins % 60;
+      if (h > 0) snprintf(r, sizeof(r), "EST ~ %d h %02d m", h, m);
+      else       snprintf(r, sizeof(r), "EST ~ %d m",       m);
+      lv_label_set_text(batt_remain_lbl, r);
+    }
+  }
+  char v[32]; snprintf(v, sizeof(v), "%.2f V", mv / 1000.0f);
+  lv_label_set_text(batt_volt_lbl, v);
+
+  if (batt_steps_lbl) {
+    char s[32]; snprintf(s, sizeof(s), "%lu STEPS TODAY", (unsigned long)g_steps);
+    lv_label_set_text(batt_steps_lbl, s);
+  }
+}
+
+static void batt_sleep_btn_cb(lv_event_t *) {
+  log_event("SLEEP via BATT tab");
+  show_toast("ENTERING DEEP SLEEP", 800);
+  lv_timer_handler();
+  delay(900);
+  // BOOT button (GPIO 0) wakes the watch.
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BOOT_BTN_PIN, 0);
+  esp_deep_sleep_start();
+}
+
+static void build_batt_tab() {
+  make_eyebrow(tab_batt, "POWER // CORE", LV_ALIGN_TOP_MID, 0, 14);
+
+  // Big tactical % arc (270° sweep, opens at the bottom like a HUD gauge).
+  batt_arc = lv_arc_create(tab_batt);
+  lv_obj_set_size(batt_arc, 280, 280);
+  lv_obj_align(batt_arc, LV_ALIGN_CENTER, 0, -20);
+  lv_arc_set_rotation(batt_arc, 135);
+  lv_arc_set_bg_angles(batt_arc, 0, 270);
+  lv_arc_set_range(batt_arc, 0, 100);
+  lv_arc_set_value(batt_arc, 0);
+  lv_obj_remove_style(batt_arc, NULL, LV_PART_KNOB);
+  lv_obj_clear_flag(batt_arc, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_style_arc_color(batt_arc, lv_color_hex(0x200000), LV_PART_MAIN);
+  lv_obj_set_style_arc_width(batt_arc, 12, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(batt_arc, lv_color_hex(T_RED),    LV_PART_INDICATOR);
+  lv_obj_set_style_arc_width(batt_arc, 12, LV_PART_INDICATOR);
+
+  batt_pct_lbl = lv_label_create(tab_batt);
+  lv_label_set_text(batt_pct_lbl, "--%");
+  lv_obj_set_style_text_color(batt_pct_lbl, lv_color_hex(T_RED), 0);
+  lv_obj_set_style_text_font (batt_pct_lbl, &lv_font_montserrat_48, 0);
+  lv_obj_align(batt_pct_lbl, LV_ALIGN_CENTER, 0, -40);
+
+  batt_state_lbl = lv_label_create(tab_batt);
+  lv_label_set_text(batt_state_lbl, "");
+  lv_obj_set_style_text_color(batt_state_lbl, lv_color_hex(T_DIM_RED), 0);
+  lv_obj_set_style_text_font (batt_state_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_letter_space(batt_state_lbl, 3, 0);
+  lv_obj_align(batt_state_lbl, LV_ALIGN_CENTER, 0, 5);
+
+  batt_remain_lbl = lv_label_create(tab_batt);
+  lv_label_set_text(batt_remain_lbl, "EST ~ --");
+  lv_obj_set_style_text_color(batt_remain_lbl, lv_color_hex(T_TXT), 0);
+  lv_obj_set_style_text_font (batt_remain_lbl, &lv_font_montserrat_16, 0);
+  lv_obj_align(batt_remain_lbl, LV_ALIGN_CENTER, 0, 35);
+
+  batt_volt_lbl = lv_label_create(tab_batt);
+  lv_label_set_text(batt_volt_lbl, "");
+  lv_obj_set_style_text_color(batt_volt_lbl, lv_color_hex(T_MUTE), 0);
+  lv_obj_set_style_text_font (batt_volt_lbl, &lv_font_montserrat_14, 0);
+  lv_obj_align(batt_volt_lbl, LV_ALIGN_CENTER, 0, 65);
+
+  batt_steps_lbl = lv_label_create(tab_batt);
+  lv_label_set_text(batt_steps_lbl, "0 STEPS TODAY");
+  lv_obj_set_style_text_color(batt_steps_lbl, lv_color_hex(T_AMBER), 0);
+  lv_obj_set_style_text_font (batt_steps_lbl, &lv_font_montserrat_12, 0);
+  lv_obj_set_style_text_letter_space(batt_steps_lbl, 2, 0);
+  lv_obj_align(batt_steps_lbl, LV_ALIGN_CENTER, 0, 95);
+
+  // SLEEP NOW pill -- enters deep sleep, BOOT button wakes.
+  lv_obj_t *sb = lv_btn_create(tab_batt);
+  lv_obj_set_size(sb, 200, 44);
+  lv_obj_align(sb, LV_ALIGN_BOTTOM_MID, 0, -38);
+  lv_obj_set_style_radius(sb, 22, 0);
+  lv_obj_set_style_bg_color(sb, lv_color_hex(T_SURFACE), 0);
+  lv_obj_set_style_border_color(sb, lv_color_hex(T_AMBER), 0);
+  lv_obj_set_style_border_width(sb, 1, 0);
+  lv_obj_t *sl = lv_label_create(sb);
+  lv_label_set_text(sl, "SLEEP NOW");
+  lv_obj_set_style_text_color(sl, lv_color_hex(T_AMBER), 0);
+  lv_obj_set_style_text_font (sl, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_letter_space(sl, 4, 0);
+  lv_obj_center(sl);
+  lv_obj_add_event_cb(sb, batt_sleep_btn_cb, LV_EVENT_CLICKED, NULL);
+
+  build_back_btn(tab_batt);
+}
+
 static void build_flash_overlay() {
   flash_scr = lv_obj_create(lv_layer_top());
   lv_obj_remove_style_all(flash_scr);
@@ -2437,14 +2800,16 @@ static void build_ui() {
   lv_obj_set_size(tabv, LCD_WIDTH, LCD_HEIGHT);
   lv_obj_set_style_bg_color(tabv, lv_color_hex(T_BG), 0);
   lv_obj_set_style_bg_opa  (tabv, LV_OPA_COVER, 0);
-  // v2.2: kill the tabview's built-in slide animation between tabs.
-  // We drive navigation ourselves via tap-edge -> lv_tabview_set_act(LV_ANIM_OFF),
-  // so the content wrapper doesn't need to be horizontally swipeable at all.
-  // Disabling SCROLLABLE on the content removes the slide entirely; tab
-  // switches feel instant (matches LauncherOS' snappy fade-cut feel).
+  // v2.3: SWIPE NAV re-enabled.  The tabview's content wrapper is
+  // scrollable again so the user can swipe left/right between tabs.
+  // Tap-edge nav is still wired up below as a secondary input.
   {
     lv_obj_t *content = lv_tabview_get_content(tabv);
-    if (content) lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+    if (content) {
+      lv_obj_add_flag(content, LV_OBJ_FLAG_SCROLLABLE);
+      lv_obj_set_scroll_dir(content, LV_DIR_HOR);
+      lv_obj_set_scroll_snap_x(content, LV_SCROLL_SNAP_CENTER);
+    }
   }
 
   tab_home    = lv_tabview_add_tab(tabv, "HOME");
@@ -2454,8 +2819,9 @@ static void build_ui() {
   tab_camp    = lv_tabview_add_tab(tabv, "CAMP");
   tab_walk    = lv_tabview_add_tab(tabv, "WALK");
   tab_data    = lv_tabview_add_tab(tabv, "DATA");
+  tab_batt    = lv_tabview_add_tab(tabv, "BATT");
 
-  for (lv_obj_t *t : { tab_home, tab_compass, tab_nav, tab_tools, tab_camp, tab_walk, tab_data }) {
+  for (lv_obj_t *t : { tab_home, tab_compass, tab_nav, tab_tools, tab_camp, tab_walk, tab_data, tab_batt }) {
     lv_obj_set_style_bg_color(t, lv_color_hex(T_BG), 0);
     lv_obj_set_style_bg_opa  (t, LV_OPA_COVER, 0);
     lv_obj_set_style_pad_all (t, 0, 0);
@@ -2468,6 +2834,7 @@ static void build_ui() {
   build_camp_tab();
   build_walk_tab();
   build_data_tab();
+  build_batt_tab();
 
   toast_lbl = lv_label_create(lv_layer_top());
   lv_label_set_text(toast_lbl, "");
@@ -2502,7 +2869,10 @@ static void build_ui() {
   }
   lv_obj_add_event_cb(tabv, tab_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-  build_pin_overlay();
+  // v2.3: PIN overlay removed -- no build_pin_overlay() call here.
+  // Apply the saved watchface index so we boot into the user's choice
+  // (silent -- the splash/boot toast handles user feedback).
+  home_face_apply(home_face_load_idx(), false);
   lv_scr_load(scr_root);
 }
 
@@ -2557,7 +2927,7 @@ void setup() {
   time_restore_from_nvs();
   hist_load();
   wp_load();
-  pin_load();
+  // v2.3: pin_load() removed -- PIN lock no longer exists.
   wifi_load_from_sd();
 
   SD_MMC.mkdir("/WATCH");
@@ -2570,12 +2940,7 @@ void setup() {
   build_ui();
   setCpuFrequencyMhz(160);
 
-  // v2.2: honour the user's "PIN ON/OFF" toggle from the Settings card.
-  // When disabled we never block the UI behind the keypad on boot.
-  if (!g_pin_enabled) {
-    g_locked = false;
-    if (pin_overlay) lv_obj_add_flag(pin_overlay, LV_OBJ_FLAG_HIDDEN);
-  }
+  // v2.3: PIN lock removed -- watch boots straight to the home tab.
 
   time_t now; time(&now);
   bool need_ntp = !g_time_valid || (now < 1700000000)
@@ -2587,6 +2952,7 @@ void setup() {
 
   update_clock_labels();
   update_battery_card();
+  update_battery_panel();
   update_camp_panel();
   apply_theme();
   log_event("BOOT");
@@ -2631,7 +2997,7 @@ void loop() {
     tick_t = now;
     update_clock_labels();
     static int bcnt = 0;
-    if (++bcnt >= 5) { bcnt = 0; update_battery_card(); }
+    if (++bcnt >= 5) { bcnt = 0; update_battery_card(); update_battery_panel(); }
     update_camp_panel();
     update_compass_labels();
     update_walk_panel();
