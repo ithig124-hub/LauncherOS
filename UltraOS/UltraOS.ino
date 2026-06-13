@@ -50,6 +50,26 @@
 #include <esp_bt.h>
 #include <esp32-hal-cpu.h>
 
+// =============================================================================
+//  COLOR PALETTE (Apple Watch Ultra inspired)
+//  Defined early so all UI code below can reference these macros.
+// =============================================================================
+#define COL_BG           0x000000
+#define COL_PANEL        0x1C1C1C
+#define COL_PANEL_LIGHT  0x2C2C2C
+#define COL_ORANGE       0xFF9F0A    // Ultra signature orange
+#define COL_BLUE         0x0A84FF
+#define COL_GREEN        0x30D158
+#define COL_RED          0xFF453A
+#define COL_CYAN         0x64D2FF
+#define COL_YELLOW       0xFFD60A
+#define COL_PINK         0xFF375F
+#define COL_PURPLE       0xBF5AF2
+#define COL_WHITE        0xFFFFFF
+#define COL_GRAY         0x8E8E93
+#define COL_TEXT_DIM     0x636366
+
+
 // ---- Pin map (must match LauncherOS) ----------------------------------------
 #define LCD_SDIO0   4
 #define LCD_SDIO1   5
@@ -518,24 +538,6 @@ static void quick_settings_open() {
     lv_obj_add_event_cb(dismiss, [](lv_event_t*) { quick_settings_close(); },
                         LV_EVENT_CLICKED, NULL);
 }
-
-// =============================================================================
-//  COLOR PALETTE (Apple Watch Ultra inspired)
-// =============================================================================
-#define COL_BG           0x000000
-#define COL_PANEL        0x1C1C1C
-#define COL_PANEL_LIGHT  0x2C2C2C
-#define COL_ORANGE       0xFF9F0A    // Ultra signature orange
-#define COL_BLUE         0x0A84FF
-#define COL_GREEN        0x30D158
-#define COL_RED          0xFF453A
-#define COL_CYAN         0x64D2FF
-#define COL_YELLOW       0xFFD60A
-#define COL_PINK         0xFF375F
-#define COL_PURPLE       0xBF5AF2
-#define COL_WHITE        0xFFFFFF
-#define COL_GRAY         0x8E8E93
-#define COL_TEXT_DIM     0x636366
 
 // =============================================================================
 //  QMI8658 IMU (Step Counter)
