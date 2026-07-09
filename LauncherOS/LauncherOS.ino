@@ -1,6 +1,29 @@
 // ============================================================================
 //  LauncherOS.ino   --   DualCore Watch launcher  (LVGL 8.3 / 8.4)
 //  ----------------------------------------------------------------------------
+//  v6.4 -- Settings screen + wallpaper picker + categorised app list.
+//      * NEW screen inserted between APPS and BATTERY.  Swipe order is
+//        now  FACE  <->  APPS  <->  SETTINGS  <->  BATTERY.
+//      * Wallpaper picker: a scrollable 2-column grid on the Settings
+//        screen shows every /WATCH/PHOTOS/*.bin as a tappable tile.
+//        Tap = apply + persist (writes the same NVS "wp_idx" key the
+//        long-press-on-face path used).  The current wallpaper is
+//        highlighted with a gold border + star badge.
+//      * Watch-face is now READ-ONLY: tapping or long-pressing it no
+//        longer changes the wallpaper.  The whole "tap zone" object and
+//        the face_tap_cb wiring have been removed -- the only way to
+//        change the wallpaper is now the Settings picker.  Swipes across
+//        the face still work (they're handled at the indev level).
+//      * Storage summary cards on Settings: "bin" (N apps) and "PHOTOS"
+//        (N wallpapers).  Currently informational -- lays the groundwork
+//        for tap-to-manage later.
+//      * App list is now bucketed.  If /WATCH/bin/categories.txt exists
+//        (format:  AppName = Category  per line, # for comments), the
+//        Apps screen shows Favourites first, then each Category as its
+//        own section header + pill run, then an "Other" bucket for
+//        anything unlisted.  With no categories.txt on the card the
+//        list falls back to the v6.3 flat favourites-first layout.
+//  ----------------------------------------------------------------------------
 //  v6.3 -- battery pass + scrollable pill app list (favourites preserved).
 //      Battery (all existing features and wake paths UNCHANGED):
 //        * POWER_SAVE turned ON by default: CPU 80 MHz idle, BT off, WiFi
@@ -896,8 +919,9 @@ static bool load_photo(int idx) {
 // ============================================================================
 #define SCREEN_FACE     0
 #define SCREEN_APPS     1
-#define SCREEN_BATTERY  2
-#define NUM_SCREENS     3
+#define SCREEN_SETTINGS 2
+#define SCREEN_BATTERY  3
+#define NUM_SCREENS     4
 
 static lv_obj_t *screens[NUM_SCREENS] = { nullptr };
 static int        current_screen = SCREEN_FACE;
@@ -946,50 +970,13 @@ static void refresh_wallpaper() {
     lv_obj_invalidate(face_bg_img);
 }
 
-// ---- wallpaper persistence + long-press cycling -----------------------
-// wp_idx is stashed in the same "dcw" Preferences namespace already used
-// by the favourites list, so it survives reboots AND is visible to any
-// other app that wants to honour the last-chosen wallpaper.
-static const uint32_t FACE_LONG_PRESS_MS = 1000;
-static uint32_t g_face_press_ms   = 0;
-static bool     g_face_long_fired = false;
-
+// v6.4: watch-face wallpaper cycling by tap / long-press has been REMOVED.
+// The Settings screen picker is now the only way to change the wallpaper.
+// save_wp_idx() is still defined here because the Settings picker calls it.
 static void save_wp_idx() {
     g_prefs.begin("dcw", false);
     g_prefs.putInt("wp_idx", g_photo_idx);
     g_prefs.end();
-}
-
-static void cycle_wallpaper_and_save() {
-    if (!g_photo_count) return;
-    g_photo_idx = (g_photo_idx + 1) % g_photo_count;
-    refresh_wallpaper();
-    save_wp_idx();
-}
-
-// Single handler subscribed to LV_EVENT_ALL.  Short click and ~1 s
-// tap-and-hold both cycle the wallpaper forward and persist wp_idx.
-// The long-press path latches g_face_long_fired so the trailing
-// CLICKED on release doesn't double-cycle.
-static void face_tap_cb(lv_event_t *e) {
-    lv_event_code_t code = lv_event_get_code(e);
-
-    if (code == LV_EVENT_PRESSED) {
-        g_face_press_ms   = millis();
-        g_face_long_fired = false;
-    } else if (code == LV_EVENT_PRESSING) {
-        if (!g_face_long_fired && g_face_press_ms &&
-            millis() - g_face_press_ms >= FACE_LONG_PRESS_MS) {
-            g_face_long_fired = true;
-            cycle_wallpaper_and_save();
-        }
-    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
-        g_face_press_ms = 0;
-    } else if (code == LV_EVENT_CLICKED) {
-        if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;   // post-swipe guard
-        if (g_face_long_fired) { g_face_long_fired = false; return; } // long-press already cycled
-        cycle_wallpaper_and_save();
-    }
 }
 
 static void update_face_time() {
@@ -1059,17 +1046,10 @@ static void build_screen_face() {
     lv_obj_align(face_bg_img, LV_ALIGN_TOP_LEFT, 0, 0);
     lv_obj_add_flag(face_bg_img, LV_OBJ_FLAG_HIDDEN);
 
-    // Tap zone (lower 3/4 -- cycles wallpaper)
-    lv_obj_t *tap = lv_obj_create(s);
-    lv_obj_set_size(tap, LCD_WIDTH, LCD_HEIGHT - 70);
-    lv_obj_align(tap, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_opa(tap, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(tap, 0, 0);
-    lv_obj_add_flag(tap, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(tap, LV_OBJ_FLAG_SCROLLABLE);
-    // LV_EVENT_ALL so we see PRESSED / PRESSING / RELEASED / CLICKED --
-    // tap cycles wallpaper, ~1 s tap-and-hold also cycles + persists.
-    lv_obj_add_event_cb(tap, face_tap_cb, LV_EVENT_ALL, NULL);
+    // v6.4: tap-zone REMOVED -- watch-face taps no longer change the
+    // wallpaper.  Use the Settings screen picker (swipe left twice from
+    // the face) to switch wallpapers.  Swipes across the face still
+    // work because they're handled at the indev level, not here.
 
     // Translucent time
     face_time = lv_label_create(s);
@@ -1168,13 +1148,68 @@ static void build_screen_face() {
 //      back to LauncherOS automatically, instead of into the last app
 //      that was flashed into the spare OTA slot.
 // ============================================================================
-struct AppEntry { String name, path; size_t size; };
+struct AppEntry { String name, path; size_t size; String category; };
 #define MAX_APPS 32
 static AppEntry  g_apps[MAX_APPS];
 static int       g_app_count = 0;
 static lv_obj_t *g_list_widget = nullptr;
 static bool      load_app_from_sd(const AppEntry &app);
 static void      populate_app_list();
+
+// ============================================================================
+//  v6.4 category map  --  /WATCH/bin/categories.txt
+//  ----------------------------------------------------------------------------
+//  Format (case-insensitive on the key, no .bin extension):
+//      AppName = Category
+//  Lines starting with '#' or blank lines are ignored.  Unmapped apps
+//  fall into the "Other" bucket.  If the file is missing altogether we
+//  behave exactly like v6.3 (flat favourites-first list).
+// ============================================================================
+#define MAX_CAT_ENTRIES 48
+struct CatEntry { String name; String category; };
+static CatEntry g_cat[MAX_CAT_ENTRIES];
+static int      g_cat_count = 0;
+static bool     g_cat_file_present = false;
+
+static String cat_trim(const String &s) {
+    int a = 0, b = s.length();
+    while (a < b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\r')) a++;
+    while (b > a && (s[b-1] == ' ' || s[b-1] == '\t' || s[b-1] == '\r')) b--;
+    return s.substring(a, b);
+}
+static String cat_lookup(const String &appname) {
+    for (int i = 0; i < g_cat_count; i++) {
+        if (g_cat[i].name.equalsIgnoreCase(appname)) return g_cat[i].category;
+    }
+    return String("Other");
+}
+static void load_categories_txt() {
+    g_cat_count = 0;
+    g_cat_file_present = false;
+    if (!SD_MMC.exists("/WATCH/bin/categories.txt")) {
+        USBSerial.println("[cat] categories.txt not present -- flat list");
+        return;
+    }
+    File f = SD_MMC.open("/WATCH/bin/categories.txt", FILE_READ);
+    if (!f) return;
+    g_cat_file_present = true;
+    String line;
+    while (f.available() && g_cat_count < MAX_CAT_ENTRIES) {
+        line = f.readStringUntil('\n');
+        line = cat_trim(line);
+        if (line.length() == 0 || line[0] == '#') continue;
+        int eq = line.indexOf('=');
+        if (eq <= 0) continue;
+        String nm = cat_trim(line.substring(0, eq));
+        String cat = cat_trim(line.substring(eq + 1));
+        if (!nm.length() || !cat.length()) continue;
+        g_cat[g_cat_count].name     = nm;
+        g_cat[g_cat_count].category = cat;
+        g_cat_count++;
+    }
+    f.close();
+    USBSerial.printf("[cat] parsed %d category entries\n", g_cat_count);
+}
 
 // ---- back-to-launcher recovery --------------------------------------------
 // Anchors the bootloader on the partition we're currently running from
@@ -1708,6 +1743,29 @@ static void add_app_tile(lv_obj_t *parent, int idx, bool isFav) {
     lv_obj_add_event_cb(pill, list_event_cb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)idx);
 }
 
+// ---- v6.4 category section header (bigger than a divider) -----------------
+static void add_section_header(lv_obj_t *parent, const char *text, uint32_t color) {
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LV_PCT(100), 28);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *lbl = lv_label_create(row);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(color), 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_letter_space(lbl, 2, 0);
+    lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 8, 4);
+
+    lv_obj_t *line = lv_obj_create(row);
+    lv_obj_remove_style_all(line);
+    lv_obj_set_size(line, LV_PCT(55), 1);
+    lv_obj_align(line, LV_ALIGN_RIGHT_MID, -8, 4);
+    lv_obj_set_style_bg_color(line, lv_color_hex(0x1E1E1E), 0);
+    lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
+}
+
 static void populate_app_list() {
     if (!g_list_widget) return;
     lv_obj_clean(g_list_widget);
@@ -1740,23 +1798,75 @@ static void populate_app_list() {
         return;
     }
 
-    int order[MAX_APPS]; compute_order(order);
-    // Emit favourites first.  Once we've finished the favs run we drop in
-    // a single full-width divider (LV_PCT(100) row -- forces a flex break)
-    // and then the remaining apps follow.
-    bool divider_emitted = false;
-    int  emitted_favs    = 0;
-    for (int k = 0; k < g_app_count; k++) {
-        int  i     = order[k];
-        bool isFav = favs_contains(g_apps[i].name);
-        if (!isFav && g_fav_count > 0 && !divider_emitted) {
-            add_grid_divider(g_list_widget);
-            divider_emitted = true;
-        }
-        if (isFav) emitted_favs++;
-        add_app_tile(g_list_widget, i, isFav);
+    // ---- Favourites first (unchanged) --------------------------------------
+    bool any_favs = false;
+    for (int j = 0; j < g_app_count; j++) {
+        if (favs_contains(g_apps[j].name)) { any_favs = true; break; }
     }
-    (void)emitted_favs; // currently informational only
+    if (any_favs) {
+        add_section_header(g_list_widget, "FAVOURITES", 0xFFB300);
+        for (int i = 0; i < g_fav_count; i++) {
+            for (int j = 0; j < g_app_count; j++) {
+                if (g_apps[j].name == g_favs[i]) {
+                    add_app_tile(g_list_widget, j, true);
+                    break;
+                }
+            }
+        }
+    }
+
+    // ---- v6.3 fallback path: no categories.txt -> flat rest of the list ----
+    if (!g_cat_file_present) {
+        if (any_favs) add_grid_divider(g_list_widget);
+        for (int j = 0; j < g_app_count; j++) {
+            if (favs_contains(g_apps[j].name)) continue;
+            add_app_tile(g_list_widget, j, false);
+        }
+        return;
+    }
+
+    // ---- v6.4 bucketed path -----------------------------------------------
+    // Collect unique category names, alphabetically, keeping "Other" last.
+    String cats[MAX_CAT_ENTRIES + 1];
+    int    ncats = 0;
+    for (int j = 0; j < g_app_count; j++) {
+        if (favs_contains(g_apps[j].name)) continue;
+        String c = cat_lookup(g_apps[j].name);
+        bool dup = false;
+        for (int k = 0; k < ncats; k++) if (cats[k] == c) { dup = true; break; }
+        if (!dup) cats[ncats++] = c;
+    }
+    // simple alpha sort with "Other" forced to the end
+    for (int a = 0; a < ncats - 1; a++) {
+        for (int b = a + 1; b < ncats; b++) {
+            bool aIsOther = cats[a].equalsIgnoreCase("Other");
+            bool bIsOther = cats[b].equalsIgnoreCase("Other");
+            bool swap = false;
+            if (aIsOther && !bIsOther) swap = true;
+            else if (!aIsOther && !bIsOther && cats[a].compareTo(cats[b]) > 0) swap = true;
+            if (swap) { String t = cats[a]; cats[a] = cats[b]; cats[b] = t; }
+        }
+    }
+
+    for (int c = 0; c < ncats; c++) {
+        // Section header (uppercase for style parity with FAVOURITES)
+        String head = cats[c]; head.toUpperCase();
+        add_section_header(g_list_widget, head.c_str(), 0x00E5FF);
+        // Emit apps in this category, alphabetically by name.
+        int idx[MAX_APPS]; int n = 0;
+        for (int j = 0; j < g_app_count; j++) {
+            if (favs_contains(g_apps[j].name)) continue;
+            if (cat_lookup(g_apps[j].name).equalsIgnoreCase(cats[c])) idx[n++] = j;
+        }
+        for (int a = 0; a < n - 1; a++) {
+            for (int b = a + 1; b < n; b++) {
+                if (g_apps[idx[a]].name.compareTo(g_apps[idx[b]].name) > 0) {
+                    int t = idx[a]; idx[a] = idx[b]; idx[b] = t;
+                }
+            }
+        }
+        for (int k = 0; k < n; k++) add_app_tile(g_list_widget, idx[k], false);
+    }
 }
 
 static void build_screen_apps() {
@@ -1829,7 +1939,225 @@ static void build_screen_apps() {
 
     // Footer hint
     lv_obj_t *foot = lv_label_create(s);
-    lv_label_set_text(foot, LV_SYMBOL_LEFT "  face   ·   battery  " LV_SYMBOL_RIGHT);
+    lv_label_set_text(foot, LV_SYMBOL_LEFT "  face   ·   settings  " LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_color(foot, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_text_font(foot, &lv_font_montserrat_12, 0);
+    lv_obj_align(foot, LV_ALIGN_BOTTOM_MID, 0, -10);
+}
+
+// ============================================================================
+//  v6.4  SETTINGS SCREEN  --  storage summary + wallpaper picker.
+//  ----------------------------------------------------------------------------
+//  Swipe order:  FACE  <->  APPS  <->  SETTINGS  <->  BATTERY.
+//    * Top row: "Settings" title + "wallpaper + storage" subtitle.
+//    * Two summary cards side by side:  bin (N apps)  and  PHOTOS (N wp).
+//    * "now: <filename>" line so the current wallpaper is unambiguous.
+//    * Scrollable 2-column grid of wallpaper tiles.  Tapping a tile
+//      loads that wallpaper immediately, persists it via save_wp_idx(),
+//      and re-renders the grid so the star badge follows the selection.
+//    * Footer swipe hint.
+//  The picker writes the exact same NVS key ("wp_idx") that the old
+//  long-press-on-face path used, so any app that reads it stays in sync
+//  automatically.  No new preferences namespace, no new API.
+// ============================================================================
+static lv_obj_t *settings_wp_grid = nullptr;
+static void settings_rebuild_wp_grid();      // fwd
+
+#define WP_TILE_W        168
+#define WP_TILE_H        96
+#define WP_TILE_RADIUS   14
+#define WP_TILE_GAP      12
+
+static void settings_wp_tile_cb(lv_event_t *e) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;   // post-swipe guard
+    int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= g_photo_count) return;
+    if (idx == g_photo_idx) return;   // no-op tap on current
+    g_photo_idx = idx;
+    refresh_wallpaper();
+    save_wp_idx();
+    // Rebuild picker so the gold border + star badge follow the choice.
+    // Cheaper than diffing which tiles need re-styling.
+    settings_rebuild_wp_grid();
+}
+
+// Extract "sunset" from "/WATCH/PHOTOS/sunset.bin"
+static String wp_display_name(int idx) {
+    if (idx < 0 || idx >= g_photo_count) return String("");
+    String p = g_photos[idx];
+    int slash = p.lastIndexOf('/');
+    String n = (slash >= 0) ? p.substring(slash + 1) : p;
+    int dot = n.lastIndexOf('.');
+    if (dot > 0) n = n.substring(0, dot);
+    return n;
+}
+
+static void add_wp_tile(lv_obj_t *parent, int idx) {
+    bool isCur = (idx == g_photo_idx);
+    lv_obj_t *tile = lv_obj_create(parent);
+    lv_obj_remove_style_all(tile);
+    lv_obj_set_size(tile, WP_TILE_W, WP_TILE_H);
+    lv_obj_set_style_bg_color(tile, lv_color_hex(isCur ? 0x1A1408 : 0x0E0E0E), 0);
+    lv_obj_set_style_bg_opa(tile, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(tile, WP_TILE_RADIUS, 0);
+    lv_obj_set_style_border_color(tile, lv_color_hex(isCur ? 0xFFB300 : 0x1C1C1C), 0);
+    lv_obj_set_style_border_width(tile, isCur ? 2 : 1, 0);
+    lv_obj_set_style_pad_all(tile, 10, 0);
+    lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(tile, lv_color_hex(isCur ? 0x2A1E10 : 0x1A1A1A), LV_STATE_PRESSED);
+    lv_obj_set_style_transform_zoom(tile, 250, LV_STATE_PRESSED);
+
+    // Left glyph -- picture symbol
+    lv_obj_t *ic = lv_label_create(tile);
+    lv_label_set_text(ic, LV_SYMBOL_IMAGE);
+    lv_obj_set_style_text_color(ic, lv_color_hex(isCur ? 0xFFD060 : 0x00E5FF), 0);
+    lv_obj_set_style_text_font(ic, &lv_font_montserrat_22, 0);
+    lv_obj_align(ic, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    // Name label
+    lv_obj_t *nm = lv_label_create(tile);
+    lv_label_set_text(nm, wp_display_name(idx).c_str());
+    lv_obj_set_style_text_color(nm, lv_color_hex(isCur ? 0xFFD060 : 0xFFFFFF), 0);
+    lv_obj_set_style_text_font(nm, &lv_font_montserrat_16, 0);
+    lv_obj_set_width(nm, WP_TILE_W - 24);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+    lv_obj_align(nm, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    if (isCur) {
+        lv_obj_t *star = lv_label_create(tile);
+        lv_label_set_text(star, LV_SYMBOL_OK);
+        lv_obj_set_style_text_color(star, lv_color_hex(0xFFB300), 0);
+        lv_obj_set_style_text_font(star, &lv_font_montserrat_16, 0);
+        lv_obj_align(star, LV_ALIGN_TOP_RIGHT, 0, 0);
+    }
+
+    lv_obj_add_flag(tile, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(tile, settings_wp_tile_cb, LV_EVENT_CLICKED,
+                        (void*)(intptr_t)idx);
+}
+
+static void settings_rebuild_wp_grid() {
+    if (!settings_wp_grid) return;
+    lv_obj_clean(settings_wp_grid);
+
+    if (!g_photo_count) {
+        lv_obj_t *empty = lv_label_create(settings_wp_grid);
+        lv_label_set_text(empty,
+            "No wallpapers on card.\nDrop .bin files into /WATCH/PHOTOS/");
+        lv_obj_set_style_text_align(empty, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_style_text_color(empty, lv_color_hex(0x666666), 0);
+        lv_obj_set_style_text_font(empty, &lv_font_montserrat_14, 0);
+        lv_obj_align(empty, LV_ALIGN_CENTER, 0, 0);
+        return;
+    }
+    for (int i = 0; i < g_photo_count; i++) add_wp_tile(settings_wp_grid, i);
+}
+
+static void build_screen_settings() {
+    lv_obj_t *s = lv_obj_create(NULL);
+    screens[SCREEN_SETTINGS] = s;
+    lv_obj_set_style_bg_color(s, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+
+    // Title
+    lv_obj_t *h1 = lv_label_create(s);
+    lv_label_set_text(h1, "Settings");
+    lv_obj_set_style_text_color(h1, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(h1, &lv_font_montserrat_28, 0);
+    lv_obj_align(h1, LV_ALIGN_TOP_LEFT, 24, 22);
+
+    lv_obj_t *h2 = lv_label_create(s);
+    lv_label_set_text(h2, "wallpaper + storage");
+    lv_obj_set_style_text_color(h2, lv_color_hex(0x666666), 0);
+    lv_obj_set_style_text_font(h2, &lv_font_montserrat_12, 0);
+    lv_obj_align(h2, LV_ALIGN_TOP_LEFT, 24, 58);
+
+    // ---- Storage summary cards (bin + PHOTOS) ------------------------------
+    lv_obj_t *row = lv_obj_create(s);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_size(row, LCD_WIDTH - 40, 68);
+    lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 84);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(row, 12, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);
+
+    auto make_summary_card = [](lv_obj_t *parent, const char *sym,
+                                const char *primary, const char *secondary,
+                                uint32_t accent) {
+        lv_obj_t *card = lv_obj_create(parent);
+        lv_obj_remove_style_all(card);
+        lv_obj_set_size(card, LV_PCT(48), LV_PCT(100));
+        lv_obj_set_style_bg_color(card, lv_color_hex(0x0E0E0E), 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(card, 14, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(accent), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_pad_all(card, 10, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *ic = lv_label_create(card);
+        lv_label_set_text(ic, sym);
+        lv_obj_set_style_text_color(ic, lv_color_hex(accent), 0);
+        lv_obj_set_style_text_font(ic, &lv_font_montserrat_20, 0);
+        lv_obj_align(ic, LV_ALIGN_TOP_LEFT, 0, 0);
+
+        lv_obj_t *p = lv_label_create(card);
+        lv_label_set_text(p, primary);
+        lv_obj_set_style_text_color(p, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(p, &lv_font_montserrat_16, 0);
+        lv_obj_align(p, LV_ALIGN_TOP_RIGHT, 0, 0);
+
+        lv_obj_t *sub = lv_label_create(card);
+        lv_label_set_text(sub, secondary);
+        lv_obj_set_style_text_color(sub, lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_font(sub, &lv_font_montserrat_12, 0);
+        lv_obj_align(sub, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    };
+    char binPrim[32], binSec[32], phPrim[32], phSec[32];
+    snprintf(binPrim, sizeof(binPrim), "%d", g_app_count);
+    snprintf(binSec,  sizeof(binSec),  "apps");
+    snprintf(phPrim,  sizeof(phPrim),  "%d", g_photo_count);
+    snprintf(phSec,   sizeof(phSec),   "wallpapers");
+    make_summary_card(row, LV_SYMBOL_LIST,  binPrim, binSec, 0x00E5FF);
+    make_summary_card(row, LV_SYMBOL_IMAGE, phPrim,  phSec,  0xFFB300);
+
+    // "now: <name>" caption
+    lv_obj_t *now = lv_label_create(s);
+    String nowTxt = String("now: ") + (g_photo_count ? wp_display_name(g_photo_idx) : String("(none)"));
+    lv_label_set_text(now, nowTxt.c_str());
+    lv_obj_set_style_text_color(now, lv_color_hex(0xBBBBBB), 0);
+    lv_obj_set_style_text_font(now, &lv_font_montserrat_14, 0);
+    lv_obj_align(now, LV_ALIGN_TOP_LEFT, 24, 164);
+
+    // ---- Wallpaper picker grid --------------------------------------------
+    settings_wp_grid = lv_obj_create(s);
+    lv_obj_set_size(settings_wp_grid, LCD_WIDTH - 30, LCD_HEIGHT - 210);
+    lv_obj_align(settings_wp_grid, LV_ALIGN_TOP_MID, 0, 194);
+    lv_obj_set_style_bg_opa(settings_wp_grid, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(settings_wp_grid, 0, 0);
+    lv_obj_set_style_pad_all(settings_wp_grid, 6, 0);
+    lv_obj_set_style_pad_row(settings_wp_grid, WP_TILE_GAP, 0);
+    lv_obj_set_style_pad_column(settings_wp_grid, WP_TILE_GAP, 0);
+    lv_obj_set_flex_flow(settings_wp_grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(settings_wp_grid,
+                          LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+    lv_obj_set_scroll_dir(settings_wp_grid, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(settings_wp_grid, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_style_bg_color(settings_wp_grid, lv_color_hex(0xFFB300), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(settings_wp_grid, 120, LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(settings_wp_grid, 2, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(settings_wp_grid, 3, LV_PART_SCROLLBAR);
+
+    settings_rebuild_wp_grid();
+
+    // Footer swipe hint
+    lv_obj_t *foot = lv_label_create(s);
+    lv_label_set_text(foot, LV_SYMBOL_LEFT "  apps   ·   battery  " LV_SYMBOL_RIGHT);
     lv_obj_set_style_text_color(foot, lv_color_hex(0x555555), 0);
     lv_obj_set_style_text_font(foot, &lv_font_montserrat_12, 0);
     lv_obj_align(foot, LV_ALIGN_BOTTOM_MID, 0, -10);
@@ -2204,7 +2532,7 @@ void setup() {
     bool from_deep_sleep =
         (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1);
 
-    USBSerial.printf("\n=== LauncherOS v6.3 (battery pass + pill app list) ===  %s\n",
+    USBSerial.printf("\n=== LauncherOS v6.4 (settings + wallpaper picker + categorised apps) ===  %s\n",
                      from_deep_sleep ? "(wake from deep sleep)" : "(cold boot)");
     // v6.0: re-anchor the bootloader on ourselves so any loaded app that
     // reboots (intentionally, via crash, or via power-cycle) comes back
@@ -2301,6 +2629,7 @@ void setup() {
             wifi_connect_and_sync();
         }
         splash_progress(82, "scanning apps");    scan_apps();
+        splash_progress(88, "categories");       load_categories_txt();
         splash_progress(92, "scanning photos");  scan_photos();
         // Restore the last-used wallpaper index so the watch face -- and
         // any app that reads "wp_idx" from the same Preferences namespace
@@ -2325,6 +2654,7 @@ void setup() {
     // watch" rather than a hard cut.
     build_screen_face();
     build_screen_apps();
+    build_screen_settings();
     build_screen_battery();
     current_screen = SCREEN_FACE;
     lv_scr_load_anim(screens[SCREEN_FACE], LV_SCR_LOAD_ANIM_FADE_ON, 260, 0, false);
