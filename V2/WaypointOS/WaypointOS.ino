@@ -39,6 +39,289 @@
 #include <esp_heap_caps.h>
 #include <esp_bt.h>
 
+// =============================================================================
+//  Forward-declare EVERY user struct/enum here, before any inlined helper code.
+//  Arduino auto-generates function prototypes and inserts them just before the
+//  FIRST function definition in the sketch. Because puff.h (inlined just below)
+//  defines functions, that insertion point is now near the top -- so these
+//  forward declarations MUST precede it, or prototypes that mention these types
+//  (TH(), tile_free(FMapTile&), wp_create_menu_item(const MenuItem&), ...) fail
+//  to compile with "does not name a type".
+// =============================================================================
+struct ThemePalette;
+struct FVec2;
+struct FMapObj;
+struct FMapPOI;
+struct FMapMeta;
+struct FMapZoom;
+struct FMapStyle;
+struct FMapTile;
+struct MVTDecodeCtx;
+struct HudRect;
+struct MenuItem;
+enum HudBtn : int;
+
+// ===== BEGIN inlined puff.h (gzip/DEFLATE inflater) =====
+// =============================================================================
+//  puff.h -- self-contained DEFLATE/gzip inflater for WaypointOS
+//
+//  Based on puff.c by Mark Adler (public domain, part of zlib/contrib).
+//  Trimmed to a single header and wrapped with wp_gunzip() so the firmware can
+//  inflate gzip-compressed MVT tiles from SD with NO external zlib/miniz
+//  dependency. Slow-but-correct reference inflate; fine for one 5-50 KB tile.
+//
+//  Usage:
+//     long out_len = dest_cap;
+//     unsigned long in_len = src_len;
+//     int rc = wp_gunzip(dest, &out_len, src, &in_len);  // rc==0 on success
+//
+//  puff() itself decodes a raw DEFLATE stream; wp_gunzip() strips the gzip
+//  (RFC 1952) header/trailer first.
+// =============================================================================
+
+#include <setjmp.h>
+#include <string.h>
+
+#define PUFF_MAXBITS   15
+#define PUFF_MAXLCODES 286
+#define PUFF_MAXDCODES 30
+#define PUFF_MAXCODES  (PUFF_MAXLCODES + PUFF_MAXDCODES)
+#define PUFF_FIXLCODES 288
+
+struct puff_state {
+    unsigned char *out;
+    unsigned long outlen;
+    unsigned long outcnt;
+    const unsigned char *in;
+    unsigned long inlen;
+    unsigned long incnt;
+    int bitbuf;
+    int bitcnt;
+    jmp_buf env;
+};
+
+struct puff_huffman { short *count; short *symbol; };
+
+static int puff_bits(struct puff_state *s, int need) {
+    long val = s->bitbuf;
+    while (s->bitcnt < need) {
+        if (s->incnt == s->inlen) longjmp(s->env, 1);
+        val |= (long)(s->in[s->incnt++]) << s->bitcnt;
+        s->bitcnt += 8;
+    }
+    s->bitbuf = (int)(val >> need);
+    s->bitcnt -= need;
+    return (int)(val & ((1L << need) - 1));
+}
+
+static int puff_stored(struct puff_state *s) {
+    unsigned len;
+    s->bitbuf = 0; s->bitcnt = 0;
+    if (s->incnt + 4 > s->inlen) return 2;
+    len = s->in[s->incnt++];
+    len |= s->in[s->incnt++] << 8;
+    if (s->in[s->incnt++] != (~len & 0xff) ||
+        s->in[s->incnt++] != ((~len >> 8) & 0xff)) return -2;
+    if (s->incnt + len > s->inlen) return 2;
+    while (len--) {
+        if (s->outcnt < s->outlen) s->out[s->outcnt] = s->in[s->incnt];
+        else if (s->out != 0) return 1;
+        s->outcnt++; s->incnt++;
+    }
+    return 0;
+}
+
+static int puff_decode(struct puff_state *s, const struct puff_huffman *h) {
+    int len, code = 0, first = 0, index = 0;
+    short *next = h->count + 1;
+    while (1) {
+        for (len = 1; len <= PUFF_MAXBITS; len++) {
+            code |= puff_bits(s, 1);
+            int count = *next++;
+            if (code - count < first) return h->symbol[index + (code - first)];
+            index += count; first += count; first <<= 1; code <<= 1;
+        }
+        return -10;
+    }
+}
+
+static int puff_construct(struct puff_huffman *h, const short *length, int n) {
+    int symbol, len, left;
+    short offs[PUFF_MAXBITS + 1];
+    for (len = 0; len <= PUFF_MAXBITS; len++) h->count[len] = 0;
+    for (symbol = 0; symbol < n; symbol++) h->count[length[symbol]]++;
+    if (h->count[0] == n) return 0;
+    left = 1;
+    for (len = 1; len <= PUFF_MAXBITS; len++) {
+        left <<= 1;
+        left -= h->count[len];
+        if (left < 0) return left;
+    }
+    offs[1] = 0;
+    for (len = 1; len < PUFF_MAXBITS; len++)
+        offs[len + 1] = offs[len] + h->count[len];
+    for (symbol = 0; symbol < n; symbol++)
+        if (length[symbol] != 0) h->symbol[offs[length[symbol]]++] = symbol;
+    return left;
+}
+
+static int puff_codes(struct puff_state *s,
+                      const struct puff_huffman *lencode,
+                      const struct puff_huffman *distcode) {
+    static const short lens[29] = {
+        3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+    static const short lext[29] = {
+        0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+    static const short dists[30] = {
+        1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,
+        1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+    static const short dext[30] = {
+        0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+    int symbol, len;
+    unsigned long dist;
+    do {
+        symbol = puff_decode(s, lencode);
+        if (symbol < 0) return symbol;
+        if (symbol < 256) {
+            if (s->outcnt < s->outlen) s->out[s->outcnt] = (unsigned char)symbol;
+            else if (s->out != 0) return 1;
+            s->outcnt++;
+        } else if (symbol > 256) {
+            symbol -= 257;
+            if (symbol >= 29) return -10;
+            len = lens[symbol] + puff_bits(s, lext[symbol]);
+            symbol = puff_decode(s, distcode);
+            if (symbol < 0) return symbol;
+            dist = dists[symbol] + puff_bits(s, dext[symbol]);
+            if (s->out != 0 && dist > s->outcnt) return -11;
+            while (len--) {
+                if (s->outcnt < s->outlen) {
+                    if (s->out != 0)
+                        s->out[s->outcnt] = s->out[s->outcnt - dist];
+                } else if (s->out != 0) return 1;
+                s->outcnt++;
+            }
+        }
+    } while (symbol != 256);
+    return 0;
+}
+
+static int puff_fixed(struct puff_state *s) {
+    static int virgin = 1;
+    static short lencnt[PUFF_MAXBITS + 1], lensym[PUFF_FIXLCODES];
+    static short distcnt[PUFF_MAXBITS + 1], distsym[PUFF_MAXDCODES];
+    static struct puff_huffman lencode, distcode;
+    if (virgin) {
+        int symbol; short lengths[PUFF_FIXLCODES];
+        lencode.count = lencnt; lencode.symbol = lensym;
+        distcode.count = distcnt; distcode.symbol = distsym;
+        for (symbol = 0; symbol < 144; symbol++) lengths[symbol] = 8;
+        for (; symbol < 256; symbol++) lengths[symbol] = 9;
+        for (; symbol < 280; symbol++) lengths[symbol] = 7;
+        for (; symbol < PUFF_FIXLCODES; symbol++) lengths[symbol] = 8;
+        puff_construct(&lencode, lengths, PUFF_FIXLCODES);
+        for (symbol = 0; symbol < PUFF_MAXDCODES; symbol++) lengths[symbol] = 5;
+        puff_construct(&distcode, lengths, PUFF_MAXDCODES);
+        virgin = 0;
+    }
+    return puff_codes(s, &lencode, &distcode);
+}
+
+static int puff_dynamic(struct puff_state *s) {
+    int nlen, ndist, ncode, index, err;
+    short lengths[PUFF_MAXCODES];
+    short lencnt[PUFF_MAXBITS + 1], lensym[PUFF_MAXLCODES];
+    short distcnt[PUFF_MAXBITS + 1], distsym[PUFF_MAXDCODES];
+    struct puff_huffman lencode, distcode;
+    static const short order[19] =
+        {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+    lencode.count = lencnt; lencode.symbol = lensym;
+    distcode.count = distcnt; distcode.symbol = distsym;
+    nlen = puff_bits(s, 5) + 257;
+    ndist = puff_bits(s, 5) + 1;
+    ncode = puff_bits(s, 4) + 4;
+    if (nlen > PUFF_MAXLCODES || ndist > PUFF_MAXDCODES) return -3;
+    for (index = 0; index < ncode; index++) lengths[order[index]] = puff_bits(s, 3);
+    for (; index < 19; index++) lengths[order[index]] = 0;
+    err = puff_construct(&lencode, lengths, 19);
+    if (err != 0) return -4;
+    index = 0;
+    while (index < nlen + ndist) {
+        int symbol = puff_decode(s, &lencode);
+        if (symbol < 0) return symbol;
+        if (symbol < 16) lengths[index++] = symbol;
+        else {
+            int len = 0;
+            if (symbol == 16) {
+                if (index == 0) return -5;
+                len = lengths[index - 1];
+                symbol = 3 + puff_bits(s, 2);
+            } else if (symbol == 17) symbol = 3 + puff_bits(s, 3);
+            else symbol = 11 + puff_bits(s, 7);
+            if (index + symbol > nlen + ndist) return -6;
+            while (symbol--) lengths[index++] = len;
+        }
+    }
+    if (lengths[256] == 0) return -9;
+    err = puff_construct(&lencode, lengths, nlen);
+    if (err && (err < 0 || nlen != lencode.count[0] + lencode.count[1])) return -7;
+    err = puff_construct(&distcode, lengths + nlen, ndist);
+    if (err && (err < 0 || ndist != distcode.count[0] + distcode.count[1])) return -8;
+    return puff_codes(s, &lencode, &distcode);
+}
+
+// Inflate a raw DEFLATE stream. *destlen in=capacity, out=bytes written.
+static int puff(unsigned char *dest, unsigned long *destlen,
+                const unsigned char *source, unsigned long *sourcelen) {
+    struct puff_state s;
+    int last, type, err;
+    s.out = dest; s.outlen = *destlen; s.outcnt = 0;
+    s.in = source; s.inlen = *sourcelen; s.incnt = 0;
+    s.bitbuf = 0; s.bitcnt = 0;
+    if (setjmp(s.env) != 0) err = 2;
+    else {
+        do {
+            last = puff_bits(&s, 1);
+            type = puff_bits(&s, 2);
+            err = type == 0 ? puff_stored(&s) :
+                  type == 1 ? puff_fixed(&s) :
+                  type == 2 ? puff_dynamic(&s) : -1;
+            if (err != 0) break;
+        } while (!last);
+    }
+    if (err <= 0) { *destlen = s.outcnt; *sourcelen = s.incnt; }
+    return err;
+}
+
+// -----------------------------------------------------------------------------
+// wp_gunzip: strip the gzip (RFC 1952) header/trailer and inflate the payload.
+// Returns 0 on success. *destlen in=capacity, out=decompressed size.
+// -----------------------------------------------------------------------------
+static int wp_gunzip(unsigned char *dest, unsigned long *destlen,
+                     const unsigned char *src, unsigned long *srclen) {
+    unsigned long n = *srclen;
+    if (n < 18) return -100;                 // too small to be gzip
+    if (src[0] != 0x1F || src[1] != 0x8B) return -101;
+    if (src[2] != 8) return -102;            // not DEFLATE
+    unsigned char flg = src[3];
+    unsigned long pos = 10;                  // fixed header
+    if (flg & 0x04) {                        // FEXTRA
+        if (pos + 2 > n) return -103;
+        unsigned xlen = src[pos] | (src[pos + 1] << 8);
+        pos += 2 + xlen;
+    }
+    if (flg & 0x08) { while (pos < n && src[pos]) pos++; pos++; }  // FNAME
+    if (flg & 0x10) { while (pos < n && src[pos]) pos++; pos++; }  // FCOMMENT
+    if (flg & 0x02) pos += 2;                // FHCRC
+    if (pos + 8 > n) return -104;            // must leave room for CRC+ISIZE
+    unsigned long deflate_len = n - pos - 8;
+    unsigned long dl = deflate_len;
+    int rc = puff(dest, destlen, src + pos, &dl);
+    return rc;                               // 0 = ok, 1 = out buffer too small
+}
+// ===== END inlined puff.h =====
+
+
 
 // =============================================================================
 //  MVT rendering diagnostics.
@@ -290,6 +573,164 @@ static const ThemePalette THEMES[] = {
 static uint8_t g_theme_id = THEME_FUSION_DARK;
 static inline const ThemePalette &TH() { return THEMES[g_theme_id]; }
 
+// Track B -- shared LVGL style system. Push the active theme's colours into the
+// central styles used by every menu/card. Call after any theme change.
+// ===== BEGIN inlined styles.h (shared LVGL style system) =====
+// =============================================================================
+//  styles.h -- WaypointOS shared LVGL style system (Track B)
+//
+//  One place for the look of every menu/card/button so screens stop hand-rolling
+//  their own colours, radii and borders. Screens build UI from these styles and
+//  from wp_create_menu_item(), giving a consistent look + press feedback.
+//
+//  Self-contained: depends only on lvgl.h. Themes are RGB565 (Arduino_GFX), so
+//  wp_565() converts to LVGL's lv_color_t. Call wp_styles_init() once, then
+//  wp_styles_set_palette(...) whenever the active theme changes.
+//
+//  Shared styles:
+//     wp_style_menu_button   - tappable tile (tools grid)
+//     wp_style_menu_card     - larger content card (library, POI)
+//     wp_style_hud_button    - compact on-map control
+//     wp_style_pressed       - shared pressed/active feedback (add to any btn)
+//     wp_style_label_title / _body / _dim
+// =============================================================================
+
+
+// RGB565 (Arduino_GFX theme colour) -> LVGL lv_color_t.
+static inline lv_color_t wp_565(uint16_t c) {
+    uint8_t r = (uint8_t)(((c >> 11) & 0x1F) * 255 / 31);
+    uint8_t g = (uint8_t)(((c >> 5)  & 0x3F) * 255 / 63);
+    uint8_t b = (uint8_t)(( c        & 0x1F) * 255 / 31);
+    return lv_color_make(r, g, b);
+}
+
+// Shared style objects (single instance; colours updated on theme change).
+static lv_style_t wp_style_menu_button;
+static lv_style_t wp_style_menu_card;
+static lv_style_t wp_style_hud_button;
+static lv_style_t wp_style_pressed;
+static lv_style_t wp_style_label_title;
+static lv_style_t wp_style_label_body;
+static lv_style_t wp_style_label_dim;
+static bool       wp_styles_ready = false;
+
+// Cached palette (RGB565) so labels/icons can match without a global dependency.
+static uint16_t   wp_pal_text = 0xFFFF, wp_pal_dim = 0x8410,
+                  wp_pal_accent = 0x07FF, wp_pal_warn = 0xFD20;
+
+static void wp_styles_init() {
+    if (wp_styles_ready) return;
+    wp_styles_ready = true;
+
+    lv_style_init(&wp_style_menu_button);
+    lv_style_set_radius(&wp_style_menu_button, 14);
+    lv_style_set_border_width(&wp_style_menu_button, 1);
+    lv_style_set_pad_all(&wp_style_menu_button, 6);
+    lv_style_set_shadow_width(&wp_style_menu_button, 0);
+
+    lv_style_init(&wp_style_menu_card);
+    lv_style_set_radius(&wp_style_menu_card, 16);
+    lv_style_set_border_width(&wp_style_menu_card, 1);
+    lv_style_set_pad_all(&wp_style_menu_card, 14);
+
+    lv_style_init(&wp_style_hud_button);
+    lv_style_set_radius(&wp_style_hud_button, 20);
+    lv_style_set_border_width(&wp_style_hud_button, 1);
+    lv_style_set_pad_all(&wp_style_hud_button, 4);
+
+    // Shared pressed/active feedback: subtle scale + brighter border.
+    lv_style_init(&wp_style_pressed);
+    lv_style_set_transform_width(&wp_style_pressed, -2);
+    lv_style_set_transform_height(&wp_style_pressed, -2);
+
+    lv_style_init(&wp_style_label_title);
+    lv_style_set_text_font(&wp_style_label_title, &lv_font_montserrat_14);
+
+    lv_style_init(&wp_style_label_body);
+    lv_style_set_text_font(&wp_style_label_body, &lv_font_montserrat_14);
+
+    lv_style_init(&wp_style_label_dim);
+    lv_style_set_text_font(&wp_style_label_dim, &lv_font_montserrat_12);
+    lv_style_set_text_letter_space(&wp_style_label_dim, 2);
+}
+
+// Push the active theme's colours into the shared styles (RGB565 in).
+static void wp_styles_set_palette(uint16_t card_bg, uint16_t border,
+                                  uint16_t text, uint16_t dim,
+                                  uint16_t accent, uint16_t warn) {
+    wp_styles_init();
+    wp_pal_text = text; wp_pal_dim = dim; wp_pal_accent = accent; wp_pal_warn = warn;
+
+    lv_color_t c_card = wp_565(card_bg);
+    lv_color_t c_bord = wp_565(border);
+    lv_color_t c_acc  = wp_565(accent);
+
+    lv_style_set_bg_color(&wp_style_menu_button, c_card);
+    lv_style_set_bg_opa(&wp_style_menu_button, LV_OPA_COVER);
+    lv_style_set_border_color(&wp_style_menu_button, c_bord);
+
+    lv_style_set_bg_color(&wp_style_menu_card, c_card);
+    lv_style_set_bg_opa(&wp_style_menu_card, LV_OPA_COVER);
+    lv_style_set_border_color(&wp_style_menu_card, c_acc);
+
+    lv_style_set_bg_color(&wp_style_hud_button, c_card);
+    lv_style_set_bg_opa(&wp_style_hud_button, LV_OPA_80);
+    lv_style_set_border_color(&wp_style_hud_button, c_bord);
+
+    lv_style_set_border_color(&wp_style_pressed, c_acc);
+    lv_style_set_border_width(&wp_style_pressed, 2);
+
+    lv_style_set_text_color(&wp_style_label_title, wp_565(text));
+    lv_style_set_text_color(&wp_style_label_body,  wp_565(text));
+    lv_style_set_text_color(&wp_style_label_dim,   wp_565(dim));
+}
+
+// -----------------------------------------------------------------------------
+//  MenuItem abstraction -- declarative {icon, label, callback} -> one builder.
+//  icon is an LVGL symbol glyph string (LV_SYMBOL_*) or nullptr.
+// -----------------------------------------------------------------------------
+struct MenuItem {
+    const char   *icon;    // LV_SYMBOL_* glyph or nullptr
+    const char   *label;
+    lv_event_cb_t cb;      // CLICKED handler
+    void         *user;    // user_data passed to cb (freed by caller if heap)
+};
+
+// Build one consistent menu tile: icon on top, label below, shared style +
+// pressed feedback. Returns the button so callers can tweak width in a flex row.
+static lv_obj_t *wp_create_menu_item(lv_obj_t *parent, const MenuItem &it) {
+    wp_styles_init();
+    lv_obj_t *b = lv_btn_create(parent);
+    lv_obj_add_style(b, &wp_style_menu_button, 0);
+    lv_obj_add_style(b, &wp_style_pressed, LV_STATE_PRESSED);
+    lv_obj_set_size(b, 108, 76);
+    lv_obj_set_flex_flow(b, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(b, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    if (it.icon) {
+        lv_obj_t *ic = lv_label_create(b);
+        lv_label_set_text(ic, it.icon);
+        lv_obj_set_style_text_color(ic, wp_565(wp_pal_accent), 0);
+        lv_obj_set_style_text_font(ic, &lv_font_montserrat_14, 0);
+    }
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, it.label);
+    lv_obj_add_style(l, &wp_style_label_body, 0);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(l, lv_pct(100));
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
+
+    if (it.cb) lv_obj_add_event_cb(b, it.cb, LV_EVENT_CLICKED, it.user);
+    return b;
+}
+// ===== END inlined styles.h =====
+
+static void wp_sync_styles() {
+    const ThemePalette &t = TH();
+    wp_styles_set_palette(t.chrome_bg, t.chrome_border, t.text, t.text_dim,
+                          t.accent, t.warn);
+}
+
 // =============================================================================
 //  Layers
 // =============================================================================
@@ -472,19 +913,36 @@ struct FMapStyle {
     uint8_t z_min;
 };
 
+// Per-tile load status (Track A: per-tile status instead of silent blanks).
+enum TileStatus : uint8_t {
+    TILE_ST_EMPTY = 0,   // slot never used
+    TILE_ST_OK,          // decoded, >=1 object
+    TILE_ST_NODATA,      // decoded ok but 0 objects (genuinely empty tile)
+    TILE_ST_MISSING,     // no file on disk
+    TILE_ST_GZIP,        // gzip stream that failed to inflate
+    TILE_ST_OOM,         // allocation failed
+    TILE_ST_BADSIZE,     // file empty / too large
+    TILE_ST_IOERR        // SD open / short read
+};
+
 // Loaded tile (decoded objects held in RAM/PSRAM). Keyed by (z, x, y).
 struct FMapTile {
     int8_t   z;
     int16_t  tx, ty;
     bool     loaded;
+    uint8_t  status;     // TileStatus
     uint16_t obj_count;
     FMapObj *objs;
     uint32_t last_use_ms;
 };
 
 #define MAX_ZOOMS   8
-#define TILE_CACHE_SLOTS 16   // 3x3 ring + spares at boundary between zoom levels
+#define TILE_CACHE_SLOTS 28   // 3x3 ring + overzoom parents + radius-2 prefetch
 #define MAX_POIS 2048
+// Overzoom: how many parent zoom levels to walk up when a tile is missing.
+#define TILE_OVERZOOM_MAX 5
+// Soft PSRAM budget for decoded tile geometry (bytes). Cache evicts past this.
+#define TILE_CACHE_PSRAM_BUDGET (3u * 1024u * 1024u)
 
 // =============================================================================
 // MVT geometry type constants (per Mapbox Vector Tile spec 2.1)
@@ -609,9 +1067,20 @@ static inline void mvt_tile_topleft_world(int8_t z, int32_t x, int32_t y,
 
 // =============================================================================
 //  Tile cache management (keyed by (z, x, y))
+//  LRU by last_use_ms, with a soft PSRAM byte budget so a big region can't
+//  balloon decoded geometry past what the ESP32-S3 can hold.
 // =============================================================================
+static uint32_t g_cache_bytes = 0;   // approx bytes of decoded geometry held
+
+static uint32_t tile_bytes(const FMapTile &t) {
+    uint32_t b = (uint32_t)t.obj_count * sizeof(FMapObj);
+    for (uint16_t i = 0; i < t.obj_count; i++)
+        b += (uint32_t)t.objs[i].point_count * sizeof(FVec2);
+    return b;
+}
 static void tile_free(FMapTile &t) {
     if (t.objs) {
+        g_cache_bytes -= tile_bytes(t);
         for (uint16_t i=0; i<t.obj_count; i++) {
             if (t.objs[i].points) free(t.objs[i].points);
         }
@@ -620,9 +1089,11 @@ static void tile_free(FMapTile &t) {
     }
     t.obj_count = 0;
     t.loaded = false;
+    t.status = TILE_ST_EMPTY;
 }
 static void cache_reset() {
     for (int i=0; i<TILE_CACHE_SLOTS; i++) tile_free(g_cache[i]);
+    g_cache_bytes = 0;
 }
 static FMapTile *cache_find(int8_t z, int16_t tx, int16_t ty) {
     for (int i=0; i<TILE_CACHE_SLOTS; i++)
@@ -633,7 +1104,19 @@ static FMapTile *cache_find(int8_t z, int16_t tx, int16_t ty) {
         }
     return nullptr;
 }
+// Evict the least-recently-used loaded slot; also trims to the PSRAM budget.
 static FMapTile *cache_evict_slot() {
+    // Enforce byte budget first: drop LRU tiles until under budget (keep >=1 slot).
+    while (g_cache_bytes > TILE_CACHE_PSRAM_BUDGET) {
+        int lru = -1; uint32_t oldest = UINT32_MAX; int loaded = 0;
+        for (int i=0; i<TILE_CACHE_SLOTS; i++) {
+            if (!g_cache[i].loaded) continue;
+            loaded++;
+            if (g_cache[i].last_use_ms < oldest) { oldest = g_cache[i].last_use_ms; lru = i; }
+        }
+        if (loaded <= 1 || lru < 0) break;
+        tile_free(g_cache[lru]);
+    }
     int slot=0; uint32_t oldest=UINT32_MAX;
     for (int i=0; i<TILE_CACHE_SLOTS; i++) {
         if (!g_cache[i].loaded) return &g_cache[i];
@@ -908,17 +1391,33 @@ static uint32_t mvt_decode_layer(const uint8_t *plyr, const uint8_t *lend,
 //  MVT tile loader
 // =============================================================================
 static String mvt_tile_path(int8_t z, int16_t x, int16_t y) {
-    // tilemaker default output: {z}/{x}/{y}.pbf ; some tools write .mvt.
-    // SD_MMC on ESP32 (FATFS) filenames come back in the ORIGINAL case they
-    // were written -- some converters (and Windows) upper-case the extension,
-    // e.g. "608.PBF". We therefore probe all four permutations before giving up.
-    char b[80];
+    // Primary: tilemaker/Planetiler default output {z}/{x}/{y}.pbf ; some tools
+    // write .mvt. SD_MMC (FATFS) returns filenames in ORIGINAL case, and some
+    // converters/Windows upper-case the extension (e.g. "608.PBF"). We also
+    // tolerate flat naming ({z}/{x}-{y}.ext and {z}_{x}_{y}.ext) that a few
+    // exporters emit. Probe the common permutations before giving up.
+    static const char *EXTS[] = { ".pbf", ".PBF", ".mvt", ".MVT" };
+    char b[96];
+    // Layout 1: /z/x/y.ext  (standard)
     snprintf(b, sizeof(b), "/%u/%d/%d", (unsigned)z, (int)x, (int)y);
     String base = g_map_dir_path + String(b);
-    static const char *EXTS[] = { ".pbf", ".PBF", ".mvt", ".MVT" };
     for (unsigned i = 0; i < sizeof(EXTS)/sizeof(EXTS[0]); i++) {
-        String candidate = base + EXTS[i];
-        if (SD_MMC.exists(candidate.c_str())) return candidate;
+        String c = base + EXTS[i];
+        if (SD_MMC.exists(c.c_str())) return c;
+    }
+    // Layout 2: /z/x-y.ext
+    snprintf(b, sizeof(b), "/%u/%d-%d", (unsigned)z, (int)x, (int)y);
+    base = g_map_dir_path + String(b);
+    for (unsigned i = 0; i < sizeof(EXTS)/sizeof(EXTS[0]); i++) {
+        String c = base + EXTS[i];
+        if (SD_MMC.exists(c.c_str())) return c;
+    }
+    // Layout 3: flat /z_x_y.ext
+    snprintf(b, sizeof(b), "/%u_%d_%d", (unsigned)z, (int)x, (int)y);
+    base = g_map_dir_path + String(b);
+    for (unsigned i = 0; i < sizeof(EXTS)/sizeof(EXTS[0]); i++) {
+        String c = base + EXTS[i];
+        if (SD_MMC.exists(c.c_str())) return c;
     }
     return String();
 }
@@ -949,6 +1448,7 @@ static FMapTile *tile_load(int8_t z, int16_t x, int16_t y) {
     FMapTile *slot = cache_evict_slot();
     slot->z = z; slot->tx = x; slot->ty = y;
     slot->loaded = false;
+    slot->status = TILE_ST_EMPTY;
     slot->obj_count = 0; slot->objs = nullptr;
     slot->last_use_ms = millis();
 
@@ -956,36 +1456,55 @@ static FMapTile *tile_load(int8_t z, int16_t x, int16_t y) {
     if (!f) {
         MVT_LOG("[TILE] z=%d x=%d y=%d path='%s' -- SD open FAILED\n",
                 (int)z, (int)x, (int)y, path.c_str());
-        return slot;
+        slot->loaded = true; slot->status = TILE_ST_IOERR; return slot;
     }
     size_t sz = f.size();
     MVT_LOG("[TILE] z=%d x=%d y=%d path='%s' bytes=%u\n",
             (int)z, (int)x, (int)y, path.c_str(), (unsigned)sz);
     if (!sz || sz > 512 * 1024) {
         MVT_LOG("[TILE]   size out of bounds -- ignored\n");
-        f.close(); slot->loaded = true; return slot;
+        f.close(); slot->loaded = true; slot->status = TILE_ST_BADSIZE; return slot;
     }
 
     uint8_t *buf = (uint8_t*)ps_malloc(sz);
     if (!buf) buf = (uint8_t*)malloc(sz);
     if (!buf) {
         MVT_LOG("[TILE]   malloc(%u) FAILED -- skipping\n", (unsigned)sz);
-        f.close(); slot->loaded = true; return slot;
+        f.close(); slot->loaded = true; slot->status = TILE_ST_OOM; return slot;
     }
     size_t got = f.read(buf, sz);
     f.close();
     if (got != sz) {
         MVT_LOG("[TILE]   short read got=%u expected=%u -- skipping\n",
                 (unsigned)got, (unsigned)sz);
-        free(buf); slot->loaded = true; return slot;
+        free(buf); slot->loaded = true; slot->status = TILE_ST_IOERR; return slot;
     }
 
-    // Defensive gzip guard: MVT tiles on the wire are usually gzipped, but on
-    // disk the WaypointOS pipeline expects them UNCOMPRESSED.
+    // Track A -- gzip handling. MBTiles/Planetiler vector tiles are gzip'd
+    // (magic 1F 8B). Inflate in place with the bundled puff() so gzip'd tiles
+    // render instead of being rejected. Uncompressed tiles fall straight through.
     if (sz >= 2 && buf[0] == 0x1F && buf[1] == 0x8B) {
-        MVT_LOG("[TILE]   GZIP detected (1F 8B) -- not supported. "
-                "Re-export tiles uncompressed (tilemaker --compress none).\n");
-        free(buf); slot->loaded = true; return slot;
+        // gzip trailer ISIZE (little-endian) = uncompressed size mod 2^32.
+        unsigned long isize = (unsigned long)buf[sz-4] | ((unsigned long)buf[sz-3] << 8) |
+                              ((unsigned long)buf[sz-2] << 16) | ((unsigned long)buf[sz-1] << 24);
+        unsigned long outcap = isize ? isize : (unsigned long)sz * 8;
+        if (outcap < (unsigned long)sz) outcap = (unsigned long)sz * 8;  // guard bad ISIZE
+        if (outcap > 1024UL * 1024UL) outcap = 1024UL * 1024UL;          // 1 MB ceiling
+        uint8_t *ubuf = (uint8_t*)ps_malloc(outcap);
+        if (!ubuf) ubuf = (uint8_t*)malloc(outcap);
+        if (!ubuf) {
+            MVT_LOG("[TILE]   gunzip malloc(%lu) FAILED\n", outcap);
+            free(buf); slot->loaded = true; slot->status = TILE_ST_OOM; return slot;
+        }
+        unsigned long outlen = outcap, srclen = (unsigned long)sz;
+        int rc = wp_gunzip(ubuf, &outlen, buf, &srclen);
+        free(buf);
+        if (rc != 0) {
+            MVT_LOG("[TILE]   gunzip FAILED rc=%d (outcap=%lu)\n", rc, outcap);
+            free(ubuf); slot->loaded = true; slot->status = TILE_ST_GZIP; return slot;
+        }
+        MVT_LOG("[TILE]   gunzip ok %u -> %lu bytes\n", (unsigned)sz, outlen);
+        buf = ubuf; sz = (size_t)outlen;
     }
 
     MVTDecodeCtx c;
@@ -1025,12 +1544,15 @@ static FMapTile *tile_load(int8_t z, int16_t x, int16_t y) {
     if (used == 0) {
         if (objs) free(objs);
         slot->loaded = true;
+        slot->status = TILE_ST_NODATA;
         return slot;
     }
     FMapObj *trimmed = (FMapObj*)realloc(objs, sizeof(FMapObj) * used);
     slot->objs = trimmed ? trimmed : objs;
     slot->obj_count = (uint16_t)(used > 65535 ? 65535 : used);
     slot->loaded = true;
+    slot->status = TILE_ST_OK;
+    g_cache_bytes += tile_bytes(*slot);
     return slot;
 }
 // =============================================================================
@@ -1350,6 +1872,20 @@ static void cam_select_zoom() {
     }
     g_cam_zoom = best;
     g_last_cached_z = (int8_t)best;
+}
+
+// Track A -- metadata-driven camera scale clamp. Replaces the old hardcoded
+// 1e-6..100 limits. Derives the min/max pixels-per-world-unit from the map's
+// own minzoom/maxzoom, allowing TILE_OVERZOOM_MAX extra levels of zoom-in
+// (served by overzoomed parent tiles) and one extra level of zoom-out.
+static void cam_scale_bounds(float *lo, float *hi) {
+    double base = 256.0 / (double)MVT_EXTENT_DEFAULT;   // scale at z = refzoom
+    int out_levels = (int)g_meta.refzoom - (int)g_meta.minzoom + 1;
+    if (out_levels < 0) out_levels = 0;
+    int in_levels  = ((int)g_meta.maxzoom - (int)g_meta.refzoom) + TILE_OVERZOOM_MAX;
+    if (in_levels < 0) in_levels = 0;
+    *lo = (float)(base / (double)(1u << out_levels));
+    *hi = (float)(base * (double)(1u << in_levels));
 }
 
 // =============================================================================
@@ -1862,16 +2398,65 @@ static uint32_t g_render_last_ms = 0;
 static uint16_t g_render_obj_count = 0;
 static uint32_t g_render_time_us = 0;
 
-// Ensure current + neighbouring tiles are loaded at the active slippy zoom.
+// -----------------------------------------------------------------------------
+// Track A -- overzoom. Resolve the best available tile for (z,x,y): try the
+// requested zoom, then walk up to parent tiles (z-1, z-2, ...) until one exists
+// on disk or is already cached. Parent geometry is stored in world coords at
+// the map's reference zoom, so it renders at the correct place/scale with no
+// per-point rescaling -- the camera scale does the "zooming in" for us.
+// Returns the resolved cached tile (may be a parent), or nullptr if nothing
+// covers the area within TILE_OVERZOOM_MAX levels.
+// -----------------------------------------------------------------------------
+static FMapTile *tile_resolve(int8_t z, int16_t x, int16_t y) {
+    for (int up = 0; up <= TILE_OVERZOOM_MAX; up++) {
+        int8_t pz = (int8_t)(z - up);
+        if (pz < (int8_t)g_meta.minzoom) break;
+        int16_t px = (int16_t)(x >> up), py = (int16_t)(y >> up);
+        FMapTile *t = cache_find(pz, px, py);
+        if (t) {
+            if (t->status == TILE_ST_OK) return t;   // usable data
+            if (up == 0) return t;                    // native zoom: report as-is
+            continue;                                 // empty parent: try grandparent
+        }
+        if (tile_exists_on_disk(pz, px, py)) {
+            FMapTile *nt = tile_load(pz, px, py);
+            if (nt && nt->status == TILE_ST_OK) return nt;
+            if (up == 0) return nt;                   // present but empty/failed
+            // parent present but empty -> keep walking up
+        }
+    }
+    return nullptr;
+}
+
+// Ensure current + neighbouring tiles are resolved (with overzoom fallback) at
+// the active slippy zoom, so the 3x3 render ring has data to draw.
 static void ensure_ring_loaded(int8_t z, int16_t ctx, int16_t cty) {
     int32_t nmax = (1L << z) - 1;
     for (int j=-1; j<=1; j++) {
         for (int i=-1; i<=1; i++) {
             int16_t tx = ctx + i, ty = cty + j;
             if (tx < 0 || ty < 0 || tx > nmax || ty > nmax) continue;
+            tile_resolve(z, tx, ty);
+        }
+    }
+}
+
+// Track A -- neighbour prefetch. Warm the cache one ring further out (radius 2)
+// so panning doesn't stutter. Budget-limited: at most a few loads per frame,
+// and only when the byte budget has headroom, so we never block the UI.
+static void prefetch_ring(int8_t z, int16_t ctx, int16_t cty) {
+    if (g_cache_bytes > (TILE_CACHE_PSRAM_BUDGET * 3) / 4) return;
+    int32_t nmax = (1L << z) - 1;
+    int budget = 3;   // max tile loads per frame for prefetch
+    for (int j=-2; j<=2 && budget > 0; j++) {
+        for (int i=-2; i<=2 && budget > 0; i++) {
+            if (i >= -1 && i <= 1 && j >= -1 && j <= 1) continue;  // inner ring already done
+            int16_t tx = ctx + i, ty = cty + j;
+            if (tx < 0 || ty < 0 || tx > nmax || ty > nmax) continue;
             if (cache_find(z, tx, ty)) continue;
             if (!tile_exists_on_disk(z, tx, ty)) continue;
             tile_load(z, tx, ty);
+            budget--;
         }
     }
 }
@@ -2220,19 +2805,26 @@ static void draw_map_frame() {
     int16_t cty = (int16_t)floor(-g_cam_y / side);
     ensure_ring_loaded(z, ctx, cty);
 
-    // Draw ring
+    // Draw ring (with overzoom fallback + parent dedup so a parent tile that
+    // covers several cells is only rendered once).
     g_hud_tiles_ok = 0;
     g_hud_tiles_empty = 0;
+    FMapTile *drawn[9]; int ndrawn = 0;
     for (int j=-1; j<=1; j++) {
         for (int i=-1; i<=1; i++) {
-            FMapTile *tl = cache_find(z, ctx + i, cty + j);
-            if (tl) {
-                if (tl->obj_count > 0) g_hud_tiles_ok++;
-                else                    g_hud_tiles_empty++;
-                render_tile_objects(tl);
-            }
+            FMapTile *tl = tile_resolve(z, ctx + i, cty + j);
+            if (!tl) { g_hud_tiles_empty++; continue; }
+            bool seen = false;
+            for (int k=0; k<ndrawn; k++) if (drawn[k] == tl) { seen = true; break; }
+            if (seen) continue;
+            if (ndrawn < 9) drawn[ndrawn++] = tl;
+            if (tl->obj_count > 0) g_hud_tiles_ok++;
+            else                   g_hud_tiles_empty++;
+            render_tile_objects(tl);
         }
     }
+    // Warm the next ring out so panning stays smooth.
+    prefetch_ring(z, ctx, cty);
     render_saved();
     render_beacons();
     render_pois();
@@ -2524,36 +3116,80 @@ static void set_theme(uint8_t id) {
     Preferences p; p.begin("waypoint", false); p.putUChar("theme", id); p.end();
     g_lib_redraw = true; g_need_map_redraw = true;
 }
+static lv_obj_t *g_theme_rows[4] = {nullptr,nullptr,nullptr,nullptr};
+static lv_obj_t *g_theme_ticks[4] = {nullptr,nullptr,nullptr,nullptr};
+
+static void themes_refresh() {
+    for (int i=0; i<4; i++) {
+        if (g_theme_ticks[i])
+            lv_label_set_text(g_theme_ticks[i], (i == g_theme_id) ? LV_SYMBOL_OK : "");
+        if (g_theme_rows[i]) {
+            if (i == g_theme_id) lv_obj_add_state(g_theme_rows[i], LV_STATE_CHECKED);
+            else                 lv_obj_clear_state(g_theme_rows[i], LV_STATE_CHECKED);
+        }
+    }
+}
+static void cb_theme_pick(lv_event_t *e) {
+    int *idp = (int*)lv_event_get_user_data(e);
+    set_theme((uint8_t)*idp);
+    wp_sync_styles();
+    themes_refresh();
+    enter_mode(MODE_MAP);
+}
 static void build_themes() {
-    if (scr_themes) return;
+    if (scr_themes) { themes_refresh(); return; }
+    wp_sync_styles();
     scr_themes = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_themes, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_bg_opa(scr_themes, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(scr_themes, LV_OBJ_FLAG_SCROLLABLE);
+
     lv_obj_t *t = lv_label_create(scr_themes);
     lv_label_set_text(t, "THEMES");
-    lv_obj_set_style_text_color(t, lv_color_hex(COL_MUTE),0);
-    lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
-    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 24);
-    // Fixed border colors per theme index (LVGL RGB888)
-    static const uint32_t THEME_BORDER_RGB[4] = { 0x00E5FF, 0x001FCC, 0xBD8000, 0x67FFCC };
+    lv_obj_add_style(t, &wp_style_label_dim, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 22);
+
+    // Flex column of theme cards (Track B: shared card style + selected tick).
+    lv_obj_t *list = lv_obj_create(scr_themes);
+    lv_obj_set_size(list, LCD_WIDTH - 40, LCD_HEIGHT - 130);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 56);
+    lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(list, 12, 0);
+
     for (int i=0; i<4; i++) {
-        lv_obj_t *b = lv_btn_create(scr_themes);
-        lv_obj_set_size(b, 260, 48);
-        lv_obj_align(b, LV_ALIGN_TOP_MID, 0, 70 + i*58);
-        lv_obj_set_style_bg_color(b, lv_color_hex(0x141414), 0);
-        lv_obj_set_style_border_color(b, lv_color_hex(THEME_BORDER_RGB[i]), 0);
-        lv_obj_set_style_border_width(b, 1, 0);
-        lv_obj_set_style_radius(b, 12, 0);
+        lv_obj_t *b = lv_btn_create(list);
+        lv_obj_add_style(b, &wp_style_menu_card, 0);
+        lv_obj_add_style(b, &wp_style_pressed, LV_STATE_PRESSED);
+        lv_obj_set_size(b, lv_pct(100), 54);
+        lv_obj_set_flex_flow(b, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(b, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                              LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        // swatch dot in this theme's accent colour
+        lv_obj_t *dot = lv_obj_create(b);
+        lv_obj_set_size(dot, 18, 18);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(dot, 0, 0);
+        lv_obj_set_style_bg_color(dot, wp_565(THEMES[i].accent), 0);
+        lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+
         lv_obj_t *l = lv_label_create(b);
         lv_label_set_text(l, THEMES[i].name);
-        lv_obj_center(l);
-        lv_obj_set_style_text_color(l, lv_color_hex(COL_TXT), 0);
+        lv_obj_add_style(l, &wp_style_label_title, 0);
+        lv_obj_set_flex_grow(l, 1);
+        lv_obj_set_style_pad_left(l, 12, 0);
+
+        lv_obj_t *tick = lv_label_create(b);
+        lv_label_set_text(tick, (i == g_theme_id) ? LV_SYMBOL_OK : "");
+        lv_obj_set_style_text_color(tick, wp_565(THEMES[i].accent), 0);
+        g_theme_ticks[i] = tick;
+        g_theme_rows[i] = b;
+
         int *id = (int*)lv_mem_alloc(sizeof(int)); *id = i;
-        lv_obj_add_event_cb(b, [](lv_event_t *e){
-            int *idp = (int*)lv_event_get_user_data(e);
-            set_theme((uint8_t)*idp);
-            enter_mode(MODE_MAP);
-        }, LV_EVENT_CLICKED, id);
+        lv_obj_add_event_cb(b, cb_theme_pick, LV_EVENT_CLICKED, id);
     }
     add_back_pill(scr_themes, "Back to Tools", cb_back_to_tools);
 }
@@ -2739,17 +3375,29 @@ static void build_dev() {
 }
 static void dev_refresh() {
     if (!lbl_dev) return;
-    int cached = 0;
-    for (int i=0; i<TILE_CACHE_SLOTS; i++) if (g_cache[i].loaded) cached++;
+    int cached = 0, ok = 0, empty = 0, miss = 0, gz = 0, err = 0;
+    for (int i=0; i<TILE_CACHE_SLOTS; i++) {
+        if (!g_cache[i].loaded) continue;
+        cached++;
+        switch (g_cache[i].status) {
+            case TILE_ST_OK:      ok++; break;
+            case TILE_ST_NODATA:  empty++; break;
+            case TILE_ST_MISSING: miss++; break;
+            case TILE_ST_GZIP:    gz++; break;
+            default:              err++; break;
+        }
+    }
     uint32_t heap = ESP.getFreeHeap();
     uint32_t psram = ESP.getFreePsram();
     int bat = g_has_pmu ? g_pmu.getBatteryPercent() : -1;
-    char buf[512];
+    char buf[640];
     snprintf(buf, sizeof(buf),
         "Map:   %s\n"
         "Zoom:  %u (%u zooms)\n"
         "Cam:   %.0f, %.0f  scl %.4f\n"
         "Tiles: %u indexed, %d cached\n"
+        "Cache: ok%d empty%d gz%d err%d\n"
+        "TileMem: %lu KB\n"
         "POIs:  %lu\n"
         "Objs:  %u last frame\n"
         "Draw:  %lu us\n"
@@ -2762,6 +3410,8 @@ static void dev_refresh() {
         (unsigned)g_cam_zoom, (unsigned)g_zoom_count,
         g_cam_x, g_cam_y, g_cam_scale,
         (unsigned)g_tile_count, cached,
+        ok, empty, gz, err,
+        (unsigned long)(g_cache_bytes/1024),
         (unsigned long)g_poi_count,
         (unsigned)g_render_obj_count,
         (unsigned long)g_render_time_us,
@@ -2774,89 +3424,73 @@ static void dev_refresh() {
 }
 
 // ----- Tools menu -----
+static void cb_tools_enter_mode(lv_event_t *e) {
+    AppMode *tp = (AppMode*)lv_event_get_user_data(e);
+    if (tp) enter_mode(*tp);
+}
+static void cb_tools_breadcrumb(lv_event_t *e) {
+    (void)e;
+    breadcrumb_add((int32_t)g_cam_x, (int32_t)g_cam_y);
+    enter_mode(MODE_MAP);
+}
+static void cb_tools_clear_nav(lv_event_t *e) {
+    (void)e;
+    g_has_nav_target = false;
+    g_need_map_redraw = true;
+    enter_mode(MODE_MAP);
+}
+
 static void build_tools() {
     if (scr_tools) return;
+    wp_sync_styles();
     scr_tools = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr_tools, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_bg_opa(scr_tools, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(scr_tools, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *t = lv_label_create(scr_tools);
     lv_label_set_text(t, "TOOLS");
-    lv_obj_set_style_text_color(t, lv_color_hex(COL_MUTE),0);
-    lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
-    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_add_style(t, &wp_style_label_dim, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 18);
 
-    struct Item { const char *name; AppMode target; };
-    static const Item items[] = {
-        {"Save Location", MODE_SAVEDIALOG},
-        {"Layers",        MODE_LAYERS},
-        {"Themes",        MODE_THEMES},
-        {"Compass",       MODE_COMPASS},
-        {"Level",         MODE_LEVEL},
-        {"Sun",           MODE_SUN},
-        {"Bearings",      MODE_BEARINGS},
-        {"Search",        MODE_SEARCH},
-        {"Block Nav",     MODE_BLOCKNAV},
-        {"Explore",       MODE_EXPLORE},
-        {"Developer",     MODE_DEV},
+    // Flex-wrap grid container (Track B: no more hand-placed x/y positions).
+    lv_obj_t *grid = lv_obj_create(scr_tools);
+    lv_obj_set_size(grid, LCD_WIDTH - 24, LCD_HEIGHT - 120);
+    lv_obj_align(grid, LV_ALIGN_TOP_MID, 0, 46);
+    lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(grid, 0, 0);
+    lv_obj_set_style_pad_all(grid, 4, 0);
+    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
+    lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_SPACE_EVENLY,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+    struct ToolDef { const char *icon; const char *name; AppMode target; };
+    static const ToolDef defs[] = {
+        { LV_SYMBOL_SAVE,      "Save",      MODE_SAVEDIALOG },
+        { LV_SYMBOL_LIST,      "Layers",    MODE_LAYERS },
+        { LV_SYMBOL_IMAGE,     "Themes",    MODE_THEMES },
+        { LV_SYMBOL_GPS,       "Compass",   MODE_COMPASS },
+        { LV_SYMBOL_MINUS,     "Level",     MODE_LEVEL },
+        { LV_SYMBOL_CHARGE,    "Sun",       MODE_SUN },
+        { LV_SYMBOL_LOOP,      "Bearings",  MODE_BEARINGS },
+        { LV_SYMBOL_DIRECTORY, "Search",    MODE_SEARCH },
+        { LV_SYMBOL_UP,        "Block Nav", MODE_BLOCKNAV },
+        { LV_SYMBOL_EYE_OPEN,  "Explore",   MODE_EXPLORE },
+        { LV_SYMBOL_SETTINGS,  "Developer", MODE_DEV },
     };
-    const int cols = 3;
-    for (size_t i=0; i<sizeof(items)/sizeof(items[0]); i++) {
-        int col = i % cols, row = i / cols;
-        lv_obj_t *b = lv_btn_create(scr_tools);
-        lv_obj_set_size(b, 116, 74);
-        lv_obj_set_pos(b, 26 + col * 128, 60 + row * 84);
-        lv_obj_set_style_bg_color(b, lv_color_hex(0x141414), 0);
-        lv_obj_set_style_border_color(b, lv_color_hex(COL_ACCENT), 0);
-        lv_obj_set_style_border_width(b, 1, 0);
-        lv_obj_set_style_radius(b, 14, 0);
-        lv_obj_t *l = lv_label_create(b);
-        lv_label_set_text(l, items[i].name);
-        lv_obj_set_style_text_color(l, lv_color_hex(COL_TXT), 0);
-        lv_obj_center(l);
+    for (size_t i = 0; i < sizeof(defs)/sizeof(defs[0]); i++) {
         AppMode *tgt = (AppMode*)lv_mem_alloc(sizeof(AppMode));
-        *tgt = items[i].target;
-        lv_obj_add_event_cb(b, [](lv_event_t *e){
-            AppMode *tp = (AppMode*)lv_event_get_user_data(e);
-            enter_mode(*tp);
-        }, LV_EVENT_CLICKED, tgt);
+        *tgt = defs[i].target;
+        MenuItem mi = { defs[i].icon, defs[i].name, cb_tools_enter_mode, tgt };
+        wp_create_menu_item(grid, mi);
     }
 
-    // Extra row: quick toggles (breadcrumb drop, clear nav target)
-    lv_obj_t *bc = lv_btn_create(scr_tools);
-    lv_obj_set_size(bc, 176, 46);
-    lv_obj_set_pos(bc, 26, 60 + 4 * 84);
-    lv_obj_set_style_bg_color(bc, lv_color_hex(0x141414), 0);
-    lv_obj_set_style_border_color(bc, lv_color_hex(COL_GOLD), 0);
-    lv_obj_set_style_border_width(bc, 1, 0);
-    lv_obj_set_style_radius(bc, 12, 0);
-    lv_obj_t *bcl = lv_label_create(bc);
-    lv_label_set_text(bcl, "Drop Breadcrumb");
-    lv_obj_set_style_text_color(bcl, lv_color_hex(COL_GOLD), 0);
-    lv_obj_center(bcl);
-    lv_obj_add_event_cb(bc, [](lv_event_t *e){
-        (void)e;
-        breadcrumb_add((int32_t)g_cam_x, (int32_t)g_cam_y);
-        enter_mode(MODE_MAP);
-    }, LV_EVENT_CLICKED, NULL);
+    // Quick actions -- same tile builder, gold-tinted via warn accent.
+    MenuItem drop  = { LV_SYMBOL_GPS,  "Breadcrumb", cb_tools_breadcrumb, nullptr };
+    MenuItem clear = { LV_SYMBOL_CLOSE, "Clear Nav", cb_tools_clear_nav, nullptr };
+    wp_create_menu_item(grid, drop);
+    wp_create_menu_item(grid, clear);
 
-    lv_obj_t *cn = lv_btn_create(scr_tools);
-    lv_obj_set_size(cn, 176, 46);
-    lv_obj_set_pos(cn, 210, 60 + 4 * 84);
-    lv_obj_set_style_bg_color(cn, lv_color_hex(0x141414), 0);
-    lv_obj_set_style_border_color(cn, lv_color_hex(COL_ACCENT), 0);
-    lv_obj_set_style_border_width(cn, 1, 0);
-    lv_obj_set_style_radius(cn, 12, 0);
-    lv_obj_t *cnl = lv_label_create(cn);
-    lv_label_set_text(cnl, "Clear Nav Target");
-    lv_obj_set_style_text_color(cnl, lv_color_hex(COL_ACCENT), 0);
-    lv_obj_center(cnl);
-    lv_obj_add_event_cb(cn, [](lv_event_t *e){
-        (void)e;
-        g_has_nav_target = false;
-        g_need_map_redraw = true;
-        enter_mode(MODE_MAP);
-    }, LV_EVENT_CLICKED, NULL);
     add_back_pill(scr_tools, "Back to Map", cb_back_to_map);
 }
 
@@ -3221,8 +3855,9 @@ static void map_pan(int dx, int dy) {
 }
 static void map_zoom(float factor) {
     g_cam_scale *= factor;
-    if (g_cam_scale < 1e-6f) g_cam_scale = 1e-6f;
-    if (g_cam_scale > 100.0f) g_cam_scale = 100.0f;
+    float lo, hi; cam_scale_bounds(&lo, &hi);
+    if (g_cam_scale < lo) g_cam_scale = lo;
+    if (g_cam_scale > hi) g_cam_scale = hi;
     cam_select_zoom();
     g_need_map_redraw = true;
 }
@@ -3372,8 +4007,9 @@ static void handle_map_touch(uint32_t now) {
             // moving up (dy < 0) zooms in
             float factor = expf(-dy * 0.006f);
             float ns = two_finger_start_scale * factor;
-            if (ns < 1e-6f) ns = 1e-6f;
-            if (ns > 100.0f) ns = 100.0f;
+            float lo, hi; cam_scale_bounds(&lo, &hi);
+            if (ns < lo) ns = lo;
+            if (ns > hi) ns = hi;
             if (fabsf(ns - g_cam_scale) > 1e-4f) {
                 g_cam_scale = ns;
                 cam_select_zoom();
@@ -3525,6 +4161,7 @@ void setup() {
     Preferences p; p.begin("waypoint", true);
     g_theme_id       = p.getUChar("theme", THEME_FUSION_DARK);
     if (g_theme_id > THEME_CHILL) g_theme_id = THEME_FUSION_DARK;
+    wp_sync_styles();   // Track B: prime shared LVGL styles from restored theme
     g_mx_off = p.getFloat("mxo", 0); g_my_off = p.getFloat("myo", 0); g_mz_off = p.getFloat("mzo", 0);
     g_mx_scl = p.getFloat("mxs", 1); g_my_scl = p.getFloat("mys", 1); g_mz_scl = p.getFloat("mzs", 1);
     g_marked_heading = p.getFloat("mark_hdg", -1);
