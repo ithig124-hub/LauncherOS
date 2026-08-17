@@ -416,6 +416,9 @@ static void show_factory_reset_modal();
 static bool loader_ring_start(lv_obj_t *scr);
 static void loader_ring_stop();
 static void cf_goto(int i, bool animate);
+// ---- v1.0 XANDER forward declarations (module defined before setup()) -----
+static void xander_open_home_cb(lv_event_t *e);
+static void xander_open_settings_cb(lv_event_t *e);
 // ============================================================================
 
 // ============================================================================
@@ -532,7 +535,7 @@ static bool g_haptics_toggle = true;    // Placeholder -- board has no vibe moto
 // ---- swipe queue ----------------------------------------------------------
 // MiniOS-style: filled on finger-release in my_touchpad_read(), consumed
 // immediately by loop().  No cooldown, no wake-grace gating.
-enum SwipeEvent { SWIPE_NONE, SWIPE_LEFT, SWIPE_RIGHT };
+enum SwipeEvent { SWIPE_NONE, SWIPE_LEFT, SWIPE_RIGHT, SWIPE_UP, SWIPE_DOWN };
 static volatile SwipeEvent g_pending_swipe = SWIPE_NONE;
 
 static int32_t  ts_x = 0, ts_y = 0;
@@ -624,9 +627,13 @@ static void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
             uint32_t dur  = millis() - ts_ms;
             int32_t  dx   = tc_x - ts_x;
             int32_t  dy   = tc_y - ts_y;
-            bool gestureSwipe = (dur < SWIPE_MAX_DURATION_MS) &&
-                                (abs(dx) > SWIPE_THRESHOLD_PX) &&
-                                (abs(dx) > abs(dy));
+            // v1.0-XANDER: classify BOTH axes.  Horizontal keeps the exact
+            // MiniOS-parity behaviour (launcher nav); the dominant-vertical
+            // case now emits SWIPE_UP / SWIPE_DOWN so the hidden Xander layer
+            // can be revealed (up from the face) and exited (down anywhere).
+            bool horiz = (abs(dx) > SWIPE_THRESHOLD_PX) && (abs(dx) >= abs(dy));
+            bool vert  = (abs(dy) > SWIPE_THRESHOLD_PX) && (abs(dy) >  abs(dx));
+            bool gestureSwipe = (dur < SWIPE_MAX_DURATION_MS) && (horiz || vert);
 
             USBSerial.printf("[TOUCH] End  dx=%d dy=%d dur=%lu\n",
                              dx, dy, (unsigned long)dur);
@@ -634,9 +641,14 @@ static void my_touchpad_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
             if (gestureSwipe) {
                 // MiniOS dispatches the moment the finger lifts -- no cooldown,
                 // no queue draining, no wake-grace. Match it exactly.
-                g_pending_swipe = (dx < 0) ? SWIPE_LEFT : SWIPE_RIGHT;
+                // NOTE: on this panel the Y axis reads "inverted" vs a naive
+                // top-left origin, so a physical UP flick yields dy > 0.  Map
+                // accordingly: dy > 0 = SWIPE_UP (enter Xander), dy < 0 = DOWN.
+                if (horiz) g_pending_swipe = (dx < 0) ? SWIPE_LEFT : SWIPE_RIGHT;
+                else       g_pending_swipe = (dy > 0) ? SWIPE_UP   : SWIPE_DOWN;
                 USBSerial.printf("[TOUCH] Swipe %s queued\n",
-                                 (dx < 0) ? "LEFT" : "RIGHT");
+                                 horiz ? (dx < 0 ? "LEFT" : "RIGHT")
+                                       : (dy > 0 ? "UP" : "DOWN"));
             }
             // Re-stamp the activity timer on release.  The screen-off
             // countdown is a 5-second timer that any touch -- press OR
@@ -1292,6 +1304,15 @@ static void build_screen_face() {
     lv_obj_set_style_border_width(face_status, 0, 0);
     lv_obj_set_style_bg_color(face_status, lv_color_hex(0xFF4040), 0);
     lv_obj_set_style_bg_opa(face_status, 200, 0);
+
+    // v1.0-XANDER: subtle discovery hint -- swipe up from the face to reveal
+    // the hidden Xander layer.  Kept dim so it never competes with the clock.
+    lv_obj_t *xhint = lv_label_create(s);
+    lv_label_set_text(xhint, LV_SYMBOL_UP "  Xander");
+    lv_obj_set_style_text_color(xhint, lv_color_hex(theme_primary()), 0);
+    lv_obj_set_style_text_opa(xhint, 120, 0);
+    lv_obj_set_style_text_font(xhint, &lv_font_montserrat_12, 0);
+    lv_obj_align(xhint, LV_ALIGN_BOTTOM_MID, 0, -10);
 
     refresh_wallpaper();
     update_face_time();
@@ -2390,6 +2411,14 @@ static void build_screen_settings() {
     card_action(list, "Wallpaper", "browse all wallpapers",
                 LV_SYMBOL_IMAGE "  Open", theme_accent(),
                 cards_open_wallpaper_cb);
+
+    // 5b) XANDER -- offline companion (open + setup)
+    card_action(list, "Xander", "offline companion",
+                LV_SYMBOL_EYE_OPEN "  Open", theme_primary(),
+                xander_open_home_cb);
+    card_action(list, "Xander Setup", "voice / always-on / stats",
+                LV_SYMBOL_SETTINGS "  Setup", theme_accent(),
+                xander_open_settings_cb);
 
     // 6) Toggle: WiFi
     card_toggle(list, "WiFi", "12 h NTP resync when on",
@@ -3541,6 +3570,926 @@ static void card_action(lv_obj_t *parent, const char *title,
 // ============================================================================
 //  SETUP
 // ============================================================================
+// ############################################################################
+// #                                                                          #
+// #   XANDER v1.0  --  offline, launcher-integrated companion                #
+// #   ----------------------------------------------------------------       #
+// #   A hidden layer beneath the clock face.  No AI, no radio dependency.    #
+// #   Intelligence = command parsing + structured databases + watch state.   #
+// #                                                                          #
+// #     NAV:   FACE --swipe up--> XANDER HOME                                #
+// #            HOME --swipe left--> PUZZLES   --swipe right--> HOME           #
+// #            HOME --swipe right--> KNOWLEDGE --swipe left--> HOME           #
+// #            (anywhere) --swipe down--> back to the clock face             #
+// #                                                                          #
+// #   Command entry: on-screen keyboard (typed intents) + tappable chips.    #
+// #   Actions call the launcher's own functions (load_app_from_sd, WiFi/BLE).#
+// #                                                                          #
+// #   NOTE: needs LV_USE_KEYBOARD and LV_USE_TEXTAREA enabled in lv_conf.h   #
+// #         (both are ON in the stock LVGL 8.x config).                      #
+// ############################################################################
+
+// ---- response library ------------------------------------------------------
+static const char *X_R_OK[]     = { "On it.", "Consider it done.", "Right away.", "Done." };
+static const char *X_R_ALREADY[]= { "We are already there.", "That is already running.", "Already set." };
+static const char *X_R_ERR[]    = { "That did not work.", "Something is getting in the way.", "I could not do that." };
+static const char *X_R_UNK[]    = { "I do not know that command yet.", "I did not catch that.", "That is not in my playbook yet." };
+static const char *X_R_GREET[]  = { "What shall we investigate?", "Back again?", "Ready when you are.", "Let us dig in." };
+static const char *xrand(const char *const *a, int n) { return a[(int)(millis() % (uint32_t)n)]; }
+
+// ---- puzzle database -------------------------------------------------------
+struct XPuzzle { int id; const char *category; uint8_t difficulty;
+                 const char *question; const char *hint; const char *answer; };
+static const XPuzzle kPuzzles[] = {
+  {  1, "logic",       3, "Three switches downstairs control three bulbs upstairs. You may flip them freely but climb the stairs only once. How do you tell which switch controls which bulb?", "A bulb gives off more than light.", "Turn switch 1 on a few minutes then off, turn switch 2 on, go up. Lit = 2, warm = 1, cold = 3." },
+  {  2, "math",        2, "I am a two-digit number. My tens digit is twice my units digit, and my digits add to 9. What am I?", "Tens = 2 x units, and they sum to 9.", "63" },
+  {  3, "riddles",     2, "The more you take, the more you leave behind. What am I?", "Think about walking.", "Footsteps." },
+  {  4, "physics",     3, "A feather and a hammer are dropped together on the Moon. Which lands first?", "There is no air up there.", "They land together - no atmosphere means no drag." },
+  {  5, "chemistry",   3, "During the electrolysis of water, what gas is produced at the cathode?", "Reduction happens at the cathode.", "Hydrogen." },
+  {  6, "coding",      3, "What is the time complexity of binary search on a sorted array of n items?", "You halve the search space each step.", "O(log n)." },
+  {  7, "engineering", 3, "A 10-tooth gear drives a 30-tooth gear. If the small gear spins at 300 rpm, how fast does the large one turn?", "The tooth ratio is 1:3.", "100 rpm." },
+  {  8, "patterns",    2, "What comes next: 1, 1, 2, 3, 5, 8, ?", "Each term is a sum of two others.", "13 - the Fibonacci sequence." },
+  {  9, "logic",       4, "You have 8 identical-looking balls; one is slightly heavier. Using a balance scale, what is the fewest weighings that always finds it?", "Try splitting into three groups.", "2 weighings." },
+  { 10, "math",        4, "What is the sum of all whole numbers from 1 to 100?", "Pair the ends: 1+100, 2+99...", "5050." },
+  { 11, "riddles",     3, "I speak without a mouth and hear without ears. I have no body, but I come alive with the wind. What am I?", "You might hear me in the mountains.", "An echo." },
+  { 12, "physics",     4, "If you double the voltage across a fixed resistor, what happens to the power it dissipates?", "Remember P = V squared over R.", "It quadruples - four times the power." },
+  { 13, "coding",      4, "In binary, what is 1011 + 0110?", "Carry the ones just like decimal.", "10001 - which is 17 in decimal." },
+  { 14, "engineering", 3, "Why does PWM let a digital pin dim an LED even though it can only output HIGH or LOW?", "It is about time, not voltage.", "It switches fast; the average on-time (duty cycle) sets the perceived brightness." },
+  { 15, "chemistry",   2, "What is the chemical symbol and atomic number of the element iron?", "It rusts.", "Fe, atomic number 26." },
+  { 16, "logic",       6, "A logician says: 'This statement is false.' Is that statement true or false?", "It refers to itself.", "Neither - it is the liar paradox; it cannot consistently be true or false." },
+};
+#define X_NPUZ ((int)(sizeof(kPuzzles)/sizeof(kPuzzles[0])))
+static const char *X_PCATS[] = { "logic","math","chemistry","physics","engineering","coding","riddles","patterns" };
+#define X_NPCAT ((int)(sizeof(X_PCATS)/sizeof(X_PCATS[0])))
+
+// ---- knowledge database ----------------------------------------------------
+struct XArticle { const char *id; const char *category; const char *title;
+                  const char *summary; const char *details; };
+static const XArticle kArticles[] = {
+  { "chem_001","chemistry","Electrolysis","Electrolysis uses electrical energy to drive a chemical reaction that would not happen on its own.","A direct current is passed through an electrolyte. Positive ions travel to the cathode (reduction), negative ions to the anode (oxidation). Splitting water gives hydrogen at the cathode and oxygen at the anode." },
+  { "chem_002","chemistry","Redox Reactions","Redox reactions transfer electrons: one species is oxidised (loses electrons) while another is reduced (gains them).","A handy memory aid is OIL RIG - Oxidation Is Loss, Reduction Is Gain. Rusting, combustion and batteries are all redox processes." },
+  { "phys_001","physics","Ohm's Law","Ohm's law links voltage, current and resistance in a circuit: V = I x R.","Voltage (volts) equals current (amps) times resistance (ohms). Rearranged, I = V/R and R = V/I. It only holds for ohmic components at constant temperature." },
+  { "phys_002","physics","Newton's Laws","Newton's three laws describe how forces change the motion of objects.","1) An object stays at rest or moves steadily unless a force acts. 2) F = m x a. 3) Every action has an equal and opposite reaction." },
+  { "bio_001","biology","DNA","DNA stores the genetic instructions used to build and run living things.","It is a double helix of nucleotides using four bases: A, T, C and G. A pairs with T, C pairs with G. The order of bases spells out genes." },
+  { "bio_002","biology","The Cell","The cell is the smallest unit of life; all organisms are made of one or more cells.","Animal cells have a nucleus, mitochondria, cytoplasm and a membrane. Plant cells add a cell wall and chloroplasts for photosynthesis." },
+  { "math_001","maths","Pi","Pi is the ratio of a circle's circumference to its diameter, about 3.14159.","Pi is irrational - its decimals never repeat or end. Circumference = 2 x pi x r, and area = pi x r squared." },
+  { "math_002","maths","Prime Numbers","A prime number is a whole number greater than 1 whose only divisors are 1 and itself.","2, 3, 5, 7, 11, 13... 2 is the only even prime. Every whole number above 1 factorises into primes in exactly one way." },
+  { "eng_001","engineering","Torque","Torque is a twisting force - how strongly something is turned about a pivot.","Torque = force x distance from the pivot. A longer lever means more torque for the same push, which is why long wrenches loosen tight bolts." },
+  { "elec_001","electronics","The Transistor","A transistor is a tiny switch or amplifier that controls a large current with a small one.","In digital logic it acts as an on/off switch; billions of them make up a CPU. The two common families are BJT and MOSFET." },
+  { "elec_002","electronics","I2C Bus","I2C is a two-wire serial bus that lets a controller talk to many chips.","It uses SDA (data) and SCL (clock). Each device has an address, so a sensor, a touch panel and a power chip can all share the same pair of wires - exactly how this watch works." },
+  { "robo_001","robotics","PID Control","A PID controller keeps a system on target by reacting to error in three ways.","Proportional reacts to the current error, Integral to accumulated past error, Derivative to how fast the error is changing. Tuning the three gains gives smooth, stable control." },
+  { "robo_002","robotics","Servo Motors","A servo is a motor that moves to and holds a precise angle you command.","A control pulse tells the servo the target position; internal feedback drives it there and holds it. Hobby servos usually cover about 180 degrees." },
+  { "prog_001","programming","Recursion","Recursion is when a function solves a problem by calling itself on a smaller version of it.","Every recursion needs a base case to stop, or it runs forever. Factorials, tree walks and divide-and-conquer algorithms are natural fits." },
+  { "prog_002","programming","Big-O Notation","Big-O describes how an algorithm's cost grows as the input grows.","O(1) is constant, O(log n) halves each step, O(n) is linear, O(n squared) is nested loops. It ignores constants and focuses on the trend at scale." },
+  { "astro_001","astronomy","Black Holes","A black hole is a region where gravity is so strong that not even light can escape.","They form when massive stars collapse. The event horizon is the point of no return; the singularity lies at the centre. We spot them by their effect on nearby matter and light." },
+  { "astro_002","astronomy","Light-Year","A light-year is the distance light travels in one year - about 9.46 trillion km.","It is a measure of distance, not time. Because light takes years to reach us, looking far into space is also looking back in time." },
+  { "geo_001","geography","Plate Tectonics","Earth's crust is broken into slabs that drift on the mantle, shaping continents.","Where plates pull apart, spread, or grind past one another you get ridges, volcanoes, mountains and earthquakes. They move a few centimetres a year." },
+  { "gen_001","general","The Greenhouse Effect","Certain gases trap heat in the atmosphere, keeping the planet warm enough for life.","Sunlight warms the surface; the surface re-emits infrared, which gases like CO2 and water vapour absorb and re-radiate. Too much of these gases warms the planet further." },
+};
+#define X_NART ((int)(sizeof(kArticles)/sizeof(kArticles[0])))
+static const char *X_KCATS[] = { "chemistry","physics","biology","maths","engineering","electronics","robotics","programming","astronomy","geography","general" };
+#define X_NKCAT ((int)(sizeof(X_KCATS)/sizeof(X_KCATS[0])))
+
+// ---- command template table (chips + keyword intents) ----------------------
+enum XIntent {
+  XI_UNKNOWN=0, XI_HELP, XI_HOME_EXIT,
+  XI_OPEN_PUZZLES, XI_OPEN_KNOWLEDGE, XI_GIVE_PUZZLE, XI_TEACH,
+  XI_WIFI_ON, XI_WIFI_OFF, XI_BLE_ON, XI_BLE_OFF,
+  XI_GPS_ON, XI_GPS_OFF, XI_BEACON_ON, XI_BEACON_OFF,
+  XI_SHOW_BATTERY, XI_SHOW_STATUS
+};
+struct XTmpl { const char *label; const char *keys; int intent; };
+static const XTmpl kTmpl[] = {
+  { "Give me a puzzle",   "puzzle riddle challenge quiz",        XI_GIVE_PUZZLE },
+  { "Teach me something", "teach learn lesson knowledge",        XI_TEACH },
+  { "Open puzzles",       "puzzles",                             XI_OPEN_PUZZLES },
+  { "Open knowledge",     "knowledge library browse",            XI_OPEN_KNOWLEDGE },
+  { "Show battery",       "battery power charge percent level",  XI_SHOW_BATTERY },
+  { "Show status",        "status connection state system",      XI_SHOW_STATUS },
+  { "WiFi on",            "wifi wireless on enable",             XI_WIFI_ON },
+  { "WiFi off",           "wifi wireless off disable",           XI_WIFI_OFF },
+  { "Bluetooth on",       "bluetooth ble on enable",             XI_BLE_ON },
+  { "Bluetooth off",      "bluetooth ble off disable",           XI_BLE_OFF },
+  { "GPS on",             "gps location on enable",              XI_GPS_ON },
+  { "GPS off",            "gps location off disable",            XI_GPS_OFF },
+  { "Beacon on",          "beacon on enable",                    XI_BEACON_ON },
+  { "Beacon off",         "beacon off disable",                  XI_BEACON_OFF },
+  { "Help",               "help commands",                       XI_HELP },
+  { "Return home",        "home clock exit return face watch",   XI_HOME_EXIT },
+};
+#define X_NTMPL ((int)(sizeof(kTmpl)/sizeof(kTmpl[0])))
+
+// ---- state -----------------------------------------------------------------
+static bool       g_xander_active = false;
+static lv_obj_t  *g_x_scr      = nullptr;
+static lv_obj_t  *g_x_resp_lbl = nullptr;
+static int        g_x_top      = 1;      // 0 = puzzles, 1 = home, 2 = knowledge
+static bool       g_x_console  = false;
+static int        g_x_orb      = 0;      // 0 idle, 1 success, 2 error
+static String     g_x_last     = "";
+// puzzle sub-state
+static int        g_x_puz_view = 0;      // 0 categories, 1 puzzle card
+static int        g_x_puz_id   = 0;      // index into kPuzzles
+static bool       g_x_puz_hint = false, g_x_puz_reveal = false;
+// knowledge sub-state
+static int        g_x_kn_view  = 0;      // 0 categories, 1 article list, 2 detail
+static String     g_x_kn_cat   = "";
+static int        g_x_kn_art   = 0;      // index into kArticles
+static bool       g_x_kn_more  = false;
+// virtual hardware flags (no GPS/beacon silicon wired -> tracked in software)
+static bool       g_x_gps = false, g_x_beacon = false;
+// persisted stats + settings
+static Preferences g_xprefs;
+static bool       g_x_loaded = false;
+static long       g_xs_solved=0, g_xs_correct=0, g_xs_hints=0, g_xs_streak=0, g_xs_best=0, g_xs_hard=0;
+static bool       g_x_voice=false, g_x_alwayson=false;
+static int        g_x_battlim=1;
+
+// ---- module forward declarations -------------------------------------------
+static void xander_enter();
+static void xander_exit();
+static void xander_handle_swipe(SwipeEvent ev);
+static void x_render();
+static void x_process(String raw);
+static void x_do(int intent);
+static void x_open_article(int i);
+static void x_launch_app(int i);
+static void show_xander_settings();
+static void xander_service();                    // deferred UI worker (runs in loop, never inside an LVGL event)
+static void xander_free_launcher_screens();
+static void xander_rebuild_launcher_screens();
+
+// Deferred Xander UI actions.  Xander (re)builds its screen OUTSIDE any LVGL
+// event callback for two reasons:
+//   1. so we never free the very widget that is currently handling a click
+//      (the puzzle / knowledge / console buttons all trigger a re-render), and
+//   2. so we can free the heavy launcher screens BEFORE building Xander's
+//      views -- which stops the LVGL object pool from running dry (the old
+//      "only the XANDER title paints, then the whole UI freezes" bug).
+enum XAction { XA_NONE = 0, XA_ENTER, XA_RENDER, XA_EXIT };
+static volatile XAction g_x_action = XA_NONE;
+static uint32_t          g_x_free_at = 0;        // delayed 2nd free pass (0 = idle)
+
+// ---- persistence -----------------------------------------------------------
+static void x_stats_load() {
+    if (g_x_loaded) return;
+    g_xprefs.begin("xander", true);
+    g_xs_solved  = g_xprefs.getLong("solved", 0);
+    g_xs_correct = g_xprefs.getLong("correct", 0);
+    g_xs_hints   = g_xprefs.getLong("hints", 0);
+    g_xs_streak  = g_xprefs.getLong("streak", 0);
+    g_xs_best    = g_xprefs.getLong("best", 0);
+    g_xs_hard    = g_xprefs.getLong("hard", 0);
+    g_x_voice    = g_xprefs.getBool("voice", false);
+    g_x_alwayson = g_xprefs.getBool("aon", false);
+    g_x_battlim  = g_xprefs.getInt("blim", 1);
+    g_xprefs.end();
+    g_x_loaded = true;
+}
+static void x_stats_save() {
+    g_xprefs.begin("xander", false);
+    g_xprefs.putLong("solved", g_xs_solved);
+    g_xprefs.putLong("correct", g_xs_correct);
+    g_xprefs.putLong("hints", g_xs_hints);
+    g_xprefs.putLong("streak", g_xs_streak);
+    g_xprefs.putLong("best", g_xs_best);
+    g_xprefs.putLong("hard", g_xs_hard);
+    g_xprefs.end();
+}
+static void x_settings_save() {
+    g_xprefs.begin("xander", false);
+    g_xprefs.putBool("voice", g_x_voice);
+    g_xprefs.putBool("aon", g_x_alwayson);
+    g_xprefs.putInt("blim", g_x_battlim);
+    g_xprefs.end();
+}
+
+// ---- small helpers ---------------------------------------------------------
+static String x_cap(const char *s) {
+    String r = s;
+    if (r.length()) r.setCharAt(0, (char)toupper(r[0]));
+    return r;
+}
+static String x_diff(int d) {
+    if (d >= 6) return String("HAWTHORNE");
+    String s = "Difficulty "; s += d; s += "/5"; return s;
+}
+static void x_set_resp(const char *s) {
+    g_x_last = s;
+    if (g_x_resp_lbl) lv_label_set_text(g_x_resp_lbl, s);
+}
+static void x_finish_info() {   // reflect g_x_last after a non-navigating command
+    if (g_x_console) { if (g_x_resp_lbl) lv_label_set_text(g_x_resp_lbl, g_x_last.c_str()); }
+    else             { x_render(); }
+}
+// tokeniser: lowercases already-lowercased input into alnum words
+static int x_tokenize(const String &in, String *out, int maxn) {
+    int n = 0; String cur = "";
+    for (size_t i = 0; i <= in.length(); i++) {
+        char c = (i < in.length()) ? in[i] : ' ';
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) cur += c;
+        else if (cur.length()) { if (n < maxn) out[n++] = cur; cur = ""; }
+    }
+    return n;
+}
+static bool x_tok_has(String *t, int n, const char *w) {
+    for (int i = 0; i < n; i++) if (t[i] == w) return true;
+    return false;
+}
+static bool x_is_stop(const String &w) {
+    static const char *S[] = { "launch","open","start","run","go","to","the",
+                               "mode","os","me","my","please","xander","a","an","show","get" };
+    for (unsigned i = 0; i < sizeof(S)/sizeof(S[0]); i++) if (w == S[i]) return true;
+    return false;
+}
+static int x_best_tmpl(String *t, int n, int &outIdx) {
+    int best = 0; outIdx = -1;
+    for (int i = 0; i < X_NTMPL; i++) {
+        String kt[8]; int kn = x_tokenize(String(kTmpl[i].keys), kt, 8);
+        int s = 0;
+        for (int k = 0; k < kn; k++) if (x_tok_has(t, n, kt[k].c_str())) s++;
+        if (s > best) { best = s; outIdx = i; }
+    }
+    return best;
+}
+static int x_find_app_tok(String *t, int n, int &outIdx) {
+    int best = 0; outIdx = -1;
+    for (int i = 0; i < g_app_count; i++) {
+        String nm = g_apps[i].name; nm.toLowerCase();
+        int s = 0;
+        for (int k = 0; k < n; k++)
+            if (t[k].length() >= 3 && !x_is_stop(t[k]) && nm.indexOf(t[k]) >= 0) s += 2;
+        if (s > best) { best = s; outIdx = i; }
+    }
+    return best;
+}
+static int x_find_article(const String &q) {
+    String t[12]; int n = x_tokenize(q, t, 12);
+    int best = 0, bi = -1;
+    for (int i = 0; i < X_NART; i++) {
+        String hay = String(kArticles[i].title) + " " + kArticles[i].id + " " +
+                     kArticles[i].category + " " + kArticles[i].summary;
+        hay.toLowerCase();
+        int s = 0;
+        for (int k = 0; k < n; k++)
+            if (t[k].length() >= 3 && !x_is_stop(t[k]) && hay.indexOf(t[k]) >= 0) s += 2;
+        if (s > best) { best = s; bi = i; }
+    }
+    return best > 0 ? bi : -1;
+}
+
+// ---- UI builders -----------------------------------------------------------
+static void x_header(const char *title, const char *sub) {
+    lv_obj_t *t = lv_label_create(g_x_scr);
+    lv_label_set_text(t, title);
+    lv_obj_set_style_text_color(t, lv_color_hex(theme_primary()), 0);
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_20, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 14);
+    if (sub) {
+        lv_obj_t *s = lv_label_create(g_x_scr);
+        lv_label_set_text(s, sub);
+        lv_obj_set_style_text_color(s, lv_color_hex(0x888888), 0);
+        lv_obj_set_style_text_font(s, &lv_font_montserrat_12, 0);
+        lv_obj_align(s, LV_ALIGN_TOP_MID, 0, 42);
+    }
+}
+static lv_obj_t *x_list(int y, int h) {
+    lv_obj_t *l = lv_obj_create(g_x_scr);
+    lv_obj_set_size(l, LCD_WIDTH - 30, h);
+    lv_obj_align(l, LV_ALIGN_TOP_MID, 0, y);
+    lv_obj_set_style_bg_opa(l, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(l, 0, 0);
+    lv_obj_set_style_pad_all(l, 6, 0);
+    lv_obj_set_style_pad_row(l, 8, 0);
+    lv_obj_set_flex_flow(l, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(l, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+    lv_obj_set_scroll_dir(l, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(l, LV_SCROLLBAR_MODE_AUTO);
+    return l;
+}
+static lv_obj_t *x_row_btn(lv_obj_t *p, const char *txt, uint32_t border,
+                           lv_event_cb_t cb, intptr_t ud) {
+    lv_obj_t *b = lv_btn_create(p);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_width(b, LV_PCT(100));
+    lv_obj_set_style_bg_color(b, lv_color_hex(theme_fg()), 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(b, 12, 0);
+    lv_obj_set_style_border_color(b, lv_color_hex(border), 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_pad_all(b, 12, 0);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_color(l, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+    lv_obj_align(l, LV_ALIGN_LEFT_MID, 0, 0);
+    if (cb) lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, (void *)ud);
+    return b;
+}
+static lv_obj_t *x_cbtn(lv_obj_t *parent, const char *txt, int w, uint32_t border,
+                        lv_event_cb_t cb, intptr_t ud) {
+    lv_obj_t *b = lv_btn_create(parent);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_size(b, w, 50);
+    lv_obj_set_style_bg_color(b, lv_color_hex(theme_fg()), 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(b, 14, 0);
+    lv_obj_set_style_border_color(b, lv_color_hex(border), 0);
+    lv_obj_set_style_border_width(b, 2, 0);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_color(l, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+    lv_obj_center(l);
+    if (cb) lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, (void *)ud);
+    return b;
+}
+static lv_obj_t *x_wraplbl(lv_obj_t *parent, const char *txt, int w, uint32_t color,
+                           const lv_font_t *font) {
+    lv_obj_t *l = lv_label_create(parent);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(l, w);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_color(l, lv_color_hex(color), 0);
+    lv_obj_set_style_text_font(l, font, 0);
+    return l;
+}
+
+// ---- callbacks -------------------------------------------------------------
+static void x_cmd_open_cb(lv_event_t *) { g_x_console = true; g_x_last = ""; x_render(); }
+
+static void x_kb_cb(lv_event_t *e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t *ta = (lv_obj_t *)lv_event_get_user_data(e);
+    if (code == LV_EVENT_READY) {
+        String txt = lv_textarea_get_text(ta);
+        x_process(txt);
+        if (g_x_console && ta) lv_textarea_set_text(ta, "");   // still in console -> clear
+    } else if (code == LV_EVENT_CANCEL) {
+        g_x_console = false; x_render();
+    }
+}
+static void x_chip_cb(lv_event_t *e) {
+    intptr_t ud = (intptr_t)lv_event_get_user_data(e);
+    if (ud >= 1000) x_launch_app((int)(ud - 1000));
+    else            x_do(kTmpl[ud].intent);
+}
+// puzzle
+static void x_puz_cat_cb(lv_event_t *e) {
+    int ci = (int)(intptr_t)lv_event_get_user_data(e);
+    const char *cat = X_PCATS[ci];
+    for (int i = 0; i < X_NPUZ; i++) if (String(kPuzzles[i].category) == cat) { g_x_puz_id = i; break; }
+    g_x_puz_view = 1; g_x_puz_hint = false; g_x_puz_reveal = false; x_render();
+}
+static void x_puz_think_cb(lv_event_t *) { g_x_puz_reveal = !g_x_puz_reveal; x_render(); }
+static void x_puz_hint_cb(lv_event_t *)  {
+    if (!g_x_puz_hint) { g_x_puz_hint = true; g_xs_hints++; x_stats_save(); }
+    x_render();
+}
+static void x_puz_next_cb(lv_event_t *) {
+    String c = kPuzzles[g_x_puz_id].category;
+    for (int k = 1; k <= X_NPUZ; k++) {
+        int j = (g_x_puz_id + k) % X_NPUZ;
+        if (String(kPuzzles[j].category) == c) { g_x_puz_id = j; break; }
+    }
+    g_x_puz_hint = false; g_x_puz_reveal = false; g_x_last = ""; x_render();
+}
+static void x_puz_cats_cb(lv_event_t *) { g_x_puz_view = 0; x_render(); }
+static void x_puz_got_cb(lv_event_t *e) {
+    int correct = (int)(intptr_t)lv_event_get_user_data(e);
+    g_xs_solved++;
+    if (correct) {
+        g_xs_correct++; g_xs_streak++;
+        if (g_xs_streak > g_xs_best) g_xs_best = g_xs_streak;
+        if (kPuzzles[g_x_puz_id].difficulty > g_xs_hard) g_xs_hard = kPuzzles[g_x_puz_id].difficulty;
+        g_x_last = "Correct. Nicely done.";
+    } else {
+        g_xs_streak = 0; g_x_last = "Not this time - keep at it.";
+    }
+    x_stats_save(); x_puz_next_cb(nullptr);
+}
+// knowledge
+static void x_kn_cat_cb(lv_event_t *e) {
+    int ci = (int)(intptr_t)lv_event_get_user_data(e);
+    g_x_kn_cat = X_KCATS[ci]; g_x_kn_view = 1; x_render();
+}
+static void x_kn_art_cb(lv_event_t *e) {
+    g_x_kn_art = (int)(intptr_t)lv_event_get_user_data(e);
+    g_x_kn_view = 2; g_x_kn_more = false; x_render();
+}
+static void x_kn_more_cb(lv_event_t *) { g_x_kn_more = !g_x_kn_more; x_render(); }
+static void x_kn_back_cb(lv_event_t *)  {
+    if (g_x_kn_view == 2) { if (g_x_kn_more) g_x_kn_more = false; else g_x_kn_view = 1; }
+    else g_x_kn_view = 0;
+    x_render();
+}
+
+// ---- view: HOME ------------------------------------------------------------
+static void x_render_home() {
+    x_header("XANDER", NULL);
+    // orb
+    lv_obj_t *orb = lv_obj_create(g_x_scr);
+    lv_obj_remove_style_all(orb);
+    lv_obj_set_size(orb, 140, 140);
+    lv_obj_align(orb, LV_ALIGN_TOP_MID, 0, 78);
+    lv_obj_set_style_radius(orb, LV_RADIUS_CIRCLE, 0);
+    uint32_t oc = (g_x_orb == 1) ? 0x00FF80 : (g_x_orb == 2) ? theme_danger() : theme_primary();
+    lv_obj_set_style_bg_color(orb, lv_color_hex(theme_fg()), 0);
+    lv_obj_set_style_bg_opa(orb, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(orb, lv_color_hex(oc), 0);
+    lv_obj_set_style_border_width(orb, 4, 0);
+    lv_obj_set_style_shadow_color(orb, lv_color_hex(oc), 0);
+    lv_obj_set_style_shadow_width(orb, 28, 0);
+    lv_obj_set_style_shadow_opa(orb, 110, 0);
+    lv_obj_clear_flag(orb, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *g = lv_label_create(orb);
+    const char *glyph = (g_x_orb == 1) ? LV_SYMBOL_OK
+                      : (g_x_orb == 2) ? LV_SYMBOL_WARNING : LV_SYMBOL_EYE_OPEN;
+    lv_label_set_text(g, glyph);
+    lv_obj_set_style_text_color(g, lv_color_hex(oc), 0);
+    lv_obj_set_style_text_font(g, &lv_font_montserrat_28, 0);
+    lv_obj_center(g);
+    // response caption
+    lv_obj_t *r = x_wraplbl(g_x_scr, g_x_last.length() ? g_x_last.c_str()
+                                                       : "What shall we investigate?",
+                            LCD_WIDTH - 60, 0xFFFFFF, &lv_font_montserrat_18);
+    lv_obj_set_style_text_align(r, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(r, LV_ALIGN_TOP_MID, 0, 232);
+    g_x_resp_lbl = r;
+    // COMMAND button
+    lv_obj_t *cmd = x_cbtn(g_x_scr, LV_SYMBOL_KEYBOARD "  COMMAND", 220, theme_primary(), x_cmd_open_cb, 0);
+    lv_obj_align(cmd, LV_ALIGN_TOP_MID, 0, 320);
+    // footers
+    lv_obj_t *f1 = lv_label_create(g_x_scr);
+    lv_label_set_text(f1, LV_SYMBOL_LEFT "  puzzles     knowledge  " LV_SYMBOL_RIGHT);
+    lv_obj_set_style_text_color(f1, lv_color_hex(0x777777), 0);
+    lv_obj_set_style_text_font(f1, &lv_font_montserrat_14, 0);
+    lv_obj_align(f1, LV_ALIGN_BOTTOM_MID, 0, -34);
+    lv_obj_t *f2 = lv_label_create(g_x_scr);
+    lv_label_set_text(f2, LV_SYMBOL_DOWN "  swipe down to exit");
+    lv_obj_set_style_text_color(f2, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_text_font(f2, &lv_font_montserrat_12, 0);
+    lv_obj_align(f2, LV_ALIGN_BOTTOM_MID, 0, -12);
+}
+
+// ---- view: CONSOLE (keyboard + tappable command chips) ---------------------
+static void x_render_console() {
+    x_header("XANDER", "type a command or tap one");
+    lv_obj_t *r = x_wraplbl(g_x_scr, g_x_last.length() ? g_x_last.c_str() : "",
+                            LCD_WIDTH - 40, theme_primary(), &lv_font_montserrat_14);
+    lv_obj_set_style_text_align(r, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(r, LV_ALIGN_TOP_MID, 0, 58);
+    g_x_resp_lbl = r;
+    lv_obj_t *ta = lv_textarea_create(g_x_scr);
+    lv_textarea_set_one_line(ta, true);
+    lv_textarea_set_placeholder_text(ta, "e.g. give me a puzzle");
+    lv_obj_set_width(ta, LCD_WIDTH - 40);
+    lv_obj_set_style_text_font(ta, &lv_font_montserrat_16, 0);
+    lv_obj_align(ta, LV_ALIGN_TOP_MID, 0, 82);
+    lv_obj_t *list = x_list(126, 172);
+    for (int i = 0; i < X_NTMPL; i++)
+        x_row_btn(list, kTmpl[i].label, theme_accent(), x_chip_cb, (intptr_t)i);
+    int nApp = g_app_count < 6 ? g_app_count : 6;
+    for (int j = 0; j < nApp; j++) {
+        String lbl = String(LV_SYMBOL_PLAY "  Launch ") + g_apps[j].name;
+        x_row_btn(list, lbl.c_str(), theme_primary(), x_chip_cb, (intptr_t)(1000 + j));
+    }
+    lv_obj_t *kb = lv_keyboard_create(g_x_scr);
+    lv_obj_set_size(kb, LCD_WIDTH, 196);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(kb, ta);
+    lv_obj_add_event_cb(kb, x_kb_cb, LV_EVENT_ALL, (void *)ta);
+}
+
+// ---- view: PUZZLES ---------------------------------------------------------
+static void x_render_puzzles() {
+    if (g_x_puz_view == 0) {
+        x_header("PUZZLES", "choose a category");
+        lv_obj_t *list = x_list(72, LCD_HEIGHT - 130);
+        for (int i = 0; i < X_NPCAT; i++)
+            x_row_btn(list, x_cap(X_PCATS[i]).c_str(), theme_accent(), x_puz_cat_cb, (intptr_t)i);
+        lv_obj_t *f = lv_label_create(g_x_scr);
+        lv_label_set_text(f, LV_SYMBOL_DOWN "  exit    " LV_SYMBOL_RIGHT "  home");
+        lv_obj_set_style_text_color(f, lv_color_hex(0x666666), 0);
+        lv_obj_set_style_text_font(f, &lv_font_montserrat_12, 0);
+        lv_obj_align(f, LV_ALIGN_BOTTOM_MID, 0, -8);
+        return;
+    }
+    const XPuzzle &p = kPuzzles[g_x_puz_id];
+    char sub[64]; snprintf(sub, sizeof(sub), "#%03d - %s", p.id, x_cap(p.category).c_str());
+    x_header("PUZZLE", sub);
+    lv_obj_t *list = x_list(70, LCD_HEIGHT - 200);
+    lv_obj_t *dl = lv_label_create(list);
+    lv_label_set_text(dl, x_diff(p.difficulty).c_str());
+    lv_obj_set_style_text_color(dl, lv_color_hex(p.difficulty >= 6 ? theme_accent() : 0x999999), 0);
+    lv_obj_set_style_text_font(dl, &lv_font_montserrat_14, 0);
+    x_wraplbl(list, p.question, LCD_WIDTH - 54, 0xFFFFFF, &lv_font_montserrat_18);
+    if (g_x_puz_hint) {
+        lv_obj_t *h = x_wraplbl(list, (String("Hint: ") + p.hint).c_str(),
+                                LCD_WIDTH - 54, theme_accent(), &lv_font_montserrat_16);
+        (void)h;
+    }
+    if (g_x_puz_reveal) {
+        x_wraplbl(list, (String("Answer: ") + p.answer).c_str(),
+                  LCD_WIDTH - 54, 0x00FF80, &lv_font_montserrat_16);
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_width(row, LV_PCT(100));
+        lv_obj_set_height(row, 54);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_style_pad_column(row, 8, 0);
+        x_cbtn(row, "I got it", (LCD_WIDTH - 70) / 2, 0x00FF80, x_puz_got_cb, 1);
+        x_cbtn(row, "Missed it", (LCD_WIDTH - 70) / 2, theme_danger(), x_puz_got_cb, 0);
+    }
+    if (g_x_last.length()) {
+        lv_obj_t *m = x_wraplbl(list, g_x_last.c_str(), LCD_WIDTH - 54, theme_primary(),
+                                &lv_font_montserrat_14);
+        (void)m;
+    }
+    // action bar
+    lv_obj_t *bar = lv_obj_create(g_x_scr);
+    lv_obj_remove_style_all(bar);
+    lv_obj_set_size(bar, LCD_WIDTH - 20, 50);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -34);
+    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(bar, 6, 0);
+    int bw = (LCD_WIDTH - 20 - 18) / 3;
+    x_cbtn(bar, g_x_puz_reveal ? "Hide" : "Think", bw, theme_primary(), x_puz_think_cb, 0);
+    x_cbtn(bar, "Hint", bw, theme_accent(), x_puz_hint_cb, 0);
+    x_cbtn(bar, "Next", bw, theme_primary(), x_puz_next_cb, 0);
+    char sf[80];
+    snprintf(sf, sizeof(sf), "Solved %ld  Streak %ld  Best %ld", g_xs_solved, g_xs_streak, g_xs_best);
+    lv_obj_t *st = lv_label_create(g_x_scr);
+    lv_label_set_text(st, sf);
+    lv_obj_set_style_text_color(st, lv_color_hex(0x666666), 0);
+    lv_obj_set_style_text_font(st, &lv_font_montserrat_12, 0);
+    lv_obj_align(st, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lv_obj_t *pback = x_cbtn(g_x_scr, LV_SYMBOL_LEFT, 44, theme_accent(), x_puz_cats_cb, 0);
+    lv_obj_align(pback, LV_ALIGN_TOP_LEFT, 8, 10);
+}
+
+// ---- view: KNOWLEDGE -------------------------------------------------------
+static int x_cat_count(const char *key) {
+    int c = 0; for (int i = 0; i < X_NART; i++) if (String(kArticles[i].category) == key) c++;
+    return c;
+}
+static void x_render_knowledge() {
+    if (g_x_kn_view == 0) {
+        x_header("KNOWLEDGE", "choose a field");
+        lv_obj_t *list = x_list(72, LCD_HEIGHT - 130);
+        for (int i = 0; i < X_NKCAT; i++) {
+            if (x_cat_count(X_KCATS[i]) == 0) continue;
+            char lbl[48]; snprintf(lbl, sizeof(lbl), "%s  (%d)", x_cap(X_KCATS[i]).c_str(),
+                                   x_cat_count(X_KCATS[i]));
+            x_row_btn(list, lbl, theme_accent(), x_kn_cat_cb, (intptr_t)i);
+        }
+        lv_obj_t *f = lv_label_create(g_x_scr);
+        lv_label_set_text(f, LV_SYMBOL_LEFT "  home    " LV_SYMBOL_DOWN "  exit");
+        lv_obj_set_style_text_color(f, lv_color_hex(0x666666), 0);
+        lv_obj_set_style_text_font(f, &lv_font_montserrat_12, 0);
+        lv_obj_align(f, LV_ALIGN_BOTTOM_MID, 0, -8);
+        return;
+    }
+    if (g_x_kn_view == 1) {
+        x_header(x_cap(g_x_kn_cat.c_str()).c_str(), "articles");
+        lv_obj_t *list = x_list(72, LCD_HEIGHT - 130);
+        for (int i = 0; i < X_NART; i++)
+            if (g_x_kn_cat == kArticles[i].category)
+                x_row_btn(list, kArticles[i].title, theme_accent(), x_kn_art_cb, (intptr_t)i);
+        lv_obj_t *kback = x_cbtn(g_x_scr, LV_SYMBOL_LEFT "  fields", 150, theme_primary(), x_kn_back_cb, 0);
+        lv_obj_align(kback, LV_ALIGN_BOTTOM_MID, 0, -10);
+        return;
+    }
+    const XArticle &a = kArticles[g_x_kn_art];
+    x_header(a.title, x_cap(a.category).c_str());
+    lv_obj_t *list = x_list(72, LCD_HEIGHT - 200);
+    x_wraplbl(list, a.summary, LCD_WIDTH - 54, 0xFFFFFF, &lv_font_montserrat_18);
+    if (g_x_kn_more)
+        x_wraplbl(list, a.details, LCD_WIDTH - 54, 0xBBBBBB, &lv_font_montserrat_16);
+    lv_obj_t *bar = lv_obj_create(g_x_scr);
+    lv_obj_remove_style_all(bar);
+    lv_obj_set_size(bar, LCD_WIDTH - 20, 50);
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, -12);
+    lv_obj_set_flex_flow(bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_style_pad_column(bar, 8, 0);
+    x_cbtn(bar, LV_SYMBOL_LEFT "  Back", (LCD_WIDTH - 70) / 2, theme_primary(), x_kn_back_cb, 0);
+    x_cbtn(bar, g_x_kn_more ? "Less" : "More " LV_SYMBOL_RIGHT,
+           (LCD_WIDTH - 70) / 2, theme_accent(), x_kn_more_cb, 0);
+}
+
+// ---- render dispatch -------------------------------------------------------
+// Each render builds a FRESH screen and swaps to it with a short fade, letting
+// LVGL auto-delete the previous Xander screen *after* the animation completes.
+// This is the same deferred-deletion pattern the launcher uses, and it is the
+// key reason a re-render triggered from a button's own click handler is safe:
+// the screen the button lives on is not freed until the current event returns.
+static void x_build_into(lv_obj_t *scr) {
+    g_x_resp_lbl = nullptr;
+    if (g_x_console)            x_render_console();
+    else if (g_x_top == 0)      x_render_puzzles();
+    else if (g_x_top == 2)      x_render_knowledge();
+    else                        x_render_home();
+    (void)scr;
+}
+static lv_obj_t *x_new_screen() {
+    lv_obj_t *s = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(s, lv_color_hex(theme_bg()), 0);
+    lv_obj_set_style_bg_opa(s, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(s, 0, 0);
+    lv_obj_set_style_border_width(s, 0, 0);
+    lv_obj_clear_flag(s, LV_OBJ_FLAG_SCROLLABLE);
+    return s;
+}
+// x_render() may be called from inside an LVGL button/keyboard event.  It only
+// REQUESTS a rebuild -- the actual lv_obj_clean + rebuild happens in loop() via
+// xander_service(), safely outside the event that asked for it.
+static void x_render() {
+    if (!g_xander_active) return;
+    g_x_action = XA_RENDER;
+}
+
+// ---- command execution -----------------------------------------------------
+static void x_launch_app(int i) {
+    if (i < 0 || i >= g_app_count) { g_x_last = xrand(X_R_ERR, 3); g_x_orb = 2; x_finish_info(); return; }
+    // Real DualCore launch: OTA-copy the .bin and reboot into it.
+    load_app_from_sd(g_apps[i]);   // does not return (esp_restart)
+}
+static void x_open_article(int i) {
+    g_x_console = false; g_x_top = 2;
+    g_x_kn_cat = kArticles[i].category; g_x_kn_view = 2; g_x_kn_art = i; g_x_kn_more = false;
+    g_x_orb = 1; x_render();
+}
+static void x_open_puzzle(int i) {
+    g_x_console = false; g_x_top = 0;
+    g_x_puz_view = 1; g_x_puz_id = i; g_x_puz_hint = false; g_x_puz_reveal = false;
+    g_x_orb = 1; x_render();
+}
+static void x_do(int intent) {
+    switch (intent) {
+    case XI_HELP:
+        g_x_last = "Try: launch <app>, give me a puzzle, teach me something, "
+                   "what is <topic>, battery, status, wifi on/off, bluetooth on/off. "
+                   "Swipe up to enter, down to exit, left for puzzles, right for knowledge.";
+        g_x_orb = 0; x_finish_info(); return;
+    case XI_HOME_EXIT:      xander_exit(); return;
+    case XI_OPEN_PUZZLES:   g_x_console = false; g_x_top = 0; g_x_puz_view = 0; g_x_orb = 1; x_render(); return;
+    case XI_OPEN_KNOWLEDGE: g_x_console = false; g_x_top = 2; g_x_kn_view = 0; g_x_kn_cat = ""; g_x_orb = 1; x_render(); return;
+    case XI_GIVE_PUZZLE:    x_open_puzzle((int)(millis() % X_NPUZ)); g_x_last = "Here is one for you."; return;
+    case XI_TEACH:          x_open_article((int)(millis() % X_NART)); g_x_last = "Have a look at this."; return;
+    case XI_WIFI_ON:
+        if (g_wifi_toggle) { g_x_last = "WiFi is already on."; g_x_orb = 0; }
+        else { g_wifi_toggle = true; g_x_last = "WiFi coming up on the next sync."; g_x_orb = 1; }
+        x_finish_info(); return;
+    case XI_WIFI_OFF:
+        if (!g_wifi_toggle) { g_x_last = "WiFi is already off."; g_x_orb = 0; }
+        else { wifi_shutdown(); g_wifi_toggle = false; g_x_last = "WiFi off."; g_x_orb = 1; }
+        x_finish_info(); return;
+    case XI_BLE_ON:
+        if (g_ble_toggle) { g_x_last = "Bluetooth is already on."; g_x_orb = 0; }
+        else { btStart(); g_ble_toggle = true; g_x_last = "Bluetooth on."; g_x_orb = 1; }
+        x_finish_info(); return;
+    case XI_BLE_OFF:
+        if (!g_ble_toggle) { g_x_last = "Bluetooth is already off."; g_x_orb = 0; }
+        else { btStop(); g_ble_toggle = false; g_x_last = "Bluetooth off."; g_x_orb = 1; }
+        x_finish_info(); return;
+    case XI_GPS_ON:   g_x_gps = true;  g_x_last = "GPS marked on (no module wired on this board yet)."; g_x_orb = 1; x_finish_info(); return;
+    case XI_GPS_OFF:  g_x_gps = false; g_x_last = "GPS off."; g_x_orb = 1; x_finish_info(); return;
+    case XI_BEACON_ON:  g_x_beacon = true;  g_x_last = "Beacon marked on (virtual until hardware is fitted)."; g_x_orb = 1; x_finish_info(); return;
+    case XI_BEACON_OFF: g_x_beacon = false; g_x_last = "Beacon off."; g_x_orb = 1; x_finish_info(); return;
+    case XI_SHOW_BATTERY: {
+        if (g_batt_pct < 0) g_x_last = "I cannot read the battery right now.";
+        else { char b[64]; snprintf(b, sizeof(b), "Battery at %d%%%s.", g_batt_pct,
+                                    g_charging ? " and charging" : ""); g_x_last = b; }
+        g_x_orb = 1; x_finish_info(); return;
+    }
+    case XI_SHOW_STATUS: {
+        char b[128];
+        snprintf(b, sizeof(b), "Battery %d%%%s  -  WiFi %s  -  BLE %s",
+                 g_batt_pct < 0 ? 0 : g_batt_pct, g_charging ? " (chg)" : "",
+                 g_wifi_connected ? "on" : "off", g_ble_toggle ? "on" : "off");
+        g_x_last = b; g_x_orb = 1; x_finish_info(); return;
+    }
+    default: g_x_last = xrand(X_R_UNK, 3); g_x_orb = 2; x_finish_info(); return;
+    }
+}
+static void x_process(String raw) {
+    String in = raw; in.toLowerCase(); in.trim();
+    if (in.length() == 0) { g_x_last = xrand(X_R_UNK, 3); g_x_orb = 2; x_finish_info(); return; }
+    // knowledge-topic triggers
+    static const char *trigs[] = { "what is", "what's", "whats", "what are",
+                                   "tell me about", "explain", "define", "teach me about" };
+    int tp = -1;
+    for (unsigned i = 0; i < sizeof(trigs)/sizeof(trigs[0]); i++) {
+        int idx = in.indexOf(trigs[i]);
+        if (idx >= 0) { tp = idx + (int)strlen(trigs[i]); break; }
+    }
+    if (tp >= 0) {
+        String topic = in.substring(tp); topic.replace("?", " "); topic.trim();
+        int a = x_find_article(topic.length() ? topic : in);
+        if (a >= 0) { x_open_article(a); g_x_last = "Here is what I have."; return; }
+        g_x_last = "I do not have that in my library yet."; g_x_orb = 2; x_finish_info(); return;
+    }
+    String t[12]; int n = x_tokenize(in, t, 12);
+    int ti; int ts = x_best_tmpl(t, n, ti);
+    int ai; int as = x_find_app_tok(t, n, ai);
+    bool launchVerb = x_tok_has(t, n, "launch") || x_tok_has(t, n, "start") ||
+                      x_tok_has(t, n, "run") || x_tok_has(t, n, "open");
+    if (as > 0 && (as > ts || (launchVerb && as >= ts))) { x_launch_app(ai); return; }
+    if (ts >= 1 && ti >= 0) { x_do(kTmpl[ti].intent); return; }
+    if (as > 0) { x_launch_app(ai); return; }
+    g_x_last = xrand(X_R_UNK, 3); g_x_orb = 2; x_finish_info();
+}
+
+// ---- enter / exit / swipe --------------------------------------------------
+static void xander_enter() {
+    x_stats_load();
+    g_xander_active = true;
+    current_screen  = SCREEN_FACE;   // exit always returns to the watch face
+    g_x_top = 1; g_x_console = false; g_x_orb = 0;
+    g_x_puz_view = 0; g_x_kn_view = 0; g_x_kn_cat = "";
+    g_x_last = xrand(X_R_GREET, 4);
+    // The real build happens in loop() -> xander_service().  This keeps us out
+    // of the LVGL event that may have called us (a Settings card tap) and lets
+    // us free the launcher screens before allocating Xander's views.
+    g_x_action = XA_ENTER;
+    USBSerial.println("[XANDER] enter requested");
+}
+static void xander_exit() {
+    g_xander_active = false;
+    g_x_action = XA_EXIT;            // rebuild launcher + fade to face in loop()
+    USBSerial.println("[XANDER] exit requested");
+}
+
+// ---- deferred Xander worker (called every loop(), NEVER from an event) ------
+static void xander_free_launcher_screens() {
+    // Reclaim the LVGL object pool the launcher's heavy screens hold while
+    // Xander is on top.  FACE is kept (we return to it) and we never delete the
+    // screen that is active right now.
+    lv_obj_t *act = lv_scr_act();
+    for (int i = 0; i < NUM_SCREENS; i++) {
+        if (i == SCREEN_FACE) continue;
+        if (screens[i] && screens[i] != act) {
+            lv_obj_del(screens[i]);
+            screens[i] = nullptr;
+        }
+    }
+}
+static void xander_rebuild_launcher_screens() {
+    if (!screens[SCREEN_APPS])     build_screen_apps();
+    if (!screens[SCREEN_SETTINGS]) build_screen_settings();
+    if (!screens[SCREEN_BATTERY])  build_screen_battery();
+}
+static void xander_service() {
+    // Delayed 2nd free pass: frees whatever screen was active at enter time
+    // (e.g. Settings) once Xander has become the active screen.
+    if (g_x_free_at && millis() >= g_x_free_at) {
+        g_x_free_at = 0;
+        if (g_xander_active) xander_free_launcher_screens();
+    }
+    if (g_x_action == XA_NONE) return;
+    XAction act = g_x_action;
+    g_x_action = XA_NONE;
+
+    if (act == XA_ENTER) {
+        // Free what we safely can BEFORE building so the pool has headroom.
+        xander_free_launcher_screens();
+        if (!g_x_scr) g_x_scr = x_new_screen();
+        lv_obj_clean(g_x_scr);
+        g_x_resp_lbl = nullptr;
+        x_build_into(g_x_scr);
+        lv_scr_load_anim(g_x_scr, LV_SCR_LOAD_ANIM_FADE_ON, 160, 0, false);
+        g_x_free_at = millis() + 240;   // free the (now-inactive) enter screen next
+    } else if (act == XA_RENDER) {
+        if (g_xander_active) {
+            if (!g_x_scr) g_x_scr = x_new_screen();
+            bool was_active = (lv_scr_act() == g_x_scr);
+            lv_obj_clean(g_x_scr);      // reference pattern: clear + redraw in place
+            g_x_resp_lbl = nullptr;
+            x_build_into(g_x_scr);
+            if (!was_active)
+                lv_scr_load_anim(g_x_scr, LV_SCR_LOAD_ANIM_FADE_ON, 90, 0, false);
+        }
+    } else if (act == XA_EXIT) {
+        // Clear Xander's widgets FIRST (frees the pool), then rebuild the
+        // launcher screens and fade back to the face.  g_x_scr is kept (empty)
+        // for reuse on the next enter.
+        if (g_x_scr) lv_obj_clean(g_x_scr);
+        g_x_resp_lbl = nullptr;
+        xander_rebuild_launcher_screens();
+        current_screen = SCREEN_FACE;
+        lv_scr_load_anim(screens[SCREEN_FACE], LV_SCR_LOAD_ANIM_FADE_ON, 160, 0, false);
+    }
+}
+static void xander_handle_swipe(SwipeEvent ev) {
+    if (!g_xander_active) return;
+    if (g_x_console) { if (ev == SWIPE_DOWN) { g_x_console = false; x_render(); } return; }
+    if (ev == SWIPE_DOWN) { xander_exit(); return; }
+    if (ev == SWIPE_LEFT || ev == SWIPE_RIGHT) {
+        // first pop any open sub-view before moving the top-level ring
+        bool popped = false;
+        if (g_x_top == 0 && g_x_puz_view > 0) { g_x_puz_view = 0; popped = true; }
+        else if (g_x_top == 2 && g_x_kn_view > 0) {
+            if (g_x_kn_view == 2) { if (g_x_kn_more) g_x_kn_more = false; else g_x_kn_view = 1; }
+            else g_x_kn_view = 0;
+            popped = true;
+        }
+        if (popped) { x_render(); return; }
+        int ni = g_x_top + (ev == SWIPE_LEFT ? -1 : 1);
+        if (ni < 0) ni = 0; if (ni > 2) ni = 2;
+        if (ni != g_x_top) {
+            g_x_top = ni;
+            if (ni == 0) g_x_puz_view = 0;
+            if (ni == 2) { g_x_kn_view = 0; g_x_kn_cat = ""; }
+            g_x_orb = 0; g_x_last = "";
+            x_render();
+        }
+    }
+}
+
+// ---- Settings -> Xander subview --------------------------------------------
+static lv_obj_t *g_xset_scr = nullptr;
+static void xset_back_cb(lv_event_t *) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    lv_scr_load_anim(screens[SCREEN_SETTINGS], LV_SCR_LOAD_ANIM_FADE_ON,
+                     SCREEN_SWITCH_ANIM_MS, 0, true);
+    current_screen = SCREEN_SETTINGS;
+    g_xset_scr = nullptr;
+}
+static void xset_voice_cb(lv_event_t *e) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    g_x_voice = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED); x_settings_save();
+}
+static void xset_aon_cb(lv_event_t *e) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    g_x_alwayson = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED); x_settings_save();
+}
+static void xset_blim_cb(lv_event_t *e) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    g_x_battlim = lv_dropdown_get_selected(lv_event_get_target(e)); x_settings_save();
+}
+static void xset_reset_cb(lv_event_t *) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    g_xs_solved = g_xs_correct = g_xs_hints = g_xs_streak = g_xs_best = g_xs_hard = 0;
+    x_stats_save();
+    show_xander_settings();   // rebuild to reflect zeros
+}
+static void show_xander_settings() {
+    x_stats_load();
+    g_xset_scr = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(g_xset_scr, lv_color_hex(theme_bg()), 0);
+    lv_obj_set_style_bg_opa(g_xset_scr, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(g_xset_scr, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *h1 = lv_label_create(g_xset_scr);
+    lv_label_set_text(h1, "Xander");
+    lv_obj_set_style_text_color(h1, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(h1, &lv_font_montserrat_28, 0);
+    lv_obj_align(h1, LV_ALIGN_TOP_LEFT, 24, 22);
+    lv_obj_t *h2 = lv_label_create(g_xset_scr);
+    lv_label_set_text(h2, "companion settings");
+    lv_obj_set_style_text_color(h2, lv_color_hex(0x666666), 0);
+    lv_obj_set_style_text_font(h2, &lv_font_montserrat_12, 0);
+    lv_obj_align(h2, LV_ALIGN_TOP_LEFT, 24, 58);
+    lv_obj_t *list = lv_obj_create(g_xset_scr);
+    lv_obj_set_size(list, LCD_WIDTH - 30, LCD_HEIGHT - 100);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 88);
+    lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(list, 0, 0);
+    lv_obj_set_style_pad_all(list, 6, 0);
+    lv_obj_set_style_pad_row(list, 10, 0);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    char sb[96];
+    snprintf(sb, sizeof(sb), "Solved %ld  Correct %ld  Best streak %ld  Hardest %ld/5",
+             g_xs_solved, g_xs_correct, g_xs_best, g_xs_hard);
+    lv_obj_t *stat = lv_label_create(list);
+    lv_label_set_text(stat, sb);
+    lv_obj_set_style_text_color(stat, lv_color_hex(theme_primary()), 0);
+    lv_obj_set_style_text_font(stat, &lv_font_montserrat_14, 0);
+    card_toggle(list, "Voice Response", "spoken replies (v1.5)", g_x_voice, xset_voice_cb);
+    card_toggle(list, "Always-On Xander", "wake-word listening (v1.5)", g_x_alwayson, xset_aon_cb);
+    card_dropdown(list, "Battery Limit", "pause always-on below",
+                  "20%\n30%\n40%\nNever", g_x_battlim, xset_blim_cb);
+    card_action(list, "Reset Puzzle Stats", "clears all counters",
+                LV_SYMBOL_TRASH "  Reset", theme_danger(), xset_reset_cb);
+    card_action(list, "Back", "return to settings",
+                LV_SYMBOL_LEFT "  Back", theme_primary(), xset_back_cb);
+    lv_scr_load_anim(g_xset_scr, LV_SCR_LOAD_ANIM_FADE_ON, SCREEN_SWITCH_ANIM_MS, 0, false);
+}
+
+// ---- settings-card entry points --------------------------------------------
+static void xander_open_home_cb(lv_event_t *) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    xander_enter();
+}
+static void xander_open_settings_cb(lv_event_t *) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    show_xander_settings();
+}
+// ############################################################################
+// #                        END XANDER v1.0 MODULE                            #
+// ############################################################################
+
 void setup() {
     USBSerial.begin(115200);
 
@@ -3714,22 +4663,32 @@ void loop() {
         SwipeEvent ev = g_pending_swipe;
         g_pending_swipe = SWIPE_NONE;
         lastSwipeMs = now;                          // arm the post-swipe click-guard
-        // v7.0: when Apps is in COVERFLOW mode, horizontal swipes cycle the
-        // carousel instead of jumping to the neighbouring launcher screen.
-        // A user can still leave the Apps screen by swiping past the end
-        // of the coverflow via the same swipe direction (falls through
-        // to goto_screen once the carousel wraps).  We keep it simple:
-        // in COVERFLOW mode swipes ALWAYS cycle the carousel; leaving
-        // Apps is done via BOOT button or SETTINGS screen.
-        if (current_screen == SCREEN_APPS && g_launcher_style == LS_COVERFLOW &&
-            g_cf_count > 1) {
-            if (ev == SWIPE_LEFT)  cf_goto(g_cf_index + 1, true);
-            if (ev == SWIPE_RIGHT) cf_goto(g_cf_index - 1, true);
-        } else {
-            if (ev == SWIPE_LEFT)  goto_screen(current_screen + 1);
-            if (ev == SWIPE_RIGHT) goto_screen(current_screen - 1);
+
+        // v1.0-XANDER gesture routing.  Xander is a hidden layer BENEATH the
+        // clock face: swipe UP from the face to enter, swipe DOWN anywhere in
+        // Xander to leave.  While Xander owns the screen it consumes every
+        // gesture (left/right navigate Puzzles<->Home<->Knowledge).  On the
+        // normal launcher screens the original horizontal nav is untouched.
+        if (g_xander_active) {
+            xander_handle_swipe(ev);
+        } else if (current_screen == SCREEN_FACE && ev == SWIPE_UP) {
+            xander_enter();
+        } else if (ev == SWIPE_LEFT || ev == SWIPE_RIGHT) {
+            if (current_screen == SCREEN_APPS && g_launcher_style == LS_COVERFLOW &&
+                g_cf_count > 1) {
+                if (ev == SWIPE_LEFT)  cf_goto(g_cf_index + 1, true);
+                if (ev == SWIPE_RIGHT) cf_goto(g_cf_index - 1, true);
+            } else {
+                if (ev == SWIPE_LEFT)  goto_screen(current_screen + 1);
+                if (ev == SWIPE_RIGHT) goto_screen(current_screen - 1);
+            }
         }
     }
+
+    // Xander builds/redraws/tears-down its screen here -- OUTSIDE the LVGL
+    // event + swipe handling above -- so it can safely clean widgets and free
+    // the launcher screens without freeing something mid-event.
+    xander_service();
 
     // -------------------------------------------------------------------
     // Side PWR button -- routed through the AXP2101 PMU (not a GPIO).

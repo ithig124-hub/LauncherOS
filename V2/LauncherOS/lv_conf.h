@@ -189,7 +189,7 @@
 #define LV_USE_CHART        0
 #define LV_USE_COLORWHEEL   0
 #define LV_USE_IMGBTN       0
-#define LV_USE_KEYBOARD     0
+#define LV_USE_KEYBOARD     1
 #define LV_USE_LED          0
 #define LV_USE_LIST         1     /* <-- launcher uses this */
 #define LV_USE_MENU         0
