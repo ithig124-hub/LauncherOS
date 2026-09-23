@@ -1,5 +1,5 @@
 // =====================================================================
-//  SportOS.ino  --  v5.1  Multi-Sport Navigation Edition
+//  SportOS.ino  --  v5.2  Always-On Pedometer Edition
 //  LauncherOS-compatible Workout / Sport module
 //  Target  : Waveshare ESP32-S3 Touch AMOLED 2.06
 //  Build   : ESP32-S3 Dev Module, PSRAM=OPI, Partition=Minimal SPIFFS (large APP)
@@ -11,6 +11,9 @@
 //      Motion comparison is experimental wrist repeatability, not coaching.
 //  v5.1: Visible SPORTS / TRAIN / TOOLS Home tabs, direct sport entries,
 //        and fixed Home navigation while sessions continue in the background.
+//  v5.2: Display-off always leaves the ESP32 and QMI8658 running so daily
+//        steps continue recording. The former deep-sleep button is now a
+//        Screen Off control, and day rollover runs in the background loop.
 //
 //  Screen timeout port from LauncherOS:
 //    + 15 s inactivity timeout; 220 ms fade out / 200 ms fade in
@@ -70,7 +73,6 @@
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
 #include <esp_system.h>
-#include <esp_sleep.h>
 #include <esp_bt.h>
 #include <esp32-hal-cpu.h>
 #include <Update.h>
@@ -3169,7 +3171,7 @@ static void build_screen_apps(){
     lv_obj_set_style_bg_color(s,lv_color_hex(COL_BG),0);
     lv_obj_set_style_bg_opa(s,LV_OPA_COVER,0);
     lv_obj_clear_flag(s,LV_OBJ_FLAG_SCROLLABLE);
-    mk_label(s,"SPORT//OS  5.1",&lv_font_montserrat_22,ACCENT_SPORT,LV_ALIGN_TOP_MID,0,20,2);
+    mk_label(s,"SPORT//OS  5.2",&lv_font_montserrat_22,ACCENT_SPORT,LV_ALIGN_TOP_MID,0,20,2);
     mk_label(s,"Tap a tab | Scroll for more sports",&lv_font_montserrat_12,COL_MUTED3,LV_ALIGN_TOP_MID,0,52);
     const char *tabs[]={"SPORTS","TRAIN","TOOLS"};
     for(int i=0;i<3;i++){
@@ -3310,11 +3312,11 @@ static void build_screen_battery(){
     lv_obj_set_style_border_width(sleepBtn,1,0);
     lv_obj_add_event_cb(sleepBtn,[](lv_event_t*){
         if(millis()-lastSwipeMs<CLICK_AFTER_SWIPE_MS) return;
-        static_cast<Arduino_CO5300*>(gfx)->setBrightness(0);
-        esp_sleep_enable_ext1_wakeup((1ULL<<BOOT_BTN), ESP_EXT1_WAKEUP_ANY_LOW);
-        esp_deep_sleep_start();
+        // Turn off only the AMOLED panel. loop(), the ESP32 and QMI8658
+        // continue running, so the daily pedometer keeps recording steps.
+        screen_off();
     },LV_EVENT_CLICKED,NULL);
-    mk_label(sleepBtn, LV_SYMBOL_POWER "  Sleep Now",
+    mk_label(sleepBtn, LV_SYMBOL_POWER "  Screen Off",
              &lv_font_montserrat_16, ACCENT_CYAN, LV_ALIGN_CENTER,0,0);
 
     lv_obj_t *launchBtn=lv_btn_create(s);
@@ -3372,6 +3374,9 @@ static void screen_off(){
     touchActive = false;
     if(g_touch_indev) lv_indev_reset(g_touch_indev, NULL);
     FT3168->IIC_Interrupt_Flag = false;
+    // Save the latest daily total before the panel fades. Further steps are
+    // checkpointed every minute while the screen remains dark.
+    save_settings();
     fade_brightness(0, SCREEN_FADE_OFF_MS);
 }
 static void screen_on(){
@@ -3660,10 +3665,12 @@ void loop(){
         show_ach_toast(id);
     }
 
-    // v3: periodic save of daily step counter (every 60 s while awake)
+    // Persist and roll the daily pedometer every minute whether the AMOLED
+    // is visible or dark. Screen-off never suspends this loop or the IMU.
     static uint32_t t_save = 0;
     if(now - t_save > 60000){
         t_save = now;
+        daily_rollover_tick();
         save_settings();
         // also unlock daily-10k badge live, not just post-session
         if(S.today_steps >= 10000) unlock_ach(ACH_STEPS_10K);
