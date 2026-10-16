@@ -150,6 +150,7 @@ static void pmu_init() {
 
 // ---- Back-to-launcher (mandatory) -------------------------------------------
 static void return_to_launcher() {
+  time_publish("exit", false);   // hand the clock back to the launcher
   const esp_partition_t *factory = esp_partition_find_first(
     ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
   if (factory) {
@@ -232,17 +233,154 @@ static int32_t  g_gmt_offset_sec = 0;
 static bool     g_time_valid = false;
 static uint32_t g_last_ntp_ok = 0;
 
+// ---- shared time block (spec: TIME_CONTRACT.md) -----------------------------
+#define TIME_SERIAL Serial
+#define TIME_SRC_ID TIME_SRC_MODULE
+// ===== SHARED TIME BLOCK v2 =================================================
+//  Inlined verbatim into every app in this repo.  Spec + rationale:
+//  TIME_CONTRACT.md.  Only the two lines above the block may differ per app:
+//      #define TIME_SERIAL  Serial          // or USBSerial
+//      #define TIME_SRC_ID  TIME_SRC_MODULE // or TIME_SRC_LAUNCHER
+//
+//  Namespace "rtcsave" -- the ONE place the watch's wall clock lives:
+//      t    uint32  unix epoch seconds, UTC
+//      gmt  int32   local offset from UTC, in SECONDS   (+28800 = UTC+8)
+//      seq  uint32  write counter, ++ on every publish  (diagnostics)
+//      man  uint8   1 = a human set this clock, 0 = machine (NTP/boot).  A boot
+//                       refresh keeps it; a machine that lands a NEW epoch clears it.
+//      src  uint8   0 = launcher, 1 = module            (diagnostics)
+//
+//  Two different things have to survive a reboot, and only one of them does:
+//    * the EPOCH lives in the chip's RTC timer.  It survives every software
+//      reset and every deep sleep, so a launcher <-> module reboot inherits
+//      it for free -- but power loss wipes it, and then this snapshot is the
+//      only thing between the user and "00:00".
+//    * the TIMEZONE lives in the C library's TZ string, which is RAM-ONLY.
+//      It dies on EVERY reboot and no app can inherit it from the previous
+//      one.  NVS is therefore the offset's only home.
+//  => frame: epoch is inherited through the RTC, backed up here.
+//     timezone is stored here and re-applied by every single boot.
+// ============================================================================
+#define TIME_VALID_MIN      1700000000UL   // ~2023-11-14: "the RTC has been set"
+#define TIME_ADOPT_SLACK_S  2L             // ignore sub-2 s snapshot/rtc skew
+#define TIME_SRC_LAUNCHER   0
+#define TIME_SRC_MODULE     1
+
+static int32_t  g_tp_gmt   = 0;   // local offset from UTC, in seconds
+static uint32_t g_tp_seq   = 0;   // last seq we read or wrote
+static bool     g_tp_valid = false;   // a plausible wall clock is available
+
+// Point the C library at the local UTC offset.  TZ is RAM-only, so this must
+// run on EVERY boot in EVERY app or the watch silently renders UTC.
+// POSIX counts the offset backwards from local to UTC, hence the minus.
+static void time_apply_tz(int32_t gmt_sec) {
+    long mins = -(gmt_sec / 60);
+    long a    = labs(mins);
+    char tz[24];
+    snprintf(tz, sizeof(tz), "UTC%c%ld:%02ld", mins < 0 ? '-' : '+', a / 60, a % 60);
+    setenv("TZ", tz, 1);
+    tzset();
+    g_tp_gmt = gmt_sec;
+}
+
+// Is the shared NVS snapshot a better clock than the one the chip is holding?
+//   nothing saved yet            -> leave everything alone
+//   chip has no valid clock      -> cold boot / dead battery: adopt the NVS
+//   a human set it (man=1)       -> their correction wins in EITHER direction
+//   snapshot runs ahead of the   -> somebody moved the clock forward: adopt
+//   chip by more than the slack
+//   otherwise                    -> the RTC is the live clock, keep it
+//   Returns TIME_DEC_* below (uint8_t return keeps the Arduino .ino auto
+//   prototype generator, which runs before this enum is declared, happy).
+enum TimeDecision { TIME_DEC_NOTHING = 0, TIME_DEC_KEEP_RTC = 1, TIME_DEC_ADOPT = 2 };
+static uint8_t time_decide(time_t rtc_now, uint32_t snap_t, uint8_t snap_man) {
+    if (snap_t < TIME_VALID_MIN)                       return TIME_DEC_NOTHING;
+    if (rtc_now < (time_t)TIME_VALID_MIN)              return TIME_DEC_ADOPT;
+    if (snap_man && labs((long)snap_t - (long)rtc_now) > TIME_ADOPT_SLACK_S)
+                                                       return TIME_DEC_ADOPT;
+    if ((int32_t)(snap_t - (uint32_t)rtc_now) > TIME_ADOPT_SLACK_S)
+                                                       return TIME_DEC_ADOPT;
+    return TIME_DEC_KEEP_RTC;
+}
+
+// WRITE half of the contract: epoch + offset + provenance.  Call it after
+// every NTP sync, after a manual set, before deep sleep, and on the way out of
+// the app (before esp_restart()).
+static void time_publish(const char *why, bool manual) {
+    time_t now; time(&now);
+    if (now < (time_t)TIME_VALID_MIN) return;      // RTC not set yet
+    Preferences p;
+    if (!p.begin("rtcsave", false)) return;
+    uint32_t prev     = p.getULong("t", 0);
+    uint8_t  prev_man = p.getUChar("man", 0);
+    // A human's correction stays in force while the snapshot still describes
+    // the same instant.  Every boot refreshes `t` by a second or so and must
+    // not quietly demote the clock back to "machine" -- otherwise the man=1
+    // rule above only survives a single reboot.  A machine that lands a
+    // genuinely DIFFERENT epoch (an NTP sync) does take the clock over.
+    bool machine_moved_it = !prev ||
+                            labs((long)now - (long)prev) > TIME_ADOPT_SLACK_S;
+    uint8_t man = (manual || (prev_man && !machine_moved_it)) ? 1 : 0;
+    p.putULong("t",   (uint32_t)now);
+    p.putLong ("gmt", g_tp_gmt);
+    p.putUChar("man", man);
+    p.putUChar("src", TIME_SRC_ID);
+    g_tp_seq = p.getULong("seq", 0) + 1;           // read-modify-write, session open
+    p.putULong("seq", g_tp_seq);
+    p.end();
+    TIME_SERIAL.printf("[time] publish t=%lu gmt=%ld seq=%lu man=%d (%s)\n",
+                       (unsigned long)now, (long)g_tp_gmt,
+                       (unsigned long)g_tp_seq, man, why);
+}
+
+// READ half: reconcile the EPOCH, then ALWAYS re-apply the TIMEZONE, then
+// republish so the snapshot never lags the running clock by more than a boot.
+// Call this at the very top of setup(), before anything that shows a time.
 static void time_restore_from_nvs() {
+    time_t rtc_now = 0; time(&rtc_now);
+
+    uint32_t snap_t = 0, snap_seq = 0;
+    int32_t  snap_gmt = 0;
+    uint8_t  snap_man = 0;
+    Preferences p;
+    if (p.begin("rtcsave", true)) {
+        snap_t   = p.getULong("t",   0);
+        snap_gmt = p.getLong ("gmt", 0);
+        snap_seq = p.getULong("seq", 0);
+        snap_man = p.getUChar("man", 0);
+        p.end();
+    }
+    if (snap_seq == 0 && snap_t) snap_seq = 1;     // pre-v2 snapshot
+
+    uint8_t d = time_decide(rtc_now, snap_t, snap_man);
+    if (d == TIME_DEC_ADOPT) {
+        struct timeval tv = { (time_t)snap_t, 0 };
+        settimeofday(&tv, NULL);                   // writes the chip RTC as well
+        g_tp_valid = true;
+        TIME_SERIAL.printf("[time] adopted NVS t=%lu (rtc was %ld man=%d)\n",
+                           (unsigned long)snap_t, (long)rtc_now, snap_man);
+    } else if (d == TIME_DEC_KEEP_RTC) {
+        g_tp_valid = true;                         // v6.2 rule: never rewind a live RTC
+        TIME_SERIAL.printf("[time] RTC live t=%ld -- NVS kept as fallback\n",
+                           (long)rtc_now);
+    } else {
+        TIME_SERIAL.println("[time] no persisted clock -- waiting for NTP");
+    }
+
+    // TZ is the part that never survives a reboot: take it from here, always.
+    if (snap_t) time_apply_tz(snap_gmt);
+    g_tp_seq = snap_seq;
+    time_publish("boot", false);                   // keep the snapshot current
+}
+// ===== END SHARED TIME BLOCK v2 =============================================
+// The block owns the epoch + timezone.  TacticalOS keeps its own extras
+// (the last-NTP stamp) and mirrors the block's state into the app.
+static void time_restore_extras() {
   g_timeprefs.begin("rtcsave", true);
-  uint32_t t   = g_timeprefs.getULong("t", 0);
-  int32_t  gmt = g_timeprefs.getLong("gmt", 0);
   g_last_ntp_ok = g_timeprefs.getULong("ntp", 0);
   g_timeprefs.end();
-  if (t < 1700000000UL) return;
-  g_gmt_offset_sec = gmt;
-  struct timeval tv = { (time_t)t, 0 };
-  settimeofday(&tv, NULL);
-  g_time_valid = true;
+  g_gmt_offset_sec = g_tp_gmt;   // offset of record
+  g_time_valid     = g_tp_valid;
 }
 
 // =============================================================================
@@ -291,6 +429,7 @@ static bool wifi_sync_once() {
     uint32_t t0 = millis();
     while (millis() - t0 < 4000) {
       if (WiFi.status() == WL_CONNECTED) {
+        time_apply_tz(g_gmt_offset_sec);   // pin the TZ string: the timezone is RAM-only and dies every reboot
         configTime(g_gmt_offset_sec, 0, "pool.ntp.org");
         delay(800);
         struct tm tm;
@@ -298,9 +437,8 @@ static bool wifi_sync_once() {
           g_time_valid = true;
           time_t nowt; time(&nowt);
           g_last_ntp_ok = (uint32_t)nowt;
+          time_publish("ntp ok", false);   // epoch + offset (single writer for "rtcsave")
           g_timeprefs.begin("rtcsave", false);
-          g_timeprefs.putULong("t",   (uint32_t)nowt);
-          g_timeprefs.putLong ("gmt", g_gmt_offset_sec);
           g_timeprefs.putULong("ntp", g_last_ntp_ok);
           g_timeprefs.end();
         }
@@ -3134,6 +3272,7 @@ void setup() {
   show_splash();
   qmi_init();
   time_restore_from_nvs();
+  time_restore_extras();          // TacticalOS's own last-NTP stamp
   hist_load();
   wp_load();
   // v2.3: pin_load() removed -- PIN lock no longer exists.

@@ -1,6 +1,22 @@
 // ============================================================================
 //  LauncherOS.ino   --   DualCore Watch launcher  (LVGL 8.3 / 8.4)
 //  ----------------------------------------------------------------------------
+//  ----------------------------------------------------------------------------
+//  v7.1 -- UNIVERSAL CLOCK (shared time contract, see TIME_CONTRACT.md).
+//      * the wall clock lives in ONE place: NVS "rtcsave" (t = epoch,
+//        gmt = offset in SECONDS, seq, man, src).  The SHARED TIME BLOCK
+//        below is inlined verbatim into every app under V2/.
+//      * THE BUG THIS FIXES: the epoch rides in the chip's RTC across a
+//        launcher <-> module reboot, but the TIMEZONE lives in the C
+//        library's RAM-only TZ string and dies on EVERY reboot.  Every app
+//        now re-applies TZ from the snapshot at boot, so UTC+8 renders as
+//        UTC+8 everywhere instead of UTC.
+//      * the launcher WRITES the clock to the chip (settimeofday) + NVS at
+//        every sync point, when GMT_OFFSET is (re)read, every 5 min, on
+//        entering deep sleep, and immediately before it reboots into an
+//        app -- and ADOPTS the snapshot on the way back when a module
+//        moved it.
+//
 //  v7.0 (merged) -- 11 themes, card-based Settings, launcher styles, 3D
 //                   carousel loader, developer info, factory reset.
 //
@@ -737,66 +753,156 @@ static uint32_t g_last_sync_ms  = 0;
 // also snapshot the current unix time to NVS at every sync point and on
 // every periodic tick, so a cold boot can resume the wall clock instantly --
 // no NTP round-trip needed for the face to show a sensible time.
-static Preferences g_timeprefs;
-static uint32_t    g_last_time_save_ms = 0;
+// ---- shared time block (spec: TIME_CONTRACT.md) -----------------------------
+#define TIME_SERIAL USBSerial
+#define TIME_SRC_ID TIME_SRC_LAUNCHER
+// ===== SHARED TIME BLOCK v2 =================================================
+//  Inlined verbatim into every app in this repo.  Spec + rationale:
+//  TIME_CONTRACT.md.  Only the two lines above the block may differ per app:
+//      #define TIME_SERIAL  Serial          // or USBSerial
+//      #define TIME_SRC_ID  TIME_SRC_MODULE // or TIME_SRC_LAUNCHER
+//
+//  Namespace "rtcsave" -- the ONE place the watch's wall clock lives:
+//      t    uint32  unix epoch seconds, UTC
+//      gmt  int32   local offset from UTC, in SECONDS   (+28800 = UTC+8)
+//      seq  uint32  write counter, ++ on every publish  (diagnostics)
+//      man  uint8   1 = a human set this clock, 0 = machine (NTP/boot).  A boot
+//                       refresh keeps it; a machine that lands a NEW epoch clears it.
+//      src  uint8   0 = launcher, 1 = module            (diagnostics)
+//
+//  Two different things have to survive a reboot, and only one of them does:
+//    * the EPOCH lives in the chip's RTC timer.  It survives every software
+//      reset and every deep sleep, so a launcher <-> module reboot inherits
+//      it for free -- but power loss wipes it, and then this snapshot is the
+//      only thing between the user and "00:00".
+//    * the TIMEZONE lives in the C library's TZ string, which is RAM-ONLY.
+//      It dies on EVERY reboot and no app can inherit it from the previous
+//      one.  NVS is therefore the offset's only home.
+//  => frame: epoch is inherited through the RTC, backed up here.
+//     timezone is stored here and re-applied by every single boot.
+// ============================================================================
+#define TIME_VALID_MIN      1700000000UL   // ~2023-11-14: "the RTC has been set"
+#define TIME_ADOPT_SLACK_S  2L             // ignore sub-2 s snapshot/rtc skew
+#define TIME_SRC_LAUNCHER   0
+#define TIME_SRC_MODULE     1
+
+static int32_t  g_tp_gmt   = 0;   // local offset from UTC, in seconds
+static uint32_t g_tp_seq   = 0;   // last seq we read or wrote
+static bool     g_tp_valid = false;   // a plausible wall clock is available
+
+// Point the C library at the local UTC offset.  TZ is RAM-only, so this must
+// run on EVERY boot in EVERY app or the watch silently renders UTC.
+// POSIX counts the offset backwards from local to UTC, hence the minus.
+static void time_apply_tz(int32_t gmt_sec) {
+    long mins = -(gmt_sec / 60);
+    long a    = labs(mins);
+    char tz[24];
+    snprintf(tz, sizeof(tz), "UTC%c%ld:%02ld", mins < 0 ? '-' : '+', a / 60, a % 60);
+    setenv("TZ", tz, 1);
+    tzset();
+    g_tp_gmt = gmt_sec;
+}
+
+// Is the shared NVS snapshot a better clock than the one the chip is holding?
+//   nothing saved yet            -> leave everything alone
+//   chip has no valid clock      -> cold boot / dead battery: adopt the NVS
+//   a human set it (man=1)       -> their correction wins in EITHER direction
+//   snapshot runs ahead of the   -> somebody moved the clock forward: adopt
+//   chip by more than the slack
+//   otherwise                    -> the RTC is the live clock, keep it
+//   Returns TIME_DEC_* below (uint8_t return keeps the Arduino .ino auto
+//   prototype generator, which runs before this enum is declared, happy).
+enum TimeDecision { TIME_DEC_NOTHING = 0, TIME_DEC_KEEP_RTC = 1, TIME_DEC_ADOPT = 2 };
+static uint8_t time_decide(time_t rtc_now, uint32_t snap_t, uint8_t snap_man) {
+    if (snap_t < TIME_VALID_MIN)                       return TIME_DEC_NOTHING;
+    if (rtc_now < (time_t)TIME_VALID_MIN)              return TIME_DEC_ADOPT;
+    if (snap_man && labs((long)snap_t - (long)rtc_now) > TIME_ADOPT_SLACK_S)
+                                                       return TIME_DEC_ADOPT;
+    if ((int32_t)(snap_t - (uint32_t)rtc_now) > TIME_ADOPT_SLACK_S)
+                                                       return TIME_DEC_ADOPT;
+    return TIME_DEC_KEEP_RTC;
+}
+
+// WRITE half of the contract: epoch + offset + provenance.  Call it after
+// every NTP sync, after a manual set, before deep sleep, and on the way out of
+// the app (before esp_restart()).
+static void time_publish(const char *why, bool manual) {
+    time_t now; time(&now);
+    if (now < (time_t)TIME_VALID_MIN) return;      // RTC not set yet
+    Preferences p;
+    if (!p.begin("rtcsave", false)) return;
+    uint32_t prev     = p.getULong("t", 0);
+    uint8_t  prev_man = p.getUChar("man", 0);
+    // A human's correction stays in force while the snapshot still describes
+    // the same instant.  Every boot refreshes `t` by a second or so and must
+    // not quietly demote the clock back to "machine" -- otherwise the man=1
+    // rule above only survives a single reboot.  A machine that lands a
+    // genuinely DIFFERENT epoch (an NTP sync) does take the clock over.
+    bool machine_moved_it = !prev ||
+                            labs((long)now - (long)prev) > TIME_ADOPT_SLACK_S;
+    uint8_t man = (manual || (prev_man && !machine_moved_it)) ? 1 : 0;
+    p.putULong("t",   (uint32_t)now);
+    p.putLong ("gmt", g_tp_gmt);
+    p.putUChar("man", man);
+    p.putUChar("src", TIME_SRC_ID);
+    g_tp_seq = p.getULong("seq", 0) + 1;           // read-modify-write, session open
+    p.putULong("seq", g_tp_seq);
+    p.end();
+    TIME_SERIAL.printf("[time] publish t=%lu gmt=%ld seq=%lu man=%d (%s)\n",
+                       (unsigned long)now, (long)g_tp_gmt,
+                       (unsigned long)g_tp_seq, man, why);
+}
+
+// READ half: reconcile the EPOCH, then ALWAYS re-apply the TIMEZONE, then
+// republish so the snapshot never lags the running clock by more than a boot.
+// Call this at the very top of setup(), before anything that shows a time.
+static void time_restore_from_nvs() {
+    time_t rtc_now = 0; time(&rtc_now);
+
+    uint32_t snap_t = 0, snap_seq = 0;
+    int32_t  snap_gmt = 0;
+    uint8_t  snap_man = 0;
+    Preferences p;
+    if (p.begin("rtcsave", true)) {
+        snap_t   = p.getULong("t",   0);
+        snap_gmt = p.getLong ("gmt", 0);
+        snap_seq = p.getULong("seq", 0);
+        snap_man = p.getUChar("man", 0);
+        p.end();
+    }
+    if (snap_seq == 0 && snap_t) snap_seq = 1;     // pre-v2 snapshot
+
+    uint8_t d = time_decide(rtc_now, snap_t, snap_man);
+    if (d == TIME_DEC_ADOPT) {
+        struct timeval tv = { (time_t)snap_t, 0 };
+        settimeofday(&tv, NULL);                   // writes the chip RTC as well
+        g_tp_valid = true;
+        TIME_SERIAL.printf("[time] adopted NVS t=%lu (rtc was %ld man=%d)\n",
+                           (unsigned long)snap_t, (long)rtc_now, snap_man);
+    } else if (d == TIME_DEC_KEEP_RTC) {
+        g_tp_valid = true;                         // v6.2 rule: never rewind a live RTC
+        TIME_SERIAL.printf("[time] RTC live t=%ld -- NVS kept as fallback\n",
+                           (long)rtc_now);
+    } else {
+        TIME_SERIAL.println("[time] no persisted clock -- waiting for NTP");
+    }
+
+    // TZ is the part that never survives a reboot: take it from here, always.
+    if (snap_t) time_apply_tz(snap_gmt);
+    g_tp_seq = snap_seq;
+    time_publish("boot", false);                   // keep the snapshot current
+}
+// ===== END SHARED TIME BLOCK v2 =============================================
+static uint32_t g_last_time_save_ms = 0;   // v7.1: periodic-publish timer
 #define TIME_PERSIST_INTERVAL_MS  (5UL * 60UL * 1000UL)   // save every 5 min
 
-static void time_save_now(const char *why) {
-    time_t now;
-    time(&now);
-    if (now < 1700000000) return;     // pre-2023 -> RTC not set yet, nothing useful to save
-    g_timeprefs.begin("rtcsave", false);
-    g_timeprefs.putULong("t", (uint32_t)now);
-    g_timeprefs.putLong("gmt", g_gmt_offset_sec);
-    g_timeprefs.end();
-    g_last_time_save_ms = millis();
-    USBSerial.printf("[rtc] persisted t=%lu (%s)\n", (unsigned long)now, why);
-}
+// v7.1: kept as a thin alias so every pre-existing call site keeps working.
+static void time_save_now(const char *why) { time_publish(why, false); }
 
-// Pull the last-known wall clock out of NVS and shove it into the RTC.
-// Called at the very top of setup() -- guarantees the watch face shows
-// a plausible time even if the battery was dead, before WiFi/NTP runs.
-//
-// v6.2 fix:  on deep-sleep wake the ESP32 internal RTC is still running
-// (we pinned RTC_PERIPH ON in deep_sleep_now()) so getLocalTime() already
-// returns a CURRENT timestamp.  Blindly settimeofday()-ing the stale NVS
-// snapshot here rewound the clock back to the moment we went to sleep --
-// which is exactly the bug the user reported ("time loads what I put it
-// in sleep at").  Only restore from NVS when the RTC is NOT already
-// holding a plausible (>= 2023) time.
-static void time_restore_from_nvs() {
-    time_t rtc_now = 0;
-    time(&rtc_now);
-    if (rtc_now >= 1700000000) {
-        // RTC already has a valid wall clock (either NTP-synced from a
-        // previous boot AND retained across deep sleep, or set by some
-        // other path).  Trust it -- do NOT overwrite with the stale NVS
-        // snapshot.  Just pull the gmt offset so format strings line up.
-        g_timeprefs.begin("rtcsave", true);
-        int32_t gmt = g_timeprefs.getLong("gmt", 0);
-        g_timeprefs.end();
-        g_gmt_offset_sec = gmt;
-        g_ntp_synced = true;
-        USBSerial.printf("[rtc] RTC live (t=%lu) -- skipping NVS restore\n",
-                         (unsigned long)rtc_now);
-        return;
-    }
-
-    g_timeprefs.begin("rtcsave", true);
-    uint32_t t   = g_timeprefs.getULong("t", 0);
-    int32_t  gmt = g_timeprefs.getLong("gmt", 0);
-    g_timeprefs.end();
-    if (t < 1700000000) {
-        USBSerial.println("[rtc] no persisted time -- waiting for NTP");
-        return;
-    }
-    g_gmt_offset_sec = gmt;
-    struct timeval tv = { (time_t)t, 0 };
-    settimeofday(&tv, NULL);
-    g_ntp_synced = true;   // show a real time on the face immediately
-    USBSerial.printf("[rtc] restored t=%lu gmt=%ld from NVS (cold start)\n",
-                     (unsigned long)t, (long)gmt);
-}
+// The v6.2 rule (never rewind a live RTC) is now time_decide() in the shared
+// time block above, which keeps it AND adds the reverse direction -- a snapshot
+// a human or a module moved wins over the live RTC.  That bidirectionality is
+// what makes the clock universal instead of launcher-only.
 
 static void wifi_shutdown() {
     // Disconnect, drop the radio, stop the WiFi driver.
@@ -859,6 +965,7 @@ static void wifi_connect_and_sync() {
         while (millis() < u && WiFi.status() != WL_CONNECTED) delay(100);
         g_wifi_connected = (WiFi.status() == WL_CONNECTED);
     }
+    time_apply_tz(g_gmt_offset_sec);   // pin the TZ string: the timezone is RAM-only and dies every reboot
     if (g_wifi_connected) {
         configTime(g_gmt_offset_sec, 0, "pool.ntp.org");
         struct tm tm;
@@ -1671,6 +1778,7 @@ static bool load_app_from_sd(const AppEntry &app) {
     lvgl_pump();
     delay(350);
     // Fade the panel down before the reboot so chip-restart looks deliberate.
+    time_save_now("launching app");
     loader_ring_stop();
     fade_brightness(0, 280);
     esp_restart();
@@ -2570,6 +2678,7 @@ static void batt_wifi_reconnect_all() {
     g_wifi_connected = ok;
 
     if (ok) {
+        time_apply_tz(g_gmt_offset_sec);   // pin the TZ string: the timezone is RAM-only and dies every reboot
         batt_wifi_set_status("Connected, syncing time...", 0x00FF80);
         configTime(g_gmt_offset_sec, 0, "pool.ntp.org");
         struct tm tm;
@@ -4512,6 +4621,8 @@ void setup() {
     // this way the splash + face show a real time even on a cold boot
     // with no WiFi, instead of "00:00".
     time_restore_from_nvs();
+    g_gmt_offset_sec = g_tp_gmt;
+    if (g_tp_valid) g_ntp_synced = true;
 
 
 #if POWER_SAVE
@@ -4590,6 +4701,8 @@ void setup() {
     bool sd_ok = SD_MMC.begin("/sdcard", true);
     if (sd_ok) {
         splash_progress(40, "wifi config");      parse_wifi_config();
+        time_apply_tz(g_gmt_offset_sec);
+        time_publish("wifi cfg", false);
         if (from_deep_sleep) {
             // RTC kept time -- skip WiFi entirely on this wake.
             struct tm tm;

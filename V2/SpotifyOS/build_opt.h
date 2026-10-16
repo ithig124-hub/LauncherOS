@@ -1,0 +1,1 @@
+-D"dsps_biquad_sf32(in,out,len,coef,state)=do { for (int _bq = 0; _bq < (len); _bq++) { dsps_biquad_f32(&(in)[2*_bq + 0], &(out)[2*_bq + 0], 1, (coef), &(state)[0]); dsps_biquad_f32(&(in)[2*_bq + 1], &(out)[2*_bq + 1], 1, (coef), &(state)[2]); } } while (0)"

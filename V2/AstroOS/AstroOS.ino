@@ -258,9 +258,150 @@ static void planet_approx(int planet_index,time_t stamp,double &ra_h,double &dec
 static double planet_distance_au(int planet_index,time_t stamp){const Planet&p=PLANETS[planet_index];double d=julian_day(stamp)-2451545.0,lp=norm_deg(p.phase0+360.0*d/p.period_days)*M_PI/180.0,le=norm_deg(100.46+360.0*d/365.256)*M_PI/180.0;return sqrt(p.orbit_au*p.orbit_au+1.0-2*p.orbit_au*cos(lp-le));}
 static void moon_equatorial(time_t stamp,double &ra_h,double &dec_deg){double d=julian_day(stamp)-2451545.0,l=norm_deg(218.316+13.176396*d),m=norm_deg(134.963+13.064993*d),f=norm_deg(93.272+13.229350*d);double lon=(l+6.289*sin(m*M_PI/180.0))*M_PI/180.0,lat=5.128*sin(f*M_PI/180.0)*M_PI/180.0,eps=23.4393*M_PI/180.0;double x=cos(lon)*cos(lat),y=sin(lon)*cos(lat)*cos(eps)-sin(lat)*sin(eps),z=sin(lon)*cos(lat)*sin(eps)+sin(lat)*cos(eps);ra_h=norm_deg(atan2(y,x)*180.0/M_PI)/15.0;dec_deg=asin(z)*180.0/M_PI;}
 static void moon_rise_set(time_t now,char*rise,size_t rn,char*set,size_t sn){snprintf(rise,rn,"--");snprintf(set,sn,"--");if(!g_location_set)return;time_t local_now=now+g_tz*3600;struct tm day;gmtime_r(&local_now,&day);day.tm_hour=day.tm_min=day.tm_sec=0;time_t start=mktime(&day)-g_tz*3600;double prev_alt,az,ra,dec;moon_equatorial(start,ra,dec);equatorial_to_horizontal(ra,dec,start,prev_alt,az);for(int m=10;m<=1440;m+=10){time_t t=start+m*60;double alt;moon_equatorial(t,ra,dec);equatorial_to_horizontal(ra,dec,t,alt,az);if(prev_alt<0&&alt>=0&&rise[0]=='-')format_hour(m/60.0,rise,rn);if(prev_alt>=0&&alt<0&&set[0]=='-')format_hour(m/60.0,set,sn);prev_alt=alt;}}
+
+// ---- shared time block (spec: TIME_CONTRACT.md) -----------------------------
+#define TIME_SERIAL Serial
+#define TIME_SRC_ID TIME_SRC_MODULE
+// ===== SHARED TIME BLOCK v2 =================================================
+//  Inlined verbatim into every app in this repo.  Spec + rationale:
+//  TIME_CONTRACT.md.  Only the two lines above the block may differ per app:
+//      #define TIME_SERIAL  Serial          // or USBSerial
+//      #define TIME_SRC_ID  TIME_SRC_MODULE // or TIME_SRC_LAUNCHER
+//
+//  Namespace "rtcsave" -- the ONE place the watch's wall clock lives:
+//      t    uint32  unix epoch seconds, UTC
+//      gmt  int32   local offset from UTC, in SECONDS   (+28800 = UTC+8)
+//      seq  uint32  write counter, ++ on every publish  (diagnostics)
+//      man  uint8   1 = a human set this clock, 0 = machine (NTP/boot).  A boot
+//                       refresh keeps it; a machine that lands a NEW epoch clears it.
+//      src  uint8   0 = launcher, 1 = module            (diagnostics)
+//
+//  Two different things have to survive a reboot, and only one of them does:
+//    * the EPOCH lives in the chip's RTC timer.  It survives every software
+//      reset and every deep sleep, so a launcher <-> module reboot inherits
+//      it for free -- but power loss wipes it, and then this snapshot is the
+//      only thing between the user and "00:00".
+//    * the TIMEZONE lives in the C library's TZ string, which is RAM-ONLY.
+//      It dies on EVERY reboot and no app can inherit it from the previous
+//      one.  NVS is therefore the offset's only home.
+//  => frame: epoch is inherited through the RTC, backed up here.
+//     timezone is stored here and re-applied by every single boot.
+// ============================================================================
+#define TIME_VALID_MIN      1700000000UL   // ~2023-11-14: "the RTC has been set"
+#define TIME_ADOPT_SLACK_S  2L             // ignore sub-2 s snapshot/rtc skew
+#define TIME_SRC_LAUNCHER   0
+#define TIME_SRC_MODULE     1
+
+static int32_t  g_tp_gmt   = 0;   // local offset from UTC, in seconds
+static uint32_t g_tp_seq   = 0;   // last seq we read or wrote
+static bool     g_tp_valid = false;   // a plausible wall clock is available
+
+// Point the C library at the local UTC offset.  TZ is RAM-only, so this must
+// run on EVERY boot in EVERY app or the watch silently renders UTC.
+// POSIX counts the offset backwards from local to UTC, hence the minus.
+static void time_apply_tz(int32_t gmt_sec) {
+    long mins = -(gmt_sec / 60);
+    long a    = labs(mins);
+    char tz[24];
+    snprintf(tz, sizeof(tz), "UTC%c%ld:%02ld", mins < 0 ? '-' : '+', a / 60, a % 60);
+    setenv("TZ", tz, 1);
+    tzset();
+    g_tp_gmt = gmt_sec;
+}
+
+// Is the shared NVS snapshot a better clock than the one the chip is holding?
+//   nothing saved yet            -> leave everything alone
+//   chip has no valid clock      -> cold boot / dead battery: adopt the NVS
+//   a human set it (man=1)       -> their correction wins in EITHER direction
+//   snapshot runs ahead of the   -> somebody moved the clock forward: adopt
+//   chip by more than the slack
+//   otherwise                    -> the RTC is the live clock, keep it
+//   Returns TIME_DEC_* below (uint8_t return keeps the Arduino .ino auto
+//   prototype generator, which runs before this enum is declared, happy).
+enum TimeDecision { TIME_DEC_NOTHING = 0, TIME_DEC_KEEP_RTC = 1, TIME_DEC_ADOPT = 2 };
+static uint8_t time_decide(time_t rtc_now, uint32_t snap_t, uint8_t snap_man) {
+    if (snap_t < TIME_VALID_MIN)                       return TIME_DEC_NOTHING;
+    if (rtc_now < (time_t)TIME_VALID_MIN)              return TIME_DEC_ADOPT;
+    if (snap_man && labs((long)snap_t - (long)rtc_now) > TIME_ADOPT_SLACK_S)
+                                                       return TIME_DEC_ADOPT;
+    if ((int32_t)(snap_t - (uint32_t)rtc_now) > TIME_ADOPT_SLACK_S)
+                                                       return TIME_DEC_ADOPT;
+    return TIME_DEC_KEEP_RTC;
+}
+
+// WRITE half of the contract: epoch + offset + provenance.  Call it after
+// every NTP sync, after a manual set, before deep sleep, and on the way out of
+// the app (before esp_restart()).
+static void time_publish(const char *why, bool manual) {
+    time_t now; time(&now);
+    if (now < (time_t)TIME_VALID_MIN) return;      // RTC not set yet
+    Preferences p;
+    if (!p.begin("rtcsave", false)) return;
+    uint32_t prev     = p.getULong("t", 0);
+    uint8_t  prev_man = p.getUChar("man", 0);
+    // A human's correction stays in force while the snapshot still describes
+    // the same instant.  Every boot refreshes `t` by a second or so and must
+    // not quietly demote the clock back to "machine" -- otherwise the man=1
+    // rule above only survives a single reboot.  A machine that lands a
+    // genuinely DIFFERENT epoch (an NTP sync) does take the clock over.
+    bool machine_moved_it = !prev ||
+                            labs((long)now - (long)prev) > TIME_ADOPT_SLACK_S;
+    uint8_t man = (manual || (prev_man && !machine_moved_it)) ? 1 : 0;
+    p.putULong("t",   (uint32_t)now);
+    p.putLong ("gmt", g_tp_gmt);
+    p.putUChar("man", man);
+    p.putUChar("src", TIME_SRC_ID);
+    g_tp_seq = p.getULong("seq", 0) + 1;           // read-modify-write, session open
+    p.putULong("seq", g_tp_seq);
+    p.end();
+    TIME_SERIAL.printf("[time] publish t=%lu gmt=%ld seq=%lu man=%d (%s)\n",
+                       (unsigned long)now, (long)g_tp_gmt,
+                       (unsigned long)g_tp_seq, man, why);
+}
+
+// READ half: reconcile the EPOCH, then ALWAYS re-apply the TIMEZONE, then
+// republish so the snapshot never lags the running clock by more than a boot.
+// Call this at the very top of setup(), before anything that shows a time.
+static void time_restore_from_nvs() {
+    time_t rtc_now = 0; time(&rtc_now);
+
+    uint32_t snap_t = 0, snap_seq = 0;
+    int32_t  snap_gmt = 0;
+    uint8_t  snap_man = 0;
+    Preferences p;
+    if (p.begin("rtcsave", true)) {
+        snap_t   = p.getULong("t",   0);
+        snap_gmt = p.getLong ("gmt", 0);
+        snap_seq = p.getULong("seq", 0);
+        snap_man = p.getUChar("man", 0);
+        p.end();
+    }
+    if (snap_seq == 0 && snap_t) snap_seq = 1;     // pre-v2 snapshot
+
+    uint8_t d = time_decide(rtc_now, snap_t, snap_man);
+    if (d == TIME_DEC_ADOPT) {
+        struct timeval tv = { (time_t)snap_t, 0 };
+        settimeofday(&tv, NULL);                   // writes the chip RTC as well
+        g_tp_valid = true;
+        TIME_SERIAL.printf("[time] adopted NVS t=%lu (rtc was %ld man=%d)\n",
+                           (unsigned long)snap_t, (long)rtc_now, snap_man);
+    } else if (d == TIME_DEC_KEEP_RTC) {
+        g_tp_valid = true;                         // v6.2 rule: never rewind a live RTC
+        TIME_SERIAL.printf("[time] RTC live t=%ld -- NVS kept as fallback\n",
+                           (long)rtc_now);
+    } else {
+        TIME_SERIAL.println("[time] no persisted clock -- waiting for NTP");
+    }
+
+    // TZ is the part that never survives a reboot: take it from here, always.
+    if (snap_t) time_apply_tz(snap_gmt);
+    g_tp_seq = snap_seq;
+    time_publish("boot", false);                   // keep the snapshot current
+}
+// ===== END SHARED TIME BLOCK v2 =============================================
 static bool parse_tle(char*name,size_t name_n,double &epoch,double &inc,double &raan,double &ecc,double &argp,double &mean_anom,double &mean_motion){
   if(!g_sd_ok)return false;String path=String(OS_FOLDER)+"/SATELLITES/tle.txt";File f=SD_MMC.open(path.c_str(),FILE_READ);if(!f)return false;char l1[96]={0},l2[96]={0};size_t a=f.readBytesUntil('\n',name,name_n-1),b=f.readBytesUntil('\n',l1,sizeof(l1)-1),c=f.readBytesUntil('\n',l2,sizeof(l2)-1);f.close();name[a]=0;l1[b]=0;l2[c]=0;if(l1[0]!='1'||l2[0]!='2')return false;
-  char ep[16]={0},ec[10]={0};if(strlen(l1)<32)return false;memcpy(ep,l1+18,14);ep[14]=0;int yy=(ep[0]-'0')*10+ep[1]-'0';double day=atof(ep+2);int year=yy>=57?1900+yy:2000+yy;struct tm jan={};jan.tm_year=year-1900;jan.tm_mon=0;jan.tm_mday=1;jan.tm_isdst=0;setenv("TZ","UTC0",1);tzset();epoch=(double)mktime(&jan)+(day-1.0)*86400.0;
+  char ep[16]={0},ec[10]={0};if(strlen(l1)<32)return false;memcpy(ep,l1+18,14);ep[14]=0;int yy=(ep[0]-'0')*10+ep[1]-'0';double day=atof(ep+2);int year=yy>=57?1900+yy:2000+yy;struct tm jan={};jan.tm_year=year-1900;jan.tm_mon=0;jan.tm_mday=1;jan.tm_isdst=0;setenv("TZ","UTC0",1);tzset();epoch=(double)mktime(&jan)+(day-1.0)*86400.0; time_apply_tz(g_tp_gmt);
   if(sscanf(l2,"%*d %*d %lf %lf %9s %lf %lf %lf",&inc,&raan,ec,&argp,&mean_anom,&mean_motion)!=6)return false;ecc=atof(ec);if(ecc>=1.0)ecc*=1e-7;return mean_motion>0&&ecc>=0&&ecc<1;
 }
 static void tle_altaz(double stamp,double epoch,double inc,double raan,double ecc,double argp,double mean_anom,double mean_motion,double &alt,double &az){
@@ -271,17 +412,11 @@ static bool next_sat_pass(time_t now,double epoch,double inc,double raan,double 
 }
 static void save_location(){Preferences p;p.begin("astro",false);p.putBool("loc",g_location_set);p.putFloat("lat",g_lat);p.putFloat("lon",g_lon);p.putInt("tz",g_tz);p.end();}
 
-static void restore_clock(){
-  time_t current=time(nullptr);
-  if(current>=1700000000) return;
-  Preferences p; p.begin("rtcsave",true);
-  uint32_t saved=p.getULong("t",0); long gmt=p.getLong("gmt",0); p.end();
-  if(saved>=1700000000){ struct timeval tv={(time_t)saved,0}; settimeofday(&tv,nullptr); setenv("TZ","UTC0",1); tzset(); (void)gmt; }
-}
+// The shared block owns the clock now; alias so the call site works.
+static void restore_clock(){ time_restore_from_nvs(); }
 
 static void save_clock(){
-  time_t current=time(nullptr); if(current<1700000000) return;
-  Preferences p; p.begin("rtcsave",false); p.putULong("t",(uint32_t)current); p.end();
+  time_publish("astro", false);   // epoch + offset, one writer for "rtcsave"
   g_last_clock_save_ms=millis();
 }
 
@@ -578,6 +713,7 @@ static void stop_and_save(){
 }
 
 static void return_to_launcher(){
+  time_publish("exit", false);   // hand the clock back to the launcher
   if(g_returning) return;
   g_returning=true;
   stop_and_save();
@@ -666,7 +802,7 @@ static void hardware_init(){
 void setup(){
   hardware_init(); restore_clock(); build_splash(); delay(350);
   SD_MMC.setPins(SDMMC_CLK,SDMMC_CMD,SDMMC_DATA); g_sd_ok=SD_MMC.begin("/sdcard",true); ensure_storage();
-  {Preferences a;a.begin("astro",true);g_location_set=a.getBool("loc",false);g_lat=a.getFloat("lat",0);g_lon=a.getFloat("lon",0);g_tz=max(-12,min(14,a.getInt("tz",0)));g_star_favs=a.getULong("favs",0);g_event_reminder=a.getBool("reminder",false);g_dim_mode=a.getBool("dim",false);g_sky_map_track_up=a.getBool("trackup",false);a.end();for(int i=0;i<(int)(sizeof(SITES)/sizeof(SITES[0]));i++)if(fabs(g_lat-SITES[i].lat)<0.1&&fabs(g_lon-SITES[i].lon)<0.1)g_site_index=i;}
+  {Preferences a;a.begin("astro",true);g_location_set=a.getBool("loc",false);g_lat=a.getFloat("lat",0);g_lon=a.getFloat("lon",0);g_tz=max(-12,min(14,(int)a.getInt("tz",0)));g_star_favs=a.getULong("favs",0);g_event_reminder=a.getBool("reminder",false);g_dim_mode=a.getBool("dim",false);g_sky_map_track_up=a.getBool("trackup",false);a.end();for(int i=0;i<(int)(sizeof(SITES)/sizeof(SITES[0]));i++)if(fabs(g_lat-SITES[i].lat)<0.1&&fabs(g_lon-SITES[i].lon)<0.1)g_site_index=i;}
   build_dashboard(); build_tools(); build_system();
   Preferences p; p.begin("fusionenv",true); g_screen=min(2,(int)p.getUChar("screen",0)); p.end();
   lv_scr_load_anim(g_screens[g_screen],LV_SCR_LOAD_ANIM_FADE_ON,260,0,false);g_last_touch_ms=millis();update_live();fade_brightness(astro_brightness(),180);
