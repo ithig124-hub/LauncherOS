@@ -18,10 +18,23 @@
 //  is plain arithmetic with no LVGL in it, so the host test suite compiles and
 //  tests it. Thresholds come from LauncherOS V2's touch handling.
 //
-//    library  swipe < >  browse maps        map  drag           pan
-//             tap card   open the map             double tap     zoom in
-//             swipe ^    map details              2-finger tap   zoom out
-//             swipe v    hide the details         2-finger drag  zoom
+//  How the map MOVES is a separate, equally testable thing: the inertia after a
+//  flick, the easing of a camera move, the anchoring of a zoom, and the follow
+//  of a heading all live in the WP_MOTION_ENGINE region as pure arithmetic
+//  (tools/host_test asserts the flick stops, that a split frame travels the
+//  same distance as a whole one, and that the point under your fingers does not
+//  move). The gesture handlers only decide *what* a gesture means; the motion
+//  engine decides how it feels.
+//
+//  The library screen is built the same way (WP_LIB_ENGINE): where its card and
+//  shelf sit, which map a touch landed on, how a long title is folded and how a
+//  description is wrapped are all arithmetic, so the screen that decides which
+//  map you open is asserted on a PC rather than reviewed by reading it.
+//
+//    library  swipe < >  browse maps        map  drag           pan, then coast
+//             tap card   open the map             double tap     zoom in (here)
+//             swipe ^    map details              2-finger tap   zoom out (here)
+//             swipe v    hide the details         2-finger drag  pinch to zoom
 //             hold       map details              tap            pick a POI
 //                                                 hold           Tools menu
 //                                                 swipe ^ bottom Tools menu
@@ -34,7 +47,16 @@
 //    BOOT     tap next / 2x tap prev / 0.5 s open or recentre / 1.5 s back a
 //             level / 4 s straight back to LauncherOS
 //
+//  Look    : Kiwi -- an ink-black canvas, one vivid green that only ever means
+//            "act" or "you are here", and a map of quiet grey-greens drawn from
+//            that palette. THEMES holds it alongside the older palettes; the map,
+//            the library and the LVGL menus all read the same table.
+//
 //  SD root : /WATCH/WayPoint/
+//  In-app  : maps can also ship INSIDE the binary: tools/bake_bundle.py bakes a
+//            map pack into wp_maps_bundle.h, the loader reads tiles straight out
+//            of flash, and the library lists them first marked "in the app" --
+//            no card, nothing to copy. Without that header the app is card-only.
 //  Maps    : /WATCH/WayPoint/<map>/{z}/{x}/{y}.pbf   (tilemaker default output)
 //            optional /WATCH/WayPoint/<map>/metadata.json with
 //              { "name":"Byford", "description":"...",
@@ -63,6 +85,17 @@
 #include <esp_system.h>
 #include <esp_heap_caps.h>
 #include <esp_bt.h>
+
+// The map library that ships inside the app. tools/bake_bundle.py writes this
+// header; a fresh checkout has none, and then the library is card-only. The
+// #if is what makes "bake the maps in" an opt-in step instead of a build that
+// fails on a file nobody generated yet.
+#if defined(__has_include)
+#  if __has_include("wp_maps_bundle.h")
+#    include "wp_maps_bundle.h"
+#    define WP_HAS_BUNDLE 1
+#  endif
+#endif
 
 // =============================================================================
 //  Forward-declare EVERY user struct/enum here, before any inlined helper code.
@@ -100,6 +133,18 @@ struct MvtVal;
 struct MvtKeyTable;
 struct MvtTags;
 struct WpStyle;
+// The library carousel's arithmetic (geometry, hit testing, text folding) is
+// spliced out by gen_engine.py as well, and the tools menu takes an array of
+// tile descriptions, so those types belong up here too.
+struct WpLibLayout;
+struct WpLibShelf;
+struct ToolTile;
+// The built-in map bundle's reader types: used by reference in signatures the
+// Arduino IDE hoists to the top, so they have to be named up here too.
+struct WpBundle;
+struct WpBundleMap;
+// ... and the decoder for the baked thumbnails the library card shows.
+struct WpImg;
 
 // ===== BEGIN inlined puff.h (gzip/DEFLATE inflater) =====
 // =============================================================================
@@ -669,6 +714,159 @@ static uint16_t wp_gesture_feed(WpGestureState *g, bool pressed, int32_t x, int3
 
 // ===== END WP_GESTURE_ENGINE
 
+// ===== BEGIN WP_MOTION_ENGINE
+// =============================================================================
+//  Motion engine -- the arithmetic behind how the map FEELS.
+//
+//  Everything the map animates is a pure function of (position, target,
+//  elapsed time): a fling that decays to a stop, a zoom that grows under the
+//  finger, a heading-up map that follows the wrist without twitching. That is
+//  precisely the kind of code a screenshot cannot judge and a watch is the
+//  worst place to debug - so the maths lives here, with no LVGL, no Arduino
+//  and no I/O, and tools/host_test asserts the properties that actually decide
+//  the feel: does the flick stop, does a split frame travel as far as a whole
+//  one, does the point under the finger stay put, does north take the short
+//  way round.
+//
+//  Units are screen pixels and milliseconds, matching the touch pipeline.
+// =============================================================================
+
+// Inertial panning tuned by what a 410 px panel can take: the flick decays as
+// v(t) = v0 * e^(-t/TAU), so the distance still to travel is always v * TAU
+// (about half a screen for a hard flick) and the motion is bounded no matter
+// how hard the map is thrown.
+#define WP_FLING_TAU_MS     260.0f
+#define WP_FLING_STOP_PX      1.50f  // remaining travel this small = the last frame
+#define WP_FLING_MAX_V       1.80f   // px/ms -- a cap, so the map cannot be thrown into orbit
+#define WP_FLING_MIN_START   0.15f   // px/ms -- slower than this and the pan just stops
+
+static inline float wp_clamp01(float t) {
+    return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+}
+
+// Decelerating curve for camera moves. A linear ramp reads as machinery; this
+// leaves immediately and arrives softly, which is what "the map settled" feels
+// like. (Same shape iOS/Android use for a programmatic pan.)
+static inline float wp_ease_out(float t) {
+    t = wp_clamp01(t);
+    const float u = 1.0f - t;
+    return 1.0f - u * u * u;
+}
+
+// Cap a flick's speed while keeping its direction: a hard flick should throw
+// the map a long way, never squash the motion into an axis.
+static void wp_fling_cap(float *vx, float *vy) {
+    const float s = sqrtf(*vx * *vx + *vy * *vy);
+    if (s <= WP_FLING_MAX_V || s <= 0.0f) return;
+    const float k = WP_FLING_MAX_V / s;
+    *vx *= k; *vy *= k;
+}
+
+// One frame of inertial panning. Writes the pixel pan for this frame into
+// *dx/*dy and decays the velocity; returns false once the motion has stopped,
+// at which point the velocity is zeroed so it can neither creep nor restart.
+//
+// The displacement is the exact integral of the decaying velocity over the
+// frame, v * TAU * (1 - e^(-dt/TAU)), not v * dt. That is what makes the pan
+// frame-rate independent: two 16 ms frames travel exactly as far as one 32 ms
+// frame instead of the slow-framed map always panning further.
+static bool wp_fling_step(float *vx, float *vy, float dt_ms,
+                          float *dx, float *dy) {
+    if (dt_ms <= 0.0f) dt_ms = 1.0f;
+    if (dt_ms > 100.0f) dt_ms = 100.0f;   // a stalled frame must not teleport
+    const float speed = sqrtf(*vx * *vx + *vy * *vy);
+    if (speed <= 0.0f) {
+        *dx = 0.0f; *dy = 0.0f;
+        return false;
+    }
+    // Still owed: `speed * TAU` of travel. Once that is under a pixel and a
+    // half, this frame is the last one and it delivers the remainder instead of
+    // dropping it, and the velocity goes to zero with it. Two things follow: the
+    // total distance of a flick is exactly v0 * TAU (bounded, whatever the
+    // frame rate), and the end of the motion is a settle rather than a visible
+    // step followed by nothing.
+    const bool last_frame = (speed * WP_FLING_TAU_MS <= WP_FLING_STOP_PX);
+    const float f = last_frame ? 0.0f : expf(-dt_ms / WP_FLING_TAU_MS);
+    *dx = *vx * WP_FLING_TAU_MS * (1.0f - f);
+    *dy = *vy * WP_FLING_TAU_MS * (1.0f - f);
+    *vx *= f; *vy *= f;
+    return !last_frame;
+}
+
+// Shortest signed way from one angle to another, in degrees (-180, 180].
+// 350 -> 10 is +20, not -340: without this, crossing north would spin the
+// map almost all the way round, which is the single ugliest thing a
+// heading-up map can do.
+static float wp_angle_delta(float from, float to) {
+    float d = fmodf(to - from, 360.0f);
+    if (d > 180.0f)   d -= 360.0f;
+    if (d <= -180.0f) d += 360.0f;
+    return d;
+}
+
+// Ease `cur` toward `target` by `alpha` (0..1) along the short way, wrapped to
+// [0, 360). The caller passes alpha = 1 - e^(-dt/TAU), which is what makes the
+// follow frame-rate independent rather than "faster when the loop is fast".
+static float wp_angle_step(float cur, float target, float alpha) {
+    alpha = wp_clamp01(alpha);
+    float v = cur + wp_angle_delta(cur, target) * alpha;
+    v = fmodf(v, 360.0f);
+    if (v < 0.0f) v += 360.0f;
+    return v;
+}
+
+// The world-space offset of one screen pixel from the camera centre: the exact
+// inverse of world_to_screen(), rotation included. It exists once, here, and
+// both the UI's screen_to_world() and the zoom anchoring below are built on it
+// -- an inverse that is written twice is an inverse that drifts.
+static void wp_pixel_to_world_offset(int32_t ax, int32_t ay,
+                                     int32_t cx, int32_t cy,
+                                     float rot_deg, float scale,
+                                     double *ux, double *uy) {
+    const double rx = (double)(ax - cx);
+    const double ry = (double)(cy - ay);        // screen +y is world -y
+    const double s  = (scale > 1e-9f) ? (double)scale : 1e-9;
+    if (rot_deg != 0.0f) {
+        const double r  = -(double)rot_deg * M_PI / 180.0;
+        const double ca = cos(r), sa = sin(r);
+        *ux = (rx * ca + ry * sa) / s;
+        *uy = (-rx * sa + ry * ca) / s;
+    } else {
+        *ux = rx / s;
+        *uy = ry / s;
+    }
+}
+
+// Where the camera has to be for world point (wx, wy) to land exactly on
+// screen pixel (ax, ay). Pinch and double-tap zoom both use this: the map is
+// zoomed about the thing under your fingers, so the point you are looking at
+// is the point that does not move.
+static void wp_cam_anchor(double wx, double wy,
+                          int32_t ax, int32_t ay,
+                          int32_t cx, int32_t cy,
+                          float rot_deg, float scale,
+                          double *camx, double *camy) {
+    double ux, uy;
+    wp_pixel_to_world_offset(ax, ay, cx, cy, rot_deg, scale, &ux, &uy);
+    *camx = wx - ux;
+    *camy = wy - uy;
+}
+
+// What the status strip calls the current scale. "z12.4" is a number only the
+// person who wrote the renderer wants; a word is what tells everyone else how
+// close they are.
+static const char *wp_zoom_band(float z_eff) {
+    if (z_eff <  4.0f) return "world";
+    if (z_eff <  7.0f) return "country";
+    if (z_eff < 10.0f) return "state";
+    if (z_eff < 12.0f) return "region";
+    if (z_eff < 13.5f) return "district";
+    if (z_eff < 15.0f) return "city";
+    if (z_eff < 16.5f) return "suburb";
+    return "street";
+}
+// ===== END WP_MOTION_ENGINE
+
 // =============================================================================
 //  Touch driver
 // =============================================================================
@@ -834,7 +1032,8 @@ static void time_restore_from_launcher() {
 // =============================================================================
 //  Themes
 // =============================================================================
-enum ThemeId { THEME_FUSION_DARK=0, THEME_FUSION_LIGHT=1, THEME_SERIOUS=2, THEME_CHILL=3 };
+enum ThemeId { THEME_FUSION_DARK=0, THEME_FUSION_LIGHT=1, THEME_SERIOUS=2, THEME_CHILL=3,
+               THEME_KIWI=4, THEME_COUNT=5 };
 
 struct ThemePalette {
     const char *name;
@@ -871,8 +1070,15 @@ static const ThemePalette THEMES[] = {
     // CHILL: teal + coral
     { "Chill", 0x0329, 0x1CB1, 0x3E9C, 0xFFFF, 0x8534, 0x67FF, 0xFB0D,
       0xEE7C, 0x4A69, 0x0620, 0x057D, 0xCEFB, 0xFD79, 0xFACA, 0x67FF, 0xF800, 0xFB0D, 0xFFDA },
+    // KIWI -- the one the app ships with. Ink-black canvas, one vivid green that
+    // only ever means "act" or "you are here", and a map of quiet grey-greens so
+    // the green is the loudest thing on the panel. Every other colour is a shade
+    // of those two ideas: dark is ground, light is something you can name. That
+    // is what keeps a 410 px AMOLED legible at arm's length with a glove on.
+    { "Kiwi", 0x0861, 0x10C2, 0x21A5, 0xF7BE, 0x84B1, 0x3F09, 0xFE27,
+      0x29C6, 0x1103, 0x1143, 0x08C4, 0x2185, 0x1944, 0xDB3B, 0x3A47, 0x3F09, 0x3F09, 0xAED6 },
 };
-static uint8_t g_theme_id = THEME_FUSION_DARK;
+static uint8_t g_theme_id = THEME_KIWI;
 static inline const ThemePalette &TH() { return THEMES[g_theme_id]; }
 
 // Track B -- shared LVGL style system. Push the active theme's colours into the
@@ -915,21 +1121,27 @@ static lv_style_t wp_style_label_dim;
 static bool       wp_styles_ready = false;
 
 // Cached palette (RGB565) so labels/icons can match without a global dependency.
-static uint16_t   wp_pal_text = 0xFFFF, wp_pal_dim = 0x8410,
-                  wp_pal_accent = 0x07FF, wp_pal_warn = 0xFD20;
+// Seeded with Kiwi, not with the old cyan: anything drawn before the first
+// wp_sync_styles() (splash, the blank screen) should already be in the theme the
+// app ships, not flash the previous one for a frame.
+static uint16_t   wp_pal_text = 0xF7BE, wp_pal_dim = 0x84B1,
+                  wp_pal_accent = 0x3F09, wp_pal_warn = 0xFE27;
 
 static void wp_styles_init() {
     if (wp_styles_ready) return;
     wp_styles_ready = true;
 
     lv_style_init(&wp_style_menu_button);
-    lv_style_set_radius(&wp_style_menu_button, 14);
+    // Kiwi's shape language in one number: a tile is a rounded slab, not a
+    // rectangle with softened corners. 20 on a 60 px tile reads as a pill from
+    // across a room, which is the whole point of the reference.
+    lv_style_set_radius(&wp_style_menu_button, 20);
     lv_style_set_border_width(&wp_style_menu_button, 1);
     lv_style_set_pad_all(&wp_style_menu_button, 6);
     lv_style_set_shadow_width(&wp_style_menu_button, 0);
 
     lv_style_init(&wp_style_menu_card);
-    lv_style_set_radius(&wp_style_menu_card, 16);
+    lv_style_set_radius(&wp_style_menu_card, 22);
     lv_style_set_border_width(&wp_style_menu_card, 1);
     lv_style_set_pad_all(&wp_style_menu_card, 14);
 
@@ -1398,9 +1610,309 @@ struct FMapTile {
 // =============================================================================
 //  Active map state (directory-of-MVT-tiles)
 // =============================================================================
+// =============================================================================
+//  Map bundle reader  (WPB1)
+//
+//  A map can live in the application image instead of on a card: one read-only
+//  blob in flash with a sorted index in front of it (tools/bake_bundle.py writes
+//  it, and its docstring is the format). This is the reader -- plain pointer
+//  arithmetic over a byte span, no filesystem, no allocation, so the same code
+//  runs on the watch and in the host tests, and the tests can prove the lookup
+//  against a bundle the packer really wrote.
+//
+//  Every field is read byte by byte rather than through a struct cast. The blob
+//  is only 4-byte aligned in the common case, and an unaligned 32-bit load is a
+//  fault on the ESP32, not a slow read.
+// =============================================================================
+#define WPB_HEADER    24
+#define WPB_MAP_REC   36
+#define WPB_TILE_REC  20
+
+static inline uint16_t wpb_le16(const uint8_t *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+}
+static inline uint32_t wpb_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static inline float wpb_lef32(const uint8_t *p) {
+    const uint32_t v = wpb_le32(p);
+    float f;
+    memcpy(&f, &v, sizeof(f));
+    return f;
+}
+
+struct WpBundle {
+    const uint8_t *data;
+    uint32_t size;
+    uint16_t maps;
+    uint32_t tiles;
+    uint32_t map_dir;
+    uint32_t tile_dir;
+    uint32_t str_off;
+};
+
+struct WpBundleMap {
+    const char *name;              // NUL-terminated, in the string pool
+    const char *meta;              // metadata.json text, not NUL-guaranteed
+    uint16_t    meta_len;
+    const uint8_t *preview;        // .wpim bytes, or nullptr
+    uint16_t    preview_len;
+    uint8_t     minzoom, maxzoom;
+    float       min_lat, min_lon, max_lat, max_lon;
+};
+
+// Validate the header once, at boot. A bundle that is absent, truncated or from
+// another format version must fail here rather than produce a library of maps
+// that open onto nothing.
+static bool wp_bundle_open(WpBundle *b, const uint8_t *data, uint32_t size) {
+    if (!b) return false;
+    memset(b, 0, sizeof(*b));
+    if (!data || size < WPB_HEADER) return false;
+    if (!(data[0] == 'W' && data[1] == 'P' && data[2] == 'B' && data[3] == '1')) return false;
+    if (wpb_le16(data + 4) != 1) return false;
+    b->data     = data;
+    b->size     = size;
+    b->maps     = wpb_le16(data + 6);
+    b->tiles    = wpb_le32(data + 8);
+    b->map_dir  = wpb_le32(data + 12);
+    b->tile_dir = wpb_le32(data + 16);
+    b->str_off  = wpb_le32(data + 20);
+    if (b->map_dir  > size || (uint32_t)b->maps  * WPB_MAP_REC  > size - b->map_dir)  return false;
+    if (b->tile_dir > size || b->tiles * WPB_TILE_REC > size - b->tile_dir) return false;
+    if (b->str_off  > size) return false;
+
+    // Every offset is proved once, here. A blob that was truncated in transit or
+    // half-rewritten by a bad bake then fails at boot with the library untouched,
+    // instead of listing maps that open onto nothing. It is ~400 records for a
+    // whole state, which is nothing next to mounting the card.
+    for (uint16_t i = 0; i < b->maps; i++) {
+        const uint8_t *r = b->data + b->map_dir + (uint32_t)i * WPB_MAP_REC;
+        const uint32_t name_off = wpb_le32(r + 0);
+        const uint32_t meta_off = wpb_le32(r + 4);
+        const uint16_t meta_len = wpb_le16(r + 8);
+        const uint16_t pv_len   = wpb_le16(r + 10);
+        const uint32_t pv_off   = wpb_le32(r + 12);
+        if (name_off >= size || meta_off >= size) return false;
+        if (!memchr(b->data + name_off, 0, size - name_off)) return false;
+        if (!meta_len || meta_len > size - meta_off) return false;
+        if (pv_len && (pv_off > size || pv_len > size - pv_off)) return false;
+    }
+    for (uint32_t i = 0; i < b->tiles; i++) {
+        const uint8_t *r = b->data + b->tile_dir + i * WPB_TILE_REC;
+        if ((int)r[0] >= (int)b->maps) return false;
+        const uint32_t off = wpb_le32(r + 12);
+        const uint32_t len = wpb_le32(r + 16);
+        if (off > size || len > size - off) return false;
+        // Binary search needs the index sorted by (map, z, x, y); an unsorted one
+        // would not fail, it would just stop finding tiles.
+        if (i) {
+            const uint8_t *p = r - WPB_TILE_REC;
+            bool ordered = false;
+            if (p[0] != r[0])      ordered = p[0] < r[0];
+            else if (p[1] != r[1]) ordered = p[1] < r[1];
+            else {
+                const uint32_t px = wpb_le32(p + 4), py = wpb_le32(p + 8);
+                const uint32_t cx = wpb_le32(r + 4), cy = wpb_le32(r + 8);
+                ordered = (px != cx) ? (px < cx) : (py < cy);
+            }
+            if (!ordered) return false;
+        }
+    }
+    return true;
+}
+
+static int wp_bundle_map_count(const WpBundle *b) {
+    return (b && b->data) ? (int)b->maps : 0;
+}
+
+static bool wp_bundle_map(const WpBundle *b, int i, WpBundleMap *out) {
+    if (!b || !b->data || !out || i < 0 || i >= (int)b->maps) return false;
+    const uint8_t *r = b->data + b->map_dir + (uint32_t)i * WPB_MAP_REC;
+    const uint32_t name_off = wpb_le32(r + 0);
+    const uint32_t meta_off = wpb_le32(r + 4);
+    const uint16_t meta_len = wpb_le16(r + 8);
+    const uint16_t prv_len  = wpb_le16(r + 10);
+    const uint32_t prv_off  = wpb_le32(r + 12);
+    // The bounds are proved for the *strings* too, not just the numbers: the name
+    // is handed out as a C string and the metadata is read by length, so a
+    // truncated or hand-edited blob could otherwise point either one past the end
+    // of flash and be believed. A name must be terminated; the metadata must lie
+    // inside the blob, because its length is what bounds it.
+    if (name_off >= b->size || meta_off >= b->size) return false;
+    if (!memchr(b->data + name_off, 0, b->size - name_off)) return false;
+    if (!meta_len || meta_len > b->size - meta_off) return false;
+    if (prv_len && (prv_off > b->size || prv_len > b->size - prv_off)) return false;
+    memset(out, 0, sizeof(*out));
+    out->name       = (const char *)(b->data + name_off);
+    out->meta       = (const char *)(b->data + meta_off);
+    out->meta_len   = meta_len;
+    out->preview    = prv_len ? (b->data + prv_off) : nullptr;
+    out->preview_len= prv_len;
+    out->minzoom    = r[16];
+    out->maxzoom    = r[17];
+    out->min_lat    = wpb_lef32(r + 20);
+    out->min_lon    = wpb_lef32(r + 24);
+    out->max_lat    = wpb_lef32(r + 28);
+    out->max_lon    = wpb_lef32(r + 32);
+    return true;
+}
+
+// Binary search over the index, which the packer sorts by (map, z, x, y).
+// Returns a pointer INTO the blob: the tile bytes are already gzip'd MVT, so the
+// decoder reads them in place and nothing is copied until it inflates.
+static bool wp_bundle_tile(const WpBundle *b, int map, int z, int32_t x, int32_t y,
+                           const uint8_t **out, uint32_t *out_len) {
+    if (out) *out = nullptr;
+    if (out_len) *out_len = 0;
+    if (!b || !b->data || map < 0 || !b->tiles) return false;
+    int32_t lo = 0, hi = (int32_t)b->tiles - 1;
+    while (lo <= hi) {
+        const int32_t mid = lo + (hi - lo) / 2;
+        const uint8_t *r = b->data + b->tile_dir + (uint32_t)mid * WPB_TILE_REC;
+        const int      m  = r[0];
+        const int      zz = r[1];
+        const int32_t  rx = (int32_t)wpb_le32(r + 4);
+        const int32_t  ry = (int32_t)wpb_le32(r + 8);
+        int c;
+        if (m != map)       c = (m  < map) ? -1 : 1;
+        else if (zz != z)   c = (zz < z)   ? -1 : 1;
+        else if (rx != x)   c = (rx < x)   ? -1 : 1;
+        else if (ry != y)   c = (ry < y)   ? -1 : 1;
+        else                c = 0;
+        if (c == 0) {
+            const uint32_t off = wpb_le32(r + 12);
+            const uint32_t len = wpb_le32(r + 16);
+            if (off > b->size || len > b->size - off) return false;
+            if (out)     *out     = b->data + off;
+            if (out_len) *out_len = len;
+            return true;
+        }
+        if (c < 0) lo = mid + 1; else hi = mid - 1;
+    }
+    return false;
+}
+
+// How many tiles this map has at one zoom. Linear over the index on purpose:
+// it runs once per zoom level when a map is opened, and an index sorted by
+// (map, z, ...) would need a second table to beat ~400 pointer-free compares.
+static uint32_t wp_bundle_zoom_tiles(const WpBundle *b, int map, int z) {
+    if (!b || !b->data) return 0;
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < b->tiles; i++) {
+        const uint8_t *r = b->data + b->tile_dir + i * WPB_TILE_REC;
+        if ((int)r[0] == map && (int)r[1] == z) n++;
+    }
+    return n;
+}
+
+// =============================================================================
+//  Images  (.wpim)
+//
+//  A map's thumbnail is a picture, not a map: it is baked once by
+//  tools/map_preview.py, palettised to at most 255 colours, and run-length
+//  encoded per row. The device only expands it, so there is no PNG decoder, no
+//  zlib, no font, and no rasteriser in the firmware -- the whole feature is the
+//  eighty lines below.
+//
+//  Format (little-endian):
+//     0  magic "WPIM"     4  version (1)      5  flags
+//     6  u16 width        8  u16 height      10  u16 palette_count
+//    12  u16 palette[palette_count]      RGB565
+//    ...  RLE stream, exactly width*height pixels:
+//          0x00..0x7F  literal run of (b+1) indices, then that many bytes
+//          0x80..0xFF  repeat of ((b & 0x7F) + 2) pixels of the next byte
+// =============================================================================
+struct WpImg {
+    uint16_t w, h;
+    uint16_t palette_count;
+    const uint8_t *pal;        // 2 bytes per colour, read with wpb_le16
+    const uint8_t *data;
+    uint32_t data_len;
+};
+
+static bool wp_img_open(WpImg *im, const uint8_t *data, uint32_t len) {
+    if (!im) return false;
+    memset(im, 0, sizeof(*im));
+    if (!data || len < 12) return false;
+    if (!(data[0] == 'W' && data[1] == 'P' && data[2] == 'I' && data[3] == 'M')) return false;
+    if (data[4] != 1) return false;
+    const uint16_t w = wpb_le16(data + 6);
+    const uint16_t h = wpb_le16(data + 8);
+    const uint16_t n = wpb_le16(data + 10);
+    if (!w || !h || !n) return false;
+    const uint32_t pal_bytes = (uint32_t)n * 2;
+    if (len < 12 + pal_bytes) return false;
+    im->w = w; im->h = h; im->palette_count = n;
+    im->pal = data + 12;
+    im->data = data + 12 + pal_bytes;
+    im->data_len = len - 12 - pal_bytes;
+    return true;
+}
+
+// Expand to an RGB565 buffer of any size, nearest-neighbour. Scaling belongs
+// here rather than in the painter because the card's text column changes width
+// with the library size, and one bitmap that only fits one of those widths would
+// be a layout that can only be drawn one way.
+static bool wp_img_decode(const WpImg *im, uint16_t *dst, int dw, int dh) {
+    if (!im || !im->data || !dst || dw <= 0 || dh <= 0) return false;
+    uint16_t *line = (uint16_t*)malloc((size_t)im->w * sizeof(uint16_t));
+    if (!line) return false;
+    uint32_t pos = 0;
+    bool ok = true;
+    int dy = 0;
+    for (int y = 0; y < (int)im->h && ok; y++) {
+        int x = 0;
+        while (x < (int)im->w) {
+            if (pos >= im->data_len) { ok = false; break; }
+            const uint8_t tok = im->data[pos++];
+            // A run never crosses a row: the encoder starts every row fresh. So
+            // one that does not fit the rest of this row is a corrupt stream, and
+            // saying so is cheaper than carrying a "current row" through the
+            // decoder and hoping the next row agrees with it.
+            if (tok & 0x80) {
+                const int run = (tok & 0x7F) + 2;
+                if (run > (int)im->w - x) { ok = false; break; }
+                if (pos >= im->data_len) { ok = false; break; }
+                const uint8_t idx = im->data[pos++];
+                if (idx >= im->palette_count) { ok = false; break; }
+                const uint16_t c = wpb_le16(im->pal + (uint32_t)idx * 2);
+                for (int i = 0; i < run; i++) line[x++] = c;
+            } else {
+                const int run = tok + 1;
+                if (run > (int)im->w - x) { ok = false; break; }
+                if (run > (int)(im->data_len - pos)) { ok = false; break; }
+                for (int i = 0; i < run; i++) {
+                    const uint8_t idx = im->data[pos + i];
+                    if (idx >= im->palette_count) { ok = false; break; }
+                    line[x++] = wpb_le16(im->pal + (uint32_t)idx * 2);
+                }
+                if (!ok) break;
+                pos += (uint32_t)run;
+            }
+        }
+        if (!ok) break;
+        while (dy < dh && (int)((int64_t)dy * im->h / dh) == y) {
+            for (int dx = 0; dx < dw; dx++) {
+                const int sx = (int)((int64_t)dx * im->w / dw);
+                dst[(size_t)dy * dw + dx] = line[sx];
+            }
+            dy++;
+        }
+    }
+    free(line);
+    return ok && dy == dh;
+}
+
 static String     g_map_folder = "/WATCH/WayPoint";
 static String     g_map_dir_path;              // full SD path of the loaded map's dir
 static bool       g_map_loaded = false;
+// -1 = the loaded map came from the card (or nothing is loaded). Otherwise this
+// is the map's index in the built-in bundle, and every tile lookup goes to flash
+// instead of to the filesystem.
+static WpBundle   g_bundle;
+static bool       g_bundle_ok = false;
+static int        g_map_bundle = -1;
 
 static FMapMeta   g_meta;
 static FMapZoom   g_zooms[MAX_ZOOMS];
@@ -2545,9 +3057,17 @@ static void tile_probe_remember_missing(int32_t z, int32_t x, int32_t y) {
 }
 
 // Returns true if a tile file exists on disk.
+// "Is there a tile here?" -- the bundle answers from its index, the card from its
+// directories. Both are remembered in the same negative cache, because from the
+// renderer's point of view a hole is a hole.
 static bool tile_exists_on_disk(int32_t z, int32_t x, int32_t y) {
     if (tile_probe_missing(z, x, y)) return false;
-    if (mvt_tile_path(z, x, y).length() > 0) return true;
+    if (g_map_bundle >= 0) {
+        if (wp_bundle_tile(&g_bundle, g_map_bundle, z, x, y, nullptr, nullptr))
+            return true;
+    } else if (mvt_tile_path(z, x, y).length() > 0) {
+        return true;
+    }
     tile_probe_remember_missing(z, x, y);
     return false;
 }
@@ -2594,11 +3114,14 @@ static FMapTile *tile_load(int8_t z, int32_t x, int32_t y) {
     // and every current caller would have had to remember to check first.
     if (FMapTile *hit = cache_find(z, x, y)) return hit;
 
-    String path = mvt_tile_path(z, x, y);
-    if (!path.length()) {
-        MVT_LOG("[TILE] z=%d x=%d y=%d -- file not found on SD\n", (int)z, (int)x, (int)y);
-        return nullptr;
-    }
+    // Two places a tile can come from, and everything below this point is shared:
+    // if the map is built in, the bytes are already in flash and are copied into
+    // the same buffer the card path fills, so the inflate/decode/cache code below
+    // cannot tell the difference. The copy is a few kilobytes; the inflate it
+    // feeds is the expensive part either way.
+    String path;
+    uint8_t *buf = nullptr;
+    size_t sz = 0;
 
     FMapTile *slot = cache_evict_slot();
     slot->z = z; slot->tx = x; slot->ty = y;
@@ -2608,32 +3131,57 @@ static FMapTile *tile_load(int8_t z, int32_t x, int32_t y) {
     for (int i = 0; i <= LAY__COUNT; i++) slot->band[i] = 0;
     slot->last_use_ms = millis();
 
-    File f = SD_MMC.open(path, FILE_READ);
-    if (!f) {
-        MVT_LOG("[TILE] z=%d x=%d y=%d path='%s' -- SD open FAILED\n",
-                (int)z, (int)x, (int)y, path.c_str());
-        slot->loaded = true; slot->status = TILE_ST_IOERR; return slot;
-    }
-    size_t sz = f.size();
-    MVT_LOG("[TILE] z=%d x=%d y=%d path='%s' bytes=%u\n",
-            (int)z, (int)x, (int)y, path.c_str(), (unsigned)sz);
-    if (!sz || sz > 512 * 1024) {
-        MVT_LOG("[TILE]   size out of bounds -- ignored\n");
-        f.close(); slot->loaded = true; slot->status = TILE_ST_BADSIZE; return slot;
-    }
-
-    uint8_t *buf = (uint8_t*)ps_malloc(sz);
-    if (!buf) buf = (uint8_t*)malloc(sz);
-    if (!buf) {
-        MVT_LOG("[TILE]   malloc(%u) FAILED -- skipping\n", (unsigned)sz);
-        f.close(); slot->loaded = true; slot->status = TILE_ST_OOM; return slot;
-    }
-    size_t got = f.read(buf, sz);
-    f.close();
-    if (got != sz) {
-        MVT_LOG("[TILE]   short read got=%u expected=%u -- skipping\n",
-                (unsigned)got, (unsigned)sz);
-        free(buf); slot->loaded = true; slot->status = TILE_ST_IOERR; return slot;
+    if (g_map_bundle >= 0) {
+        const uint8_t *span = nullptr;
+        uint32_t len = 0;
+        if (!wp_bundle_tile(&g_bundle, g_map_bundle, z, x, y, &span, &len)) {
+            // Not an error state to cache: a tile the bundle does not hold is
+            // simply outside this map, exactly like a missing file on the card.
+            MVT_LOG("[TILE] z=%d x=%d y=%d -- not in the bundle\n", (int)z, (int)x, (int)y);
+            return nullptr;
+        }
+        sz = (size_t)len;
+        buf = (uint8_t*)ps_malloc(sz);
+        if (!buf) buf = (uint8_t*)malloc(sz);
+        if (!buf) {
+            MVT_LOG("[TILE]   malloc(%u) FAILED -- skipping\n", (unsigned)sz);
+            slot->loaded = true; slot->status = TILE_ST_OOM; return slot;
+        }
+        memcpy(buf, span, sz);
+        MVT_LOG("[TILE] z=%d x=%d y=%d bundle bytes=%u\n",
+                (int)z, (int)x, (int)y, (unsigned)sz);
+    } else {
+        path = mvt_tile_path(z, x, y);
+        if (!path.length()) {
+            MVT_LOG("[TILE] z=%d x=%d y=%d -- file not found on SD\n", (int)z, (int)x, (int)y);
+            return nullptr;
+        }
+        File f = SD_MMC.open(path, FILE_READ);
+        if (!f) {
+            MVT_LOG("[TILE] z=%d x=%d y=%d path='%s' -- SD open FAILED\n",
+                    (int)z, (int)x, (int)y, path.c_str());
+            slot->loaded = true; slot->status = TILE_ST_IOERR; return slot;
+        }
+        sz = f.size();
+        MVT_LOG("[TILE] z=%d x=%d y=%d path='%s' bytes=%u\n",
+                (int)z, (int)x, (int)y, path.c_str(), (unsigned)sz);
+        if (!sz || sz > 512 * 1024) {
+            MVT_LOG("[TILE]   size out of bounds -- ignored\n");
+            f.close(); slot->loaded = true; slot->status = TILE_ST_BADSIZE; return slot;
+        }
+        buf = (uint8_t*)ps_malloc(sz);
+        if (!buf) buf = (uint8_t*)malloc(sz);
+        if (!buf) {
+            MVT_LOG("[TILE]   malloc(%u) FAILED -- skipping\n", (unsigned)sz);
+            f.close(); slot->loaded = true; slot->status = TILE_ST_OOM; return slot;
+        }
+        size_t got = f.read(buf, sz);
+        f.close();
+        if (got != sz) {
+            MVT_LOG("[TILE]   short read got=%u expected=%u -- skipping\n",
+                    (unsigned)got, (unsigned)sz);
+            free(buf); slot->loaded = true; slot->status = TILE_ST_IOERR; return slot;
+        }
     }
 
     // Track A -- gzip handling. MBTiles/Planetiler vector tiles are gzip'd
@@ -2841,8 +3389,11 @@ static int json_find_int(const String &src, const char *key, int fallback) {
 // =============================================================================
 //  Map open / close  (a "map" is a directory containing MVT tiles)
 // =============================================================================
-static bool mvt_map_read_header_meta(const String &dir_path, FMapMeta &out) {
-    // Try to read <dir>/metadata.json for name/bounds; fall back to dir name.
+// One parser, two sources: a metadata.json on the card and the identical text in
+// the bundle's string pool. A bundled map is therefore read by exactly the code
+// that has always read a card map -- title, bounds, zoom range, all of it -- and
+// cannot quietly acquire a second set of rules.
+static void mvt_meta_apply_json(const String &s, const String &dirname, FMapMeta &out) {
     out.title = String();
     out.desc = String();
     out.min_lat = out.min_lon = out.max_lat = out.max_lon = 0;
@@ -2852,45 +3403,48 @@ static bool mvt_map_read_header_meta(const String &dir_path, FMapMeta &out) {
     out.projection = 1; // web mercator
     out.created = 0;
 
-    // dir name as fallback title
-    int slash = dir_path.lastIndexOf('/');
-    String dirname = (slash >= 0) ? dir_path.substring(slash + 1) : dir_path;
-
-    File mj = SD_MMC.open((dir_path + "/metadata.json").c_str(), FILE_READ);
-    if (mj) {
-        String s = mj.readString();
-        mj.close();
-        out.title = json_find_str(s, "name");
-        out.desc  = json_find_str(s, "description");
-        // bounds "minLon,minLat,maxLon,maxLat"
-        String b = json_find_str(s, "bounds");
-        if (b.length()) {
-            int p1 = b.indexOf(','); int p2 = (p1>=0) ? b.indexOf(',', p1+1) : -1;
-            int p3 = (p2>=0) ? b.indexOf(',', p2+1) : -1;
-            if (p1>0 && p2>p1 && p3>p2) {
-                out.min_lon = b.substring(0, p1).toFloat();
-                out.min_lat = b.substring(p1+1, p2).toFloat();
-                out.max_lon = b.substring(p2+1, p3).toFloat();
-                out.max_lat = b.substring(p3+1).toFloat();
-            }
+    out.title = json_find_str(s, "name");
+    out.desc  = json_find_str(s, "description");
+    // bounds "minLon,minLat,maxLon,maxLat"
+    String b = json_find_str(s, "bounds");
+    if (b.length()) {
+        int p1 = b.indexOf(','); int p2 = (p1>=0) ? b.indexOf(',', p1+1) : -1;
+        int p3 = (p2>=0) ? b.indexOf(',', p2+1) : -1;
+        if (p1>0 && p2>p1 && p3>p2) {
+            out.min_lon = b.substring(0, p1).toFloat();
+            out.min_lat = b.substring(p1+1, p2).toFloat();
+            out.max_lon = b.substring(p2+1, p3).toFloat();
+            out.max_lat = b.substring(p3+1).toFloat();
         }
-        out.minzoom = (uint8_t)json_find_int(s, "minzoom", 10);
-        out.maxzoom = (uint8_t)json_find_int(s, "maxzoom", 17);
-        // Clamp to the slippy-zoom range we can actually represent. Every world
-        // coordinate is `(1u << refzoom)`-scaled, so a bogus maxzoom (0, or 31
-        // from a hand-edited metadata.json, or a 64-bit value that truncates)
-        // used to shift the whole world away and render an empty screen with no
-        // error at all. A too-small maxzoom (< minzoom) reversed the zoom loop
-        // in mvt_map_open and made the map refuse to open.
-        if (out.minzoom > 22) out.minzoom = 22;
-        if (out.maxzoom > 22) out.maxzoom = 22;
-        if (out.maxzoom < out.minzoom) out.maxzoom = out.minzoom;
     }
- if (!out.title.length()) out.title = dirname;
+    out.minzoom = (uint8_t)json_find_int(s, "minzoom", 10);
+    out.maxzoom = (uint8_t)json_find_int(s, "maxzoom", 17);
+    // Clamp to the slippy-zoom range we can actually represent. Every world
+    // coordinate is `(1u << refzoom)`-scaled, so a bogus maxzoom (0, or 31 from
+    // a hand-edited metadata.json, or a 64-bit value that truncates) used to
+    // shift the whole world away and render an empty screen with no error at
+    // all. A too-small maxzoom (< minzoom) reversed the zoom loop in
+    // mvt_map_open and made the map refuse to open.
+    if (out.minzoom > 22) out.minzoom = 22;
+    if (out.maxzoom > 22) out.maxzoom = 22;
+    if (out.maxzoom < out.minzoom) out.maxzoom = out.minzoom;
+
+    if (!out.title.length()) out.title = dirname;
     if (out.max_lat == 0 && out.min_lat == 0) {
         out.desc = out.desc.length() ? out.desc : String("MVT tiles (bounds unknown)");
     }
     out.refzoom = out.maxzoom;
+}
+
+static bool mvt_map_read_header_meta(const String &dir_path, FMapMeta &out) {
+    // Try to read <dir>/metadata.json for name/bounds; fall back to dir name.
+    int slash = dir_path.lastIndexOf('/');
+    String dirname = (slash >= 0) ? dir_path.substring(slash + 1) : dir_path;
+
+    String s;
+    File mj = SD_MMC.open((dir_path + "/metadata.json").c_str(), FILE_READ);
+    if (mj) { s = mj.readString(); mj.close(); }
+    mvt_meta_apply_json(s, dirname, out);
     MVT_LOG("[MAP] meta dir='%s' title='%s' bounds=[%.5f,%.5f .. %.5f,%.5f] "
             "minzoom=%u maxzoom=%u refzoom=%u\n",
             dir_path.c_str(), out.title.c_str(),
@@ -2900,8 +3454,30 @@ static bool mvt_map_read_header_meta(const String &dir_path, FMapMeta &out) {
     return true;
 }
 
+// The bundle stores metadata.json's bytes, not a parsed struct: one parser, and
+// a bake that drops zoom levels rewrites the JSON rather than adding a field the
+// firmware would have to know about.
+static bool mvt_meta_from_bundle(const WpBundleMap &bm, FMapMeta &out) {
+    if (!bm.meta || !bm.meta_len) return false;
+    // Copy out of flash by the *stated* length and terminate it here, so a
+    // metadata blob that was never NUL-terminated cannot be read past its end.
+    // 512 bytes is several times the JSON this ever holds; a longer one is cut
+    // rather than trusted, and the parser is tolerant of a cut tail.
+    char buf[512];
+    uint32_t n = bm.meta_len;
+    if (n > sizeof(buf) - 1) n = sizeof(buf) - 1;
+    memcpy(buf, bm.meta, n);
+    buf[n] = 0;
+    String s(buf);                            // now a copy in RAM, not in flash
+    mvt_meta_apply_json(s, String(bm.name), out);
+    MVT_LOG("[MAP] bundle '%s' title='%s' minzoom=%u maxzoom=%u\n",
+            bm.name, out.title.c_str(), (unsigned)out.minzoom, (unsigned)out.maxzoom);
+    return true;
+}
+
 // Count tile files under one zoom dir (small helper for library metadata).
 static uint32_t count_tiles_at_zoom(const String &dir_path, uint8_t z) {
+    if (g_map_bundle >= 0) return wp_bundle_zoom_tiles(&g_bundle, g_map_bundle, z);
     char zb[16]; snprintf(zb, sizeof(zb), "/%u", (unsigned)z);
     File zd = SD_MMC.open((dir_path + zb).c_str());
     if (!zd || !zd.isDirectory()) { if (zd) zd.close(); return 0; }
@@ -2932,12 +3508,57 @@ static uint32_t count_tiles_at_zoom(const String &dir_path, uint8_t z) {
 static void mvt_map_close() {
     g_map_loaded = false;
     g_map_dir_path = String();
+    g_map_bundle = -1;          // the next open says where ITS tiles come from
     poi_reset();
     g_zoom_count = 0;
     g_tile_count = 0;
     for (int i=0; i<LAY__COUNT; i++) g_styles[i].set = false;
     cache_reset();
+    // The negative probe cache is keyed on (z,x,y) alone, so an entry recorded
+    // against one map is a lie about the next one: open a map, pan where it has
+    // no tiles, switch to a map that does, and those tiles stay invisible until
+    // the 64-slot ring happens to reuse them. tile_miss_clear() was written for
+    // exactly this and never called. mvt_map_open() always closes first, so this
+    // is the one place that has to run.
+    tile_miss_clear();
     g_last_cached_z = -1;
+}
+
+// One rung of the zoom ladder: world-units per pixel where that zoom is
+// "preferred", i.e. one MVT tile should render at ~256 screen pixels. Both
+// openers (card and bundle) build their ladder through this, so a bundled map
+// and a card map holding the same zooms behave identically.
+static FMapZoom mvt_zoom_record(uint8_t z, uint32_t tiles) {
+    FMapZoom zr;
+    zr.zoom_id = z;
+    int shift = g_meta.refzoom - z;
+    double world_side = (double)MVT_EXTENT_DEFAULT *
+                        ((shift >= 0) ? (double)(1u << shift)
+                                      : 1.0 / (double)(1u << -shift));
+    zr.min_px_scale = (float)(world_side / 256.0);
+    zr.object_count = tiles;
+    return zr;
+}
+
+// The tail both openers share: metres per world unit at the map's own latitude,
+// the centre a recentre starts from, and the flag the draw path checks.
+static void mvt_map_finish_open() {
+    // Compute metres-per-world-unit at map's origin latitude for scale bar / nav.
+    double lat_c = ((double)g_meta.min_lat + (double)g_meta.max_lat) * 0.5;
+    if (lat_c == 0) lat_c = -32.0;   // fallback (Byford-ish southern hemisphere)
+    double cosL = cos(lat_c * M_PI / 180.0);
+    if (cosL < 0.05) cosL = 0.05;
+    // 156543.03392 m/px at equator zoom 0, slippy 256px tiles.
+    // world_units per pixel at refzoom = MVT_EXTENT / 256.
+    // => metres per world unit = 156543.03392 * cos(L) / (2^refzoom * (EXTENT/256))
+    g_metres_per_world_unit = 156543.03392 * cosL /
+                              ((double)(1u << g_meta.refzoom) *
+                               ((double)MVT_EXTENT_DEFAULT / 256.0));
+    g_meta.units_per_metre = (float)(1.0 / g_metres_per_world_unit);
+    g_meta.origin_lat = (float)lat_c;
+    g_meta.origin_lon = (float)(((double)g_meta.min_lon + (double)g_meta.max_lon) * 0.5);
+
+    g_map_loaded = true;
 }
 
 static bool mvt_map_open(const String &dir_path) {
@@ -2962,17 +3583,7 @@ static bool mvt_map_open(const String &dir_path) {
         if (!SD_MMC.exists((dir_path + zb).c_str())) continue;
         uint32_t tc = count_tiles_at_zoom(dir_path, z);
         if (!tc) continue;
-        FMapZoom zr;
-        zr.zoom_id = z;
-        // world-units per pixel where this zoom is "preferred": one MVT tile
-        // (world span at ref zoom) should render at ~256 screen pixels.
-        int shift = g_meta.refzoom - z;
-        double world_side = (double)MVT_EXTENT_DEFAULT *
-                            ((shift >= 0) ? (double)(1u << shift)
-                                          : 1.0 / (double)(1u << -shift));
-        zr.min_px_scale = (float)(world_side / 256.0);
-        zr.object_count = tc;
-        g_zooms[g_zoom_count++] = zr;
+        g_zooms[g_zoom_count++] = mvt_zoom_record(z, tc);
         g_tile_count += tc;
     }
     if (g_zoom_count == 0) {
@@ -2987,22 +3598,41 @@ static bool mvt_map_open(const String &dir_path) {
                 (unsigned)g_zooms[i].zoom_id, (unsigned)g_zooms[i].object_count);
     }
 
-    // Compute metres-per-world-unit at map's origin latitude for scale bar / nav.
-    double lat_c = ((double)g_meta.min_lat + (double)g_meta.max_lat) * 0.5;
-    if (lat_c == 0) lat_c = -32.0;   // fallback (Byford-ish southern hemisphere)
-    double cosL = cos(lat_c * M_PI / 180.0);
-    if (cosL < 0.05) cosL = 0.05;
-    // 156543.03392 m/px at equator zoom 0, slippy 256px tiles.
-    // world_units per pixel at refzoom = MVT_EXTENT / 256.
-    // => metres per world unit = 156543.03392 * cos(L) / (2^refzoom * (EXTENT/256))
-    g_metres_per_world_unit = 156543.03392 * cosL /
-                              ((double)(1u << g_meta.refzoom) *
-                               ((double)MVT_EXTENT_DEFAULT / 256.0));
-    g_meta.units_per_metre = (float)(1.0 / g_metres_per_world_unit);
-    g_meta.origin_lat = (float)lat_c;
-    g_meta.origin_lon = (float)(((double)g_meta.min_lon + (double)g_meta.max_lon) * 0.5);
+    mvt_map_finish_open();
+    return true;
+}
 
-    g_map_loaded = true;
+// Open a built-in map. Everything after "where do the tiles come from" is the
+// same as a card map, so it is the same code: the ladder comes from the bundle
+// index instead of from probing folders, and the projection tail is shared.
+static bool mvt_map_open_bundle(int idx) {
+    mvt_map_close();
+    WpBundleMap bm;
+    if (!g_bundle_ok || !wp_bundle_map(&g_bundle, idx, &bm)) return false;
+    if (!mvt_meta_from_bundle(bm, g_meta)) return false;
+    g_map_dir_path = String();
+    g_map_bundle   = idx;
+    g_zoom_count = 0;
+    g_tile_count = 0;
+    for (uint8_t z = 0; z <= 22; z++) {
+        uint32_t tc = wp_bundle_zoom_tiles(&g_bundle, idx, z);
+        if (!tc) continue;
+        if (g_zoom_count >= MAX_ZOOMS) {
+            MVT_LOG("[MAP] bundle zoom list full at MAX_ZOOMS=%u - z%u ignored\n",
+                    (unsigned)MAX_ZOOMS, (unsigned)z);
+            break;
+        }
+        g_zooms[g_zoom_count++] = mvt_zoom_record(z, tc);
+        g_tile_count += tc;
+    }
+    if (g_zoom_count == 0) {
+        MVT_LOG("[MAP] bundle map %d holds no tiles -- aborting open\n", idx);
+        g_map_bundle = -1;
+        return false;
+    }
+    MVT_LOG("[MAP] bundled '%s': %u zooms, %u tiles\n",
+            bm.name, (unsigned)g_zoom_count, (unsigned)g_tile_count);
+    mvt_map_finish_open();
     return true;
 }
 // -----------------------------------------------------------------------------
@@ -3057,7 +3687,7 @@ static int    g_screen_cx = LCD_WIDTH/2;
 static int    g_screen_cy = LCD_HEIGHT/2;
 static float  g_map_rotation_deg = 0.0f;     // 0 = north up; set to heading if rotate-with-heading
 static bool   g_rotate_with_heading = false;
-static float  g_last_rot_drawn_deg = -999.0f;// throttle: only redraw when heading moves > N degrees
+
 
 // Nav target (POI or map centre set as "Navigate here")
 static bool   g_has_nav_target = false;
@@ -3084,29 +3714,31 @@ static inline void world_to_screen(int32_t wx, int32_t wy, int *sx, int *sy) {
     *sy = g_screen_cy - (int)dy;   // world +Y is up
 }
 
-static void cam_reset_to_bounds() {
+// Where a recentre wants the camera, WITHOUT moving it: the centre of the map's
+// declared bounds, at the middle of the zoom ladder, snapped to a level that
+// exists on disk. Split out of cam_reset_to_bounds() so the UI can animate a
+// move to it - and so the animated destination and the instantaneous one are
+// one calculation rather than two that drift apart.
+static void cam_bounds_target(double *tx, double *ty, float *tscale,
+                              uint8_t *tzoom) {
     // Centre on the map's lat/lon centre (Web Mercator, world +Y = north).
     double lat_c = ((double)g_meta.min_lat + (double)g_meta.max_lat) * 0.5;
     double lon_c = ((double)g_meta.min_lon + (double)g_meta.max_lon) * 0.5;
     if (g_meta.min_lat == 0 && g_meta.max_lat == 0) {
         // Unknown bounds: park camera on the middle discovered tile at midzoom.
         uint8_t z = g_zoom_count ? g_zooms[g_zoom_count/2].zoom_id : g_meta.refzoom;
-        // Look for first tile file at this zoom to derive x/y.
         int shift = g_meta.refzoom - z;
         double side = (double)MVT_EXTENT_DEFAULT *
                       ((shift >= 0) ? (double)(1u << shift) : 1.0/(double)(1u << -shift));
-        g_cam_x = side * 0.5;
-        g_cam_y = -side * 0.5;
-        g_cam_scale = (float)(256.0 / side);
-        g_cam_zoom  = z;
+        *tx     = side * 0.5;
+        *ty     = -side * 0.5;
+        *tscale = (float)(256.0 / side);
+        *tzoom  = z;
         return;
     }
- g_cam_x = mercator_lon_to_world_x(lon_c, g_meta.refzoom);
-    g_cam_y = mercator_lat_to_world_y(lat_c, g_meta.refzoom);
-    // Choose initial zoom = clamp((minzoom+maxzoom)/2, minzoom, maxzoom), then
-    // snap to the closest discovered zoom level on disk. For the user's Perth
-    // export (minzoom=10, maxzoom=16) this lands at z13 -- inside the tiny
-    // bounds where tiles actually exist.
+    // Choose the zoom = clamp((minzoom+maxzoom)/2, minzoom, maxzoom), then snap
+    // to the closest discovered level. For the user's Perth export (minzoom=10,
+    // maxzoom=16) this lands at z13 -- inside the tiny bounds where tiles exist.
     uint8_t z_want = (uint8_t)(((int)g_meta.minzoom + (int)g_meta.maxzoom) / 2);
     if (z_want < g_meta.minzoom) z_want = g_meta.minzoom;
     if (z_want > g_meta.maxzoom) z_want = g_meta.maxzoom;
@@ -3120,15 +3752,24 @@ static void cam_reset_to_bounds() {
     int shift = g_meta.refzoom - z;
     double side = (double)MVT_EXTENT_DEFAULT *
                   ((shift >= 0) ? (double)(1u << shift) : 1.0/(double)(1u << -shift));
-    g_cam_scale = (float)(256.0 / side);
-    g_cam_zoom  = z;
-    MVT_LOG("[CAM] reset to bounds: lon=%.5f lat=%.5f z=%u scale=%.6f "
-            "(minzoom=%u maxzoom=%u want=%u)\n",
-            lon_c, lat_c, (unsigned)z, g_cam_scale,
-            (unsigned)g_meta.minzoom, (unsigned)g_meta.maxzoom, (unsigned)z_want);
+    *tx     = mercator_lon_to_world_x(lon_c, g_meta.refzoom);
+    *ty     = mercator_lat_to_world_y(lat_c, g_meta.refzoom);
+    *tscale = (float)(256.0 / side);
+    *tzoom  = z;
+}
+
+static void cam_reset_to_bounds() {
+    double tx, ty; float ts; uint8_t tz;
+    cam_bounds_target(&tx, &ty, &ts, &tz);
+    g_cam_x = tx; g_cam_y = ty; g_cam_scale = ts; g_cam_zoom = tz;
+    MVT_LOG("[CAM] reset to bounds: world=%.1f,%.1f z=%u scale=%.6f "
+            "(minzoom=%u maxzoom=%u)\n",
+            tx, ty, (unsigned)tz, ts,
+            (unsigned)g_meta.minzoom, (unsigned)g_meta.maxzoom);
 }
 
 static void cam_select_zoom() {
+
     // Pick the slippy zoom whose "preferred" world-units-per-pixel best matches
     // the current camera scale. min_px_scale is world_units_per_screen_pixel at
     // that zoom's canonical rendering size.
@@ -3298,12 +3939,15 @@ static void draw_thick_seg(int x0, int y0, int x1, int y1, int w, uint16_t c) {
     g_px[3] = (int16_t)(x0 - (int)px); g_py[3] = (int16_t)(y0 - (int)py);
     uint16_t quad_end = 4;
     fill_rings_screen(4, &quad_end, 1, c);
-    // Round the joints on the fatter roads so corners don't show notches.
-    if (w >= 4) {
+    // Round the joints on every road wide enough for a notch to show. At 3 px
+    // a kink used to leave a nick in an otherwise solid line, which is exactly
+    // what a map is not supposed to look like.
+    if (w >= 3) {
         gfx->fillCircle(x0, y0, w / 2, c);
         gfx->fillCircle(x1, y1, w / 2, c);
     }
 }
+
 
 // Draw polyline in world coords, clipped by screen bounds.
 static void draw_polyline_world(const FVec2 *pts, int n, uint16_t col,
@@ -3567,6 +4211,20 @@ struct MapEntry {
     uint8_t zmin = 10, zmax = 17;
     float min_lat = 0, min_lon = 0, max_lat = 0, max_lon = 0;
     bool has_meta = false;
+    // Which slot of the recent-maps ring this map holds (-1 = not recent), read
+    // once during the scan so the shelf and the card can say "recent" without
+    // asking NVS again on every redraw.
+    int8_t recent_rank = -1;
+    // Built-in maps: -1 means the tiles live on the card. Anything else is the
+    // map's index in the flash bundle, and it cannot be removed from the library
+    // because it is part of the firmware.
+    int8_t bundle_id = -1;
+    bool   builtin   = false;
+    // A thumbnail, already painted, sitting in flash. 0 = none: a map on the card
+    // has no picture unless its pack ships one, and the card simply loses the
+    // band rather than showing an empty box.
+    const uint8_t *preview = nullptr;
+    uint16_t       preview_len = 0;
 };
 static MapEntry g_maps[MAX_MAPS];
 static int g_map_count_lib = 0;
@@ -3574,8 +4232,254 @@ static int g_map_sel = 0;
 static bool g_lib_redraw = true;
 static bool g_lib_info   = false;   // details panel: swipe up / long press
 
-// Detect if a directory looks like an MVT tile-tree (contains at least one
-// numeric zoom folder holding a tile file). Cheap check: probe a handful of
+// =============================================================================
+//  Library engine  (WP_LIB_ENGINE)
+//
+//  The library is the first screen with a decision on it, and every part of that
+//  decision is arithmetic: where the card and the shelf sit, which map a touch
+//  landed on, how a long title is shortened, how a description is broken into
+//  lines that fit the card, and where a map's zoom range sits on the detail
+//  ladder. Keeping it here - plain numbers and char buffers, no LVGL, no panel,
+//  no SD - is what lets tools/host_test assert the screen that decides which map
+//  you open instead of trusting it. gen_engine.py enforces the boundary: teach
+//  this region about a display and the host build stops.
+// =============================================================================
+// ===== BEGIN WP_LIB_ENGINE
+#define WP_LIB_CHAR_W     6      // panel font at size 1: 6 x 8 px per character
+#define WP_LIB_CHAR_H     8
+#define WP_LIB_CARD_R    22      // same slab radius as every LVGL card
+#define WP_LIB_CHIP_PAD  10      // horizontal padding inside a shelf chip
+#define WP_LIB_CHIP_MIN  64      // a chip narrower than this cannot be read
+#define WP_LIB_SHELF_GAP  6
+#define WP_LIB_LADDER_LO  0      // the zoom ladder the detail bar is drawn against
+#define WP_LIB_LADDER_HI 22
+
+// Every rect on the screen, derived from the panel size so that the painter and
+// the hit test cannot disagree about where anything is.
+struct WpLibLayout {
+    int pill_x, pill_y, pill_w, pill_h;
+    int shelf_x, shelf_y, shelf_w, shelf_h;
+    int card_x, card_y, card_w, card_h;
+    int row_y, row_h;                  // the "3 / 7" position plate
+    int hint_y, hint_line;             // first hint line and the leading under it
+    int arrow_w, arrow_h;              // the plates either side of the card
+};
+
+// The strip of tabs above the card: which maps it shows, and how wide each chip
+// is. A window rather than the whole shelf, because a library of 30 maps has no
+// room for 30 tabs.
+struct WpLibShelf {
+    int first, slots, chip_w;
+    int x, w, gap;
+};
+
+static void wp_lib_layout(int sw, int sh, WpLibLayout *o) {
+    o->pill_x = 4;  o->pill_y = 3;
+    o->pill_w = sw - 8;  o->pill_h = 26;
+    o->shelf_x = 10;  o->shelf_y = o->pill_y + o->pill_h + 8;
+    o->shelf_w = sw - 20;  o->shelf_h = 26;
+    o->hint_line = WP_LIB_CHAR_H + 6;
+    o->hint_y = sh - 10 - 4 * o->hint_line;
+    o->row_h = 22;
+    o->card_x = 16;
+    o->card_y = o->shelf_y + o->shelf_h + 10;
+    o->card_w = sw - 32;
+    o->card_h = o->hint_y - 12 - (o->row_h + 6) - o->card_y;
+    if (o->card_h < 120) o->card_h = 120;   // never a card too small to read
+    o->row_y = o->card_y + o->card_h + 6;
+    o->arrow_w = 30;  o->arrow_h = 44;
+}
+
+// Step the selection by dir (+1 / -1), wrapping. An empty library stays at 0 and
+// a one-map library never moves: there is nothing else to show.
+static int wp_lib_step(int sel, int count, int dir) {
+    if (count <= 1) return 0;
+    int s = sel % count;
+    if (s < 0) s += count;
+    s += (dir >= 0) ? 1 : -1;
+    if (s < 0) s = count - 1;
+    if (s >= count) s = 0;
+    return s;
+}
+
+// How many chips fit across w at a readable width: never more than the library
+// holds, never fewer than one.
+static int wp_lib_slots(int count, int w, int gap) {
+    if (count <= 0) return 0;
+    int fit = (w + gap) / (WP_LIB_CHIP_MIN + gap);
+    if (fit < 1) fit = 1;
+    return (fit < count) ? fit : count;
+}
+
+// The leftmost chip shown. The window slides so the selection sits in the middle
+// of the strip when it can, and stops at the ends so the shelf is never half
+// empty at one side.
+static int wp_lib_first(int count, int sel, int slots) {
+    if (count <= 0 || slots <= 0) return 0;
+    if (count <= slots) return 0;
+    int f = sel - slots / 2;
+    if (f < 0) f = 0;
+    if (f > count - slots) f = count - slots;
+    return f;
+}
+
+static void wp_lib_shelf(int count, int sel, int x, int w, int gap,
+                         WpLibShelf *o) {
+    o->x = x;  o->w = w;  o->gap = gap;
+    o->slots = wp_lib_slots(count, w, gap);
+    o->first = wp_lib_first(count, sel, o->slots);
+    o->chip_w = (o->slots > 0) ? (w - gap * (o->slots - 1)) / o->slots : 0;
+}
+
+static int wp_lib_chip_x(const WpLibShelf *s, int i) {
+    return s->x + i * (s->chip_w + s->gap);
+}
+
+// How many characters a chip that wide can hold.
+static int wp_lib_chip_chars(const WpLibShelf *s) {
+    int room = s->chip_w - 2 * WP_LIB_CHIP_PAD;
+    if (room < WP_LIB_CHAR_W) return 0;
+    return room / WP_LIB_CHAR_W;
+}
+
+// Shorten s to max_chars: the whole string when it fits, otherwise a cut closed
+// with '~' so that a shortened title never passes for the real name. Always
+// NUL-terminates, and never writes past cap bytes. Returns what it wrote.
+static int wp_lib_fold(const char *s, char *out, int cap, int max_chars) {
+    if (!out || cap <= 0) return 0;
+    out[0] = 0;
+    if (!s || max_chars < 1) return 0;
+    int n = (int)strlen(s);
+    if (n <= max_chars) {
+        int k = (n < cap - 1) ? n : cap - 1;
+        memcpy(out, s, (size_t)k);  out[k] = 0;
+        return k;
+    }
+    int k = (max_chars < cap - 1) ? max_chars : cap - 1;
+    if (k < 2) return 0;
+    memcpy(out, s, (size_t)(k - 1));
+    out[k - 1] = '~';  out[k] = 0;
+    return k;
+}
+
+// Pull the next line of a wrapped paragraph out of s, starting at `from`. Breaks
+// at a space where there is one, hard-breaks a word longer than the line so the
+// loop can never spin, and returns the offset to carry on from (-1 = finished).
+// Whatever a break eats is only the space it broke on: the host test reassembles
+// the lines and compares them with the source, so a description cannot lose a
+// character on its way to a 410 px panel.
+static int wp_lib_wrap_line(const char *s, int from, int max_chars,
+                            char *out, int cap) {
+    if (!out || cap <= 0) return -1;
+    out[0] = 0;
+    if (!s || max_chars < 1) return -1;
+    const int n = (int)strlen(s);
+    while (from < n && s[from] == ' ') from++;
+    if (from >= n) return -1;
+    const int room = n - from;
+    if (room <= max_chars) {
+        int k = (room < cap - 1) ? room : cap - 1;
+        memcpy(out, s + from, (size_t)k);  out[k] = 0;
+        return -1;
+    }
+    int br = max_chars;
+    while (br > 0 && s[from + br] != ' ') br--;
+    if (br < 1) br = max_chars;          // one word, longer than the whole line
+    int k = (br < cap - 1) ? br : cap - 1;
+    memcpy(out, s + from, (size_t)k);  out[k] = 0;
+    int next = from + br;
+    while (next < n && s[next] == ' ') next++;
+    return (next >= n) ? -1 : next;
+}
+
+// Where a zoom level sits on the ladder, 0..1, clamped.
+static float wp_lib_ladder_frac(int z) {
+    float f = (float)(z - WP_LIB_LADDER_LO) /
+              (float)(WP_LIB_LADDER_HI - WP_LIB_LADDER_LO);
+    if (f < 0.0f) f = 0.0f;
+    if (f > 1.0f) f = 1.0f;
+    return f;
+}
+
+// The span a map covers, in pixels across px: the bar that replaces "z12-z16"
+// with something you can see the shape of. A one-level map still gets a visible
+// bar rather than a zero-width nothing.
+static void wp_lib_ladder_span(int zmin, int zmax, int px, int *x0, int *x1) {
+    if (px < 2) px = 2;
+    float f0 = wp_lib_ladder_frac(zmin);
+    float f1 = wp_lib_ladder_frac(zmax);
+    if (f1 < f0) { float tf = f0; f0 = f1; f1 = tf; }
+    int a = (int)(f0 * (float)px + 0.5f);
+    int b = (int)(f1 * (float)px + 0.5f);
+    if (a < 0) a = 0;
+    if (a > px - 1) a = px - 1;
+    if (b > px) b = px;
+    if (b <= a) b = a + 1;
+    *x0 = a;  *x1 = b;
+}
+
+// What the card says in its corner: recency first (it is the reason to open this
+// one), then a missing metadata.json, which the card admits rather than hides.
+// Returns what it wrote; an empty string means nothing needed saying.
+static int wp_lib_badge(int recent_rank, int has_meta, char *out, int cap) {
+    if (!out || cap <= 0) return 0;
+    const char *s = (recent_rank >= 0) ? "recent"
+                  : (!has_meta)         ? "no metadata"
+                                        : "";
+    int n = (int)strlen(s);
+    if (n > cap - 1) n = cap - 1;
+    memcpy(out, s, (size_t)n);  out[n] = 0;
+    return n;
+}
+
+// What a touch landed on. The rects come from the same layout the painter uses,
+// so the plate that looks like an arrow is the plate that steps the carousel.
+#define WP_LIB_HIT_NONE   0
+#define WP_LIB_HIT_PREV   1
+#define WP_LIB_HIT_NEXT   2
+#define WP_LIB_HIT_OPEN   3
+#define WP_LIB_HIT_SHELF  4
+
+static int wp_lib_hit(int x, int y, int count, const WpLibLayout *L,
+                      const WpLibShelf *S, int *chip) {
+    if (chip) *chip = -1;
+    if (S && S->slots > 0 && S->chip_w > 0 &&
+        y >= L->shelf_y && y < L->shelf_y + L->shelf_h &&
+        x >= S->x && x < S->x + S->w) {
+        const int rel  = x - S->x;
+        const int step = S->chip_w + S->gap;
+        const int i    = rel / step;     // the gap between two chips has no map
+        if (i >= 0 && i < S->slots && rel - i * step < S->chip_w) {
+            if (chip) *chip = S->first + i;
+            return WP_LIB_HIT_SHELF;
+        }
+        return WP_LIB_HIT_NONE;
+    }
+    if (x < L->card_x || x >= L->card_x + L->card_w ||
+        y < L->card_y || y >= L->card_y + L->card_h) return WP_LIB_HIT_NONE;
+    if (count > 1) {                     // with one map there is nowhere to step
+        if (x < L->card_x + L->arrow_w) return WP_LIB_HIT_PREV;
+        if (x >= L->card_x + L->card_w - L->arrow_w) return WP_LIB_HIT_NEXT;
+    }
+    return WP_LIB_HIT_OPEN;
+}
+
+// The same map can be in the app *and* in a folder on the card: the baked copy
+// is there for a watch with no card, the folder is usually the full pack. Both
+// would be listed under one name, which reads as a duplicate rather than as a
+// choice, so the card's copy replaces the baked one -- but only when it is the
+// same map *and* covers at least the zoom range the app has. A narrower folder
+// (a card holding just the street levels, say) is not a replacement for the
+// baked map, and dropping the baked one for it would lose zooms the watch can
+// already draw.
+static bool wp_lib_card_covers(bool same_map, int app_zmin, int app_zmax,
+                               int card_zmin, int card_zmax) {
+    if (!same_map) return false;
+    return card_zmin <= app_zmin && card_zmax >= app_zmax;
+}
+// ===== END WP_LIB_ENGINE
+
+// Detect if a directory looks like an MVT tile-tree (contains at least one// numeric zoom folder holding a tile file). Cheap check: probe a handful of
 // zoom levels for existence of {dir}/{z}/.
 static bool dir_looks_like_mvt_map(const String &dir_path) {
     for (uint8_t z = 0; z <= 22; z++) {
@@ -3587,6 +4491,31 @@ static bool dir_looks_like_mvt_map(const String &dir_path) {
 
 static void library_scan() {
     g_map_count_lib = 0;
+
+    // Built-in maps come first, and they are listed even when the card is absent
+    // or empty: they are the firmware's own library, not a copy of one.
+    for (int i = 0; i < wp_bundle_map_count(&g_bundle) && g_map_count_lib < MAX_MAPS; i++) {
+        WpBundleMap bm;
+        if (!wp_bundle_map(&g_bundle, i, &bm)) continue;
+        FMapMeta m;
+        if (!mvt_meta_from_bundle(bm, m)) continue;
+        MapEntry &e = g_maps[g_map_count_lib];
+        e.path   = String("@bundle/") + bm.name;
+        e.title  = m.title.length() ? m.title : String(bm.name);
+        e.desc   = m.desc.length() ? m.desc : String("Built-in vector map");
+        e.zmin   = m.minzoom;
+        e.zmax   = m.maxzoom;
+        e.min_lat = m.min_lat; e.min_lon = m.min_lon;
+        e.max_lat = m.max_lat; e.max_lon = m.max_lon;
+        e.has_meta    = true;
+        e.recent_rank = -1;
+        e.bundle_id   = (int8_t)i;
+        e.builtin     = true;
+        e.preview     = bm.preview;
+        e.preview_len = bm.preview_len;
+        g_map_count_lib++;
+    }
+
     SD_MMC.mkdir("/WATCH");
     SD_MMC.mkdir("/WATCH/WayPoint");
     SD_MMC.mkdir("/WATCH/WayPoint/saved");
@@ -3612,12 +4541,47 @@ static void library_scan() {
                         e.min_lat = m.min_lat; e.min_lon = m.min_lon;
                         e.max_lat = m.max_lat; e.max_lon = m.max_lon;
                         e.has_meta = SD_MMC.exists((path + "/metadata.json").c_str());
+                        // A card map is not in the app and has no baked picture,
+                        // said explicitly: an entry reused by a later scan must
+                        // not keep a pointer into flash from an earlier one.
+                        e.bundle_id   = -1;
+                        e.builtin     = false;
+                        e.preview     = nullptr;
+                        e.preview_len = 0;
+                        e.recent_rank = -1;
                         g_map_count_lib++;
                     }
                 }
             }
         }
         ent = d.openNextFile();
+    }
+
+    // The card can shadow the app. When the full pack is on the card as well as
+    // the coarse copy in flash, both entries would carry the same name, and the
+    // library would look like it had two of everything. The card copy wins --
+    // it is the same map with more of it -- but only when it really does cover
+    // the built-in's zoom range (wp_lib_card_covers), so a card holding just the
+    // street levels keeps the baked map listed rather than replacing it.
+    for (int i = 0; i < g_map_count_lib; i++) {
+        if (!g_maps[i].builtin) continue;
+        String folded = g_maps[i].path;                     // "@bundle/WA"
+        if (folded.startsWith("@bundle/")) folded = folded.substring(8);
+        bool shadowed = false;
+        for (int j = 0; j < g_map_count_lib && !shadowed; j++) {
+            if (g_maps[j].builtin) continue;
+            String folder = g_maps[j].path;
+            int sl = folder.lastIndexOf('/');
+            if (sl >= 0) folder = folder.substring(sl + 1);
+            const bool same = folder.equalsIgnoreCase(folded) ||
+                              g_maps[j].title.equalsIgnoreCase(g_maps[i].title);
+            shadowed = wp_lib_card_covers(same, g_maps[i].zmin, g_maps[i].zmax,
+                                          g_maps[j].zmin, g_maps[j].zmax);
+        }
+        if (!shadowed) continue;
+        for (int k = i; k < g_map_count_lib - 1; k++) g_maps[k] = g_maps[k + 1];
+        g_map_count_lib--;
+        i--;
     }
 
     // Reorder: put "recent" maps first, in their MRU order.
@@ -3637,6 +4601,94 @@ static void library_scan() {
         g_maps[slot] = tmp;
         slot++;
     }
+
+    // Mark the ring, now that the order has settled: the card says "recent" and
+    // the shelf keeps a gold dot on the map wherever it has been shuffled to,
+    // which is the whole reason to have read the ring at all.
+    for (int i = 0; i < g_map_count_lib; i++) g_maps[i].recent_rank = -1;
+    for (int i = 0; i < 5; i++) {
+        if (!recent[i].length()) continue;
+        for (int j = 0; j < g_map_count_lib; j++) {
+            if (g_maps[j].path == recent[i] && g_maps[j].recent_rank < 0) {
+                g_maps[j].recent_rank = (int8_t)i;
+                break;
+            }
+        }
+    }
+
+    // The list can shrink between scans (a baked map shadowed by the card, a
+    // folder unplugged), and the selection is an index into it: clamp here, once,
+    // rather than trusting every caller to have done it.
+    if (g_map_sel < 0) g_map_sel = 0;
+    if (g_map_sel >= g_map_count_lib) g_map_sel = g_map_count_lib ? g_map_count_lib - 1 : 0;
+}
+
+// One plate: the shape every piece of chrome on this screen is cut from, so the
+// pill, the shelf chips and the card cannot end up with three corner radii.
+static void lib_plate(int x, int y, int w, int h, int r, uint16_t fill,
+                      uint16_t border) {
+    gfx->fillRoundRect(x, y, w, h, r, fill);
+    if (border) gfx->drawRoundRect(x, y, w, h, r, border);
+}
+
+// The card's thumbnail is a bitmap, so its corners are square unless they are
+// taken off. These four arcs paint card background over the corners the image
+// sticks out of -- cheaper than an alpha mask, and it matches the radius of every
+// other plate on the screen instead of inventing a second shape language.
+static void lib_mask_corners(int x, int y, int w, int h, int r, uint16_t bg) {
+    for (int i = 0; i < r; i++) {
+        const int dy = r - 1 - i;
+        const int dx = r - (int)sqrtf((float)(r * r - dy * dy));
+        if (dx <= 0) continue;
+        if (dx > w / 2) continue;
+        gfx->drawFastHLine(x, y + i, dx, bg);
+        gfx->drawFastHLine(x + w - dx, y + i, dx, bg);
+        gfx->drawFastHLine(x, y + h - 1 - i, dx, bg);
+        gfx->drawFastHLine(x + w - dx, y + h - 1 - i, dx, bg);
+    }
+}
+
+// One bitmap, reused: the library draws one card at a time, so a second buffer
+// would only be a second thing to free.
+static uint16_t *g_lib_prev = nullptr;
+static int g_lib_prev_w = 0, g_lib_prev_h = 0;
+
+// Draw a wrapped paragraph between y and y_bottom, through the tested wrapper,
+// and return the y the next block should start at. Every caller that prints more
+// than a word goes through here: hand-rolled wrap loops are how a description
+// ends up half drawn and a panel ends up frozen.
+static int lib_para(int x, int y, int y_bottom, int width, const char *text,
+                    uint16_t col, uint8_t size) {
+    const int max_chars = width / (WP_LIB_CHAR_W * size);
+    if (max_chars < 1) return y;
+    char line[96];
+    gfx->setTextColor(col); gfx->setTextSize(size);
+    int from = 0;
+    while (from >= 0 && y + WP_LIB_CHAR_H * size <= y_bottom) {
+        from = wp_lib_wrap_line(text, from, max_chars, line, sizeof(line));
+        gfx->setCursor(x, y);
+        gfx->print(line);
+        y += WP_LIB_CHAR_H * size + 6;
+    }
+    return y;
+}
+
+// The four gestures, in the same voice as the map's own hints, so the two
+// screens do not have to be learned twice.
+static void library_draw_hints(const WpLibLayout *L, const ThemePalette &t) {
+    const char *hint[4];
+    hint[0] = "swipe left/right   browse the library";
+    hint[1] = "tap the card       open the map";
+    hint[2] = g_lib_info ? "swipe down         hide the details"
+                         : "swipe up           details of this map";
+    hint[3] = "hold 1.5 s         back to LauncherOS";
+    gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
+    int y = L->hint_y;
+    for (int i = 0; i < 4; i++) {
+        gfx->setCursor(L->card_x, y);
+        gfx->print(hint[i]);
+        y += L->hint_line;
+    }
 }
 
 static void library_draw() {
@@ -3644,160 +4696,241 @@ static void library_draw() {
     g_lib_redraw = false;
     const ThemePalette &t = TH();
     gfx->fillScreen(t.bg);
-    // grid backdrop
-    for (int x=0; x<LCD_WIDTH; x+=40) gfx->drawLine(x, 0, x, LCD_HEIGHT, t.chrome_bg);
-    for (int y=0; y<LCD_HEIGHT; y+=40) gfx->drawLine(0, y, LCD_WIDTH, y, t.chrome_bg);
 
-    int cx = LCD_WIDTH/2;
-    gfx->setTextColor(t.accent); gfx->setTextSize(2);
-    gfx->setCursor(cx - 92, 22); gfx->print("WAYPOINT / OS");
+    WpLibLayout L;
+    wp_lib_layout(LCD_WIDTH, LCD_HEIGHT, &L);
+
+    // ---- header: the same status pill the map wears, because these two screens
+    //      sit next to each other in the flow and should look like one app ----
+    lib_plate(L.pill_x, L.pill_y, L.pill_w, L.pill_h, L.pill_h / 2,
+              t.chrome_bg, t.chrome_border);
+    const int ty = L.pill_y + (L.pill_h - WP_LIB_CHAR_H) / 2;
+    gfx->setTextColor(t.accent); gfx->setTextSize(1);
+    gfx->setCursor(L.pill_x + 12, ty);
+    gfx->print("MAP LIBRARY");
+    char pos[32];
+    snprintf(pos, sizeof(pos), "%d / %d", g_map_count_lib ? g_map_sel + 1 : 0,
+             g_map_count_lib);
     gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
-    gfx->setCursor(cx - 40, 48); gfx->print("map library");
+    gfx->setCursor(L.pill_x + L.pill_w - 12 -
+                   (int)strlen(pos) * WP_LIB_CHAR_W, ty);
+    gfx->print(pos);
 
     if (g_map_count_lib == 0) {
-        gfx->setTextColor(t.text); gfx->setTextSize(1);
-        const char *lines[] = {
-            "No map folders found.",
-            "",
-            "Place MVT tiles under:",
-            "/WATCH/WayPoint/<name>/",
-            "     {z}/{x}/{y}.pbf",
-            "",
-            "Optional metadata.json for",
-            "name, bounds and minzoom/",
-            "maxzoom.",
-        };
-        int y = 110;
-        for (auto &ln : lines) { gfx->setCursor(28, y); gfx->print(ln); y += 16; }
-        gfx->setTextColor(t.text_dim);
-        gfx->setCursor(28, LCD_HEIGHT - 60); gfx->print("BOOT hold 1.5s -> LauncherOS");
+        // Nothing to browse: say exactly where a map goes, in the same card a
+        // map is described in, so the screen teaches instead of scolding.
+        lib_plate(L.card_x, L.card_y, L.card_w, L.card_h, WP_LIB_CARD_R,
+                  t.chrome_bg, t.chrome_border);
+        gfx->setTextColor(t.text); gfx->setTextSize(2);
+        gfx->setCursor(L.card_x + 18, L.card_y + 16);
+        gfx->print("No maps yet");
+        int y = lib_para(L.card_x + 18, L.card_y + 48,
+                         L.card_y + L.card_h - 12, L.card_w - 36,
+                         "No maps at all. Bake one into the app with "
+                         "tools/bake_bundle.py, or copy a map under "
+                         "/WATCH/WayPoint/ with its tiles in {z}/{x}/{y}.pbf "
+                         "folders, then open this screen again.",
+                         t.text, 1);
+        y = lib_para(L.card_x + 18, y + 8, L.card_y + L.card_h - 12,
+                     L.card_w - 36,
+                     "A metadata.json beside the tiles names the map and gives "
+                     "its bounds and zoom range; without one the folder name is "
+                     "the title and the range is discovered when it opens.",
+                     t.text_dim, 1);
+        library_draw_hints(&L, t);
         return;
     }
 
-    MapEntry &e = g_maps[g_map_sel];
-    int card_x = 20, card_y = 104, card_w = LCD_WIDTH - 40, card_h = 246;
-    gfx->fillRoundRect(card_x, card_y, card_w, card_h, 16, t.chrome_bg);
-    gfx->drawRoundRect(card_x, card_y, card_w, card_h, 16, t.accent);
+    const MapEntry &e = g_maps[g_map_sel];
+    const bool multi = (g_map_count_lib > 1);
+    // The arrow plates own the first 30 px of each side, so the title and the
+    // body start clear of them instead of running underneath.
+    const int pad_l = 16 + (multi ? L.arrow_w + 10 : 0);
+    const int pad_r = 16 + (multi ? L.arrow_w + 10 : 0);
+    const int inner = L.card_w - pad_l - pad_r;
 
-    gfx->setTextColor(t.text); gfx->setTextSize(2);
-    gfx->setCursor(card_x + 18, card_y + 16);
-    String shown = e.title.length() > 18 ? e.title.substring(0,17) + "~" : e.title;
-    gfx->print(shown);
-
-    // Zoom range chip: the detail ladder is worth knowing before opening a map,
-    // and metadata.json already told us during the scan.
-    if (e.has_meta) {
-        char zb[24];
-        snprintf(zb, sizeof(zb), "z%u-%u", (unsigned)e.zmin, (unsigned)e.zmax);
-        int zw = (int)strlen(zb) * 6 + 12;
-        int zx = card_x + card_w - zw - 14;
-        gfx->fillRoundRect(zx, card_y + 13, zw, 18, 5, t.bg);
-        gfx->drawRoundRect(zx, card_y + 13, zw, 18, 5, t.chrome_border);
-        gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
-        gfx->setCursor(zx + 6, card_y + 19);
-        gfx->print(zb);
+    // ---- shelf: the library as a strip of tabs, recent maps marked ----------
+    WpLibShelf S;
+    wp_lib_shelf(g_map_count_lib, g_map_sel, L.shelf_x, L.shelf_w,
+                 WP_LIB_SHELF_GAP, &S);
+    const int chip_chars = wp_lib_chip_chars(&S);
+    for (int i = 0; i < S.slots; i++) {
+        const int idx = S.first + i;
+        const int cxp = wp_lib_chip_x(&S, i);
+        const bool on = (idx == g_map_sel);
+        lib_plate(cxp, L.shelf_y, S.chip_w, L.shelf_h, L.shelf_h / 2,
+                  on ? t.chrome_bg : t.bg, on ? t.accent : t.chrome_border);
+        char lbl[48];
+        wp_lib_fold(g_maps[idx].title.c_str(), lbl, sizeof(lbl), chip_chars);
+        gfx->setTextColor(on ? t.accent : t.text_dim); gfx->setTextSize(1);
+        gfx->setCursor(cxp + WP_LIB_CHIP_PAD,
+                       L.shelf_y + (L.shelf_h - WP_LIB_CHAR_H) / 2);
+        gfx->print(lbl);
+        if (g_maps[idx].recent_rank >= 0)     // a recent map keeps its mark
+            gfx->fillCircle(cxp + S.chip_w - 8, L.shelf_y + 8, 2, t.warn);
+    }
+    // There is more library in that direction: the strip is a window on a shelf,
+    // and saying so is cheaper than eight dots that mean nothing at this size.
+    gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
+    if (S.first > 0) {
+        gfx->setCursor(L.shelf_x - 8, L.shelf_y + (L.shelf_h - WP_LIB_CHAR_H) / 2);
+        gfx->print("<");
+    }
+    if (S.first + S.slots < g_map_count_lib) {
+        gfx->setCursor(L.shelf_x + L.shelf_w + 1,
+                       L.shelf_y + (L.shelf_h - WP_LIB_CHAR_H) / 2);
+        gfx->print(">");
     }
 
-    gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
-    gfx->setCursor(card_x + 18, card_y + 44);
-    String fn = e.path; int p = fn.lastIndexOf('/'); if (p>=0) fn = fn.substring(p+1);
-    gfx->print("dir: "); gfx->print(fn);
+    // ---- the card -----------------------------------------------------------
+    lib_plate(L.card_x, L.card_y, L.card_w, L.card_h, WP_LIB_CARD_R,
+              t.chrome_bg, t.accent);
 
-    // Body: the map's description, or - when the details panel is open - the
-    // metadata the description leaves out.
-    gfx->setTextColor(t.text); gfx->setTextSize(1);
-    const int max_chars = (card_w - 36) / 6;
-    int dy = card_y + 66;
-    const int dy_max = card_y + card_h - 12;
-    if (g_lib_info) {
-        String lines[6];
-        int n = 0;
-        lines[n++] = e.path;
+    // What the title cannot say lives in the corner: how recently this map was
+    // opened, or that there is no metadata describing it.
+    char badge[24];
+    wp_lib_badge(e.recent_rank, e.has_meta ? 1 : 0, badge, sizeof(badge));
+    const int badge_w = (int)strlen(badge) * WP_LIB_CHAR_W + 16;
+    char title[64];
+    wp_lib_fold(e.title.c_str(), title, sizeof(title),
+                (inner - (badge[0] ? badge_w + 10 : 0)) / 12);
+    gfx->setTextColor(t.text); gfx->setTextSize(2);
+    gfx->setCursor(L.card_x + pad_l, L.card_y + 16);
+    gfx->print(title);
+    if (badge[0]) {
+        const int bx = L.card_x + L.card_w - pad_r - badge_w;
+        lib_plate(bx, L.card_y + 15, badge_w, 18, 5, t.bg, t.chrome_border);
+        gfx->setTextColor(e.recent_rank >= 0 ? t.warn : t.text_dim);
+        gfx->setTextSize(1);
+        gfx->setCursor(bx + 8, L.card_y + 20);
+        gfx->print(badge);
+    }
+
+    // Where the map comes from: the title can say anything, this is the folder
+    // (or the fact that there is no folder, because it is in the firmware).
+    char dir[80], dir_lbl[96];
+    String dn = e.path;
+    int slash = dn.lastIndexOf('/');
+    if (slash >= 0) dn = dn.substring(slash + 1);
+    wp_lib_fold(dn.c_str(), dir, sizeof(dir), inner / WP_LIB_CHAR_W - 5);
+    if (e.builtin) snprintf(dir_lbl, sizeof(dir_lbl), "in the app  %s", dir);
+    else           snprintf(dir_lbl, sizeof(dir_lbl), "dir %s", dir);
+    gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
+    gfx->setCursor(L.card_x + pad_l, L.card_y + 46);
+    gfx->print(dir_lbl);
+
+    // ---- the detail ladder: the zoom range as a span you can see the shape of,
+    //      rather than two numbers you have to compare ------------------------
+    const int ly = L.card_y + 68;
+    char zrange[24];
+    if (e.has_meta) snprintf(zrange, sizeof(zrange), "z%u-%u",
+                             (unsigned)e.zmin, (unsigned)e.zmax);
+    else            snprintf(zrange, sizeof(zrange), "on open");
+    const int zrw = (int)strlen(zrange) * WP_LIB_CHAR_W;
+    gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
+    gfx->setCursor(L.card_x + pad_l, ly);
+    gfx->print("detail");
+    gfx->setTextColor(e.has_meta ? t.text : t.text_dim);
+    gfx->setCursor(L.card_x + L.card_w - pad_r - zrw, ly);
+    gfx->print(zrange);
+    const int track_x = L.card_x + pad_l + 7 * WP_LIB_CHAR_W + 6;
+    const int track_w = L.card_x + L.card_w - pad_r - zrw - 10 - track_x;
+    if (track_w > 10) {
+        gfx->drawRect(track_x, ly, track_w, 8, t.chrome_border);
         if (e.has_meta) {
-            char zb[48];
-            snprintf(zb, sizeof(zb), "zooms: z%u to z%u", (unsigned)e.zmin, (unsigned)e.zmax);
-            lines[n++] = zb;
-            if (e.min_lat != 0 || e.max_lat != 0) {
-                char bb[80];
-                snprintf(bb, sizeof(bb), "bounds: %.4f,%.4f .. %.4f,%.4f",
-                         (double)e.min_lon, (double)e.min_lat,
-                         (double)e.max_lon, (double)e.max_lat);
-                lines[n++] = bb;
-            } else {
-                lines[n++] = "bounds: not stated";
-            }
-        } else {
-            lines[n++] = "no metadata.json: the folder name";
-            lines[n++] = "is the title, and the zoom levels";
-            lines[n++] = "are discovered when it opens";
+            int z0, z1;
+            wp_lib_ladder_span(e.zmin, e.zmax, track_w - 2, &z0, &z1);
+            gfx->fillRect(track_x + 1 + z0, ly + 1, z1 - z0, 6, t.accent);
         }
-        for (int i = 0; i < n && dy < dy_max; i++) {
-            String d = lines[i];
-            while (d.length() > 0 && dy < dy_max) {
-                String chunk;
-                if ((int)d.length() <= max_chars) { chunk = d; d = ""; }
-                else {
-                    int br = max_chars;
-                    while (br > 0 && d[br] != ' ') br--;
-                    if (br == 0) br = max_chars;
-                    chunk = d.substring(0, br);
-                    d = d.substring(br); d.trim();
-                }
-                gfx->setCursor(card_x + 18, dy); gfx->print(chunk);
-                dy += 14;
-            }
+    }
+
+    // ---- the map itself, as a picture ---------------------------------------
+    // Baked at 320x96 and scaled to whatever the text column is this time, so
+    // the band survives the arrows appearing and the card narrowing.
+    int body_y = ly + 18;
+    if (e.preview && e.preview_len) {
+        const int bh = 88;
+        if (g_lib_prev_w != inner || g_lib_prev_h != bh) {
+            free(g_lib_prev);
+            g_lib_prev = (uint16_t*)ps_malloc((size_t)inner * bh * sizeof(uint16_t));
+            g_lib_prev_w = g_lib_prev ? inner : 0;
+            g_lib_prev_h = g_lib_prev ? bh : 0;
+        }
+        WpImg im;
+        if (g_lib_prev && wp_img_open(&im, e.preview, e.preview_len) &&
+            wp_img_decode(&im, g_lib_prev, inner, bh)) {
+            const int bx = L.card_x + pad_l, byy = ly + 16;
+            gfx->draw16bitRGBBitmap(bx, byy, g_lib_prev, inner, bh);
+            lib_mask_corners(bx, byy, inner, bh, 14, t.chrome_bg);
+            gfx->drawRoundRect(bx, byy, inner, bh, 14, t.chrome_border);
+            body_y = byy + bh + 10;
+        }
+    }
+
+    // ---- body: the description, or - with the details panel open - what the
+    //      description leaves out --------------------------------------------
+    const int by_max = L.card_y + L.card_h - 12;
+    if (g_lib_info) {
+        // The first line of the details is "where this map actually is". For a
+        // built-in map that is the firmware, not a path, and printing
+        // "@bundle/WA" at the user would be a debug string wearing a label.
+        int by = lib_para(L.card_x + pad_l, body_y, by_max, inner,
+                          e.builtin ? "in the app, no card needed" : e.path.c_str(),
+                          t.text, 1);
+        if (e.has_meta && (e.min_lat != 0 || e.max_lat != 0)) {
+            char bb[96];
+            snprintf(bb, sizeof(bb), "bounds %.4f,%.4f to %.4f,%.4f",
+                     (double)e.min_lon, (double)e.min_lat,
+                     (double)e.max_lon, (double)e.max_lat);
+            by = lib_para(L.card_x + pad_l, by, by_max, inner, bb,
+                          t.text_dim, 1);
+        } else if (e.has_meta) {
+            by = lib_para(L.card_x + pad_l, by, by_max, inner,
+                          "bounds are not stated in metadata.json",
+                          t.text_dim, 1);
+        } else {
+            by = lib_para(L.card_x + pad_l, by, by_max, inner,
+                          "No metadata.json, so the folder name is the title "
+                          "and the zoom range is discovered when the map opens.",
+                          t.text_dim, 1);
         }
     } else {
-        String d = e.desc;
-        while (d.length() > 0 && dy < dy_max) {
-            String chunk;
-            if ((int)d.length() <= max_chars) { chunk = d; d = ""; }
-            else {
-                int br = max_chars;
-                while (br > 0 && d[br] != ' ') br--;
-                if (br == 0) br = max_chars;
-                chunk = d.substring(0, br);
-                d = d.substring(br); d.trim();
-            }
-            gfx->setCursor(card_x + 18, dy); gfx->print(chunk);
-            dy += 14;
-        }
+        lib_para(L.card_x + pad_l, body_y, by_max, inner, e.desc.c_str(),
+                 t.text, 1);
     }
 
-    gfx->setTextColor(t.accent); gfx->setTextSize(3);
-    if (g_map_count_lib > 1) {
-        gfx->setCursor(card_x - 14, card_y + card_h/2 - 12); gfx->print("<");
-        gfx->setCursor(card_x + card_w - 4, card_y + card_h/2 - 12); gfx->print(">");
+    // ---- the arrow plates: drawn from the same width the hit test uses, so the
+    //      plate you press is the plate that steps ---------------------------
+    if (multi) {
+        const int ay = L.card_y + L.card_h / 2 - L.arrow_h / 2;
+        const int aw = L.arrow_w - 4;
+        lib_plate(L.card_x + 4, ay, aw, L.arrow_h, aw / 2, t.bg, t.accent);
+        gfx->setTextColor(t.accent); gfx->setTextSize(2);
+        gfx->setCursor(L.card_x + 4 + aw / 2 - 6, ay + L.arrow_h / 2 - 8);
+        gfx->print("<");
+        const int rx = L.card_x + L.card_w - 4 - aw;
+        lib_plate(rx, ay, aw, L.arrow_h, aw / 2, t.bg, t.accent);
+        gfx->setCursor(rx + aw / 2 - 6, ay + L.arrow_h / 2 - 8);
+        gfx->print(">");
     }
 
-    // Position: a counter, plus dots when the library is small enough for dots
-    // to mean anything (a library of 30 maps needs the number, not 30 dots).
-    if (g_map_count_lib > 1) {
-        const int dots = (g_map_count_lib > 9) ? 9 : g_map_count_lib;
-        const int sel  = (g_map_count_lib > 1)
-                       ? (int)((long)g_map_sel * (dots - 1) / (g_map_count_lib - 1)) : 0;
-        const int dx0  = cx - (dots * 12) / 2;
-        for (int i = 0; i < dots; i++) {
-            int px = dx0 + i * 12 + 5, py = card_y + card_h + 22;
-            if (i == sel) gfx->fillCircle(px, py, 3, t.accent);
-            else          gfx->drawCircle(px, py, 3, t.chrome_border);
-        }
-    }
-    char counter[32];
-    snprintf(counter, sizeof(counter), "%d / %d", g_map_sel + 1, g_map_count_lib);
+    // ---- where you are in the library --------------------------------------
+    const int pw = (int)strlen(pos) * WP_LIB_CHAR_W + 24;
+    const int px = L.card_x + L.card_w / 2 - pw / 2;
+    lib_plate(px, L.row_y, pw, L.row_h, L.row_h / 2, t.chrome_bg,
+              t.chrome_border);
     gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
-    gfx->setCursor(cx - 16, card_y + card_h + 8);
-    gfx->print(counter);
+    gfx->setCursor(px + 12, L.row_y + (L.row_h - WP_LIB_CHAR_H) / 2);
+    gfx->print(pos);
+    if (S.slots < g_map_count_lib) {
+        char more[32];
+        snprintf(more, sizeof(more), "%d more", g_map_count_lib - S.slots);
+        gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
+        gfx->setCursor(px + pw + 10, L.row_y + (L.row_h - WP_LIB_CHAR_H) / 2);
+        gfx->print(more);
+    }
 
-    // Gestures, spelled out once. This is the whole navigation model now, so it
-    // earns the space the BOOT-button chords used to take.
-    int hy = LCD_HEIGHT - 78;
-    gfx->setTextColor(t.text_dim);
-    gfx->setCursor(20, hy);      gfx->print("swipe < >    browse the library");
-    gfx->setCursor(20, hy + 14); gfx->print("tap card     open the map");
-    gfx->setCursor(20, hy + 28); gfx->print(g_lib_info ? "swipe v      hide details"
-                                                        : "swipe ^      map details");
-    gfx->setCursor(20, hy + 42); gfx->print("hold 1.5s    back to LauncherOS");
+    library_draw_hints(&L, t);
 }
 
 // =============================================================================
@@ -3886,6 +5019,52 @@ static void draw_map_frame();  // fwd
 static bool g_need_map_redraw = true;
 
 // -----------------------------------------------------------------------------
+//  The map's per-frame state, declared here with the rest of what the render
+//  pass reads.
+//
+//  These are written much further down the file - by the gesture handlers, the
+//  motion tick and the chrome - and read by code that sits between here and
+//  there, so the declaration has to be above all of it. That is not cosmetic: a
+//  global declared below its first reader does not exist as far as that reader
+//  is concerned, the sketch stops compiling on the first `if`, and the host
+//  tests cannot see it at all because they compile extracted regions rather
+//  than the sketch.
+// -----------------------------------------------------------------------------
+
+// The centre reticle's fade (see map_feel_tick).
+static uint8_t  g_reticle_step    = 0;    // 3 = full ... 0 = hidden
+static uint32_t g_reticle_next_ms = 0;
+
+// What the rotation follow is aiming at: -compass-heading while heading-up, 0
+// while the map settles back to north-up, -999 when it is not following.
+static float    g_heading_target  = -999.0f;
+
+// Coasting (inertia) after a flick. vx/vy are px/ms in *finger* space, so the
+// coast continues the motion the finger made rather than fighting it.
+static float    g_fling_vx = 0, g_fling_vy = 0;
+static float    g_fling_rem_x = 0, g_fling_rem_y = 0;   // sub-pixel carry
+static uint32_t g_fling_last_ms = 0;
+static uint32_t g_drag_last_ms = 0;                     // when the last pan sample arrived
+
+// Camera moves that play out over a few frames instead of teleporting.
+#define WP_ANIM_NONE    0
+#define WP_ANIM_ZOOM    1
+#define WP_ANIM_CAMERA  2
+#define WP_ZOOM_MS      170      // one zoom step: quick, but not a jump
+#define WP_RECENTRE_MS  420      // a long move: long enough to read where it went
+#define WP_ROT_TAU_MS   150.0f   // heading-up follow: the wrist, not the magnetometer
+
+static uint8_t  g_anim_kind = WP_ANIM_NONE;
+static uint32_t g_anim_t0 = 0, g_anim_dur = 0;
+static double   g_anim_from_x = 0, g_anim_from_y = 0, g_anim_to_x = 0, g_anim_to_y = 0;
+static float    g_anim_from_scale = 1.0f, g_anim_to_scale = 1.0f;
+static int32_t  g_anim_ax = 0, g_anim_ay = 0;      // the pixel a zoom holds still
+static uint32_t g_cam_moved_ms = 0;               // drives the reticle fade
+static uint32_t g_feel_last_ms = 0;               // frame clock for the follow
+
+
+
+// -----------------------------------------------------------------------------
 //  Per-object styling: colour, width, dash and whether this layer fills.
 //
 //  Widths now come from the feature's road class and from how far the camera
@@ -3969,13 +5148,31 @@ static void mvt_style_object(const FMapObj &o, bool casing, WpStyle &s) {
             // automatic ones, but the casing pass still stays 2 px wider.
             const bool over = g_styles[o.layer].set;
             if (!over) {
-                int dz = (int)lroundf(g_cam_zoom_eff) - (int)g_meta.refzoom;
-                if (dz >  1) dz =  1;      // never grow past 2x
-                if (dz < -6) dz = -6;      // never shrink past 1/64
                 const uint8_t base = ROAD_WIDTH_BASE[o.sub < RC__COUNT ? o.sub : RC_OTHER];
-                int w = (dz >= 0) ? (base << dz)
-                                  : ((base + (1 << (-dz)) / 2) >> (-dz));
-                if (w < 1) w = 1;
+                // Width follows the FRACTIONAL camera zoom, not a rounded zoom
+                // level. Doubling in one step when the camera crossed a level
+                // was the most visible thing a pinch did: a street jumped from
+                // 2 px to 4 px halfway through the gesture. Interpolating
+                // between the two sizes costs one multiply and makes the whole
+                // zoom continuous - while still landing on exactly `base` at the
+                // native zoom and exactly 2x one level in, so the widths the
+                // tests pin are unchanged.
+                const float dz = g_cam_zoom_eff - (float)g_meta.refzoom;
+                int w;
+                if (dz >= 0.0f) {
+                    const float d    = (dz > 1.0f) ? 1.0f : dz;   // never past 2x
+                    const int   step = (int)d;
+                    const float frac = d - (float)step;
+                    const int   lo   = base << step;
+                    const int   hi   = base << (step + 1);
+                    w = lo + (int)((float)(hi - lo) * frac + 0.5f);
+                } else {
+                    const float d    = (dz < -6.0f) ? -6.0f : dz; // never past 1/64
+                    const int   step = (int)(-d);
+                    w = (base + (1 << step) / 2) >> step;
+                }
+                if (w < 1)   w = 1;
+                if (w > 255) w = 255;
                 s.width = (uint8_t)w;
                 if (o.sub == RC_MOTORWAY || o.sub == RC_TRUNK) {
                     s.colour = wp_mix565(t.roads, t.warn, 55);
@@ -4064,29 +5261,49 @@ static void draw_layers(FMapTile **ring, int nring) {
 }
 
 // POI dots, gated by zoom, by rank and by the layer toggle.
+//
+// Two things happen here beyond drawing a circle. Dots are offered in rank
+// order and each one claims a box in the same occupancy grid the labels use, so
+// a dense strip of shops is thinned to the handful that matter instead of
+// becoming a smear - and, because the labels claim their space afterwards, a
+// name can no longer land on top of the dot it belongs to. And a dot fades in
+// as its zoom band arrives rather than appearing at full strength, which is
+// what stops an opening map from shimmering as the detail switches on.
 static void render_pois() {
     if (!g_pois) return;
     const ThemePalette &t = TH();
     const uint16_t edge = wp_mix565(t.text, t.bg, 120);
-    for (uint32_t i = 0; i < g_poi_count; i++) {
-        const FMapPOI &p = g_pois[i];
-        if (!(g_layer_mask & (1u << p.layer))) continue;
-        if (g_cam_zoom_eff < (float)p.zmin) continue;
-        int sx, sy;
-        world_to_screen(p.x, p.y, &sx, &sy);
-        if (sx < -6 || sy < -6 || sx > LCD_WIDTH + 6 || sy > LCD_HEIGHT + 6) continue;
-        uint16_t c = t.shops;
-        switch (p.type) {
-            case 3: c = t.transit; break;
-            case 4: c = t.schools; break;
-            case 5: c = t.parks;   break;
-            default: c = t.shops;  break;
+    for (int pass = 0; pass < 2; pass++) {
+        const bool wanted_major = (pass == 0);
+        for (uint32_t i = 0; i < g_poi_count; i++) {
+            const FMapPOI &p = g_pois[i];
+            const bool major = (p.rank <= 1);
+            if (major != wanted_major) continue;     // cities first, then the rest
+            if (!(g_layer_mask & (1u << p.layer))) continue;
+            const float span = g_cam_zoom_eff - (float)p.zmin;
+            if (span < -0.5f) continue;              // its band has not arrived
+            const uint8_t mix = (span >= 0.5f)
+                              ? 255 : (uint8_t)((span + 0.5f) * 255.0f);
+            if (mix < 40) continue;
+            int sx, sy;
+            world_to_screen(p.x, p.y, &sx, &sy);
+            if (sx < -6 || sy < -6 || sx > LCD_WIDTH + 6 || sy > LCD_HEIGHT + 6)
+                continue;
+            uint16_t c = t.shops;
+            switch (p.type) {
+                case 3: c = t.transit; break;
+                case 4: c = t.schools; break;
+                case 5: c = t.parks;   break;
+                default: c = t.shops;  break;
+            }
+            const int r = major ? 5 : 3;
+            if (!lbl_claim(sx - r, sy - r, sx + r + 1, sy + r + 1)) continue;
+            gfx->fillCircle(sx, sy, r, wp_mix565(t.bg, c, mix));
+            gfx->drawCircle(sx, sy, r + 1, wp_mix565(t.bg, edge, mix));
         }
-        const int r = (p.rank <= 1) ? 5 : 3;
-        gfx->fillCircle(sx, sy, r, c);
-        gfx->drawCircle(sx, sy, r + 1, edge);
     }
 }
+
 
 // -----------------------------------------------------------------------------
 //  Label pass. Runs after the vector layers and after the dots, written
@@ -4124,27 +5341,34 @@ static bool lbl_claim(int x0, int y0, int x1, int y1) {
 }
 
 // Text with a 1px halo, so names stay readable over whatever they land on
-// without needing an opaque plate behind every one of them.
+// without needing an opaque plate behind every one of them. Four neighbours
+// rather than eight: at one pixel the diagonals add nothing a reader can see,
+// and this runs up to 26 times a frame - so halving the glyph runs halves what
+// the label pass costs on the QSPI bus.
 static void lbl_draw(int x, int y, const char *s, uint8_t size,
                      uint16_t fg, uint16_t halo) {
+    static const int8_t ox[4] = { -1,  1,  0,  0 };
+    static const int8_t oy[4] = {  0,  0, -1,  1 };
     gfx->setTextSize(size);
     gfx->setTextColor(halo);
-    for (int dy = -1; dy <= 1; dy++)
-        for (int dx = -1; dx <= 1; dx++) {
-            if (!dx && !dy) continue;
-            gfx->setCursor(x + dx, y + dy);
-            gfx->print(s);
-        }
+    for (int i = 0; i < 4; i++) {
+        gfx->setCursor(x + ox[i], y + oy[i]);
+        gfx->print(s);
+    }
     gfx->setTextColor(fg);
     gfx->setCursor(x, y);
     gfx->print(s);
 }
 
+
 static void render_labels() {
     if (!g_pois) return;
     const ThemePalette &t = TH();
     const uint16_t halo = (wp_luma565(t.text) > 128) ? 0x0000 : 0xFFFF;
-    memset(g_lbl_occ, 0, sizeof(g_lbl_occ));
+    // The occupancy grid is cleared once per frame in draw_map_frame(), before
+    // the POI dots claim their boxes -- so a name cannot be placed on top of
+    // the dot it belongs to.
+
 
     int placed = 0;
     // Rank 0 first (cities/towns) down to rank 4: everything below that is a dot
@@ -4181,10 +5405,11 @@ static void render_saved() {
         int sx, sy;
         world_to_screen(g_saved[i].x, g_saved[i].y, &sx, &sy);
         if (sx < 0 || sy < 0 || sx >= LCD_WIDTH || sy >= LCD_HEIGHT) continue;
-        gfx->fillCircle(sx, sy, 5, TH().saved);
-        gfx->drawCircle(sx, sy, 7, TH().text);
-        // pin stem
-        gfx->drawLine(sx, sy, sx, sy + 8, TH().saved);
+        // A saved place is a filled dot with a dark centre, so it stays readable
+        // on top of the bright green route and the POI dots it sits among.
+        gfx->fillCircle(sx, sy, 7, TH().saved);
+        gfx->fillCircle(sx, sy, 3, TH().bg);
+        gfx->drawCircle(sx, sy, 7, wp_mix565(TH().saved, TH().bg, 60));
     }
 }
 
@@ -4295,39 +5520,94 @@ static void render_sun_overlay() {
 //  The one tappable piece of chrome is the compass rose: tap it to lock the map
 //  to heading-up, tap again for north-up.
 // -----------------------------------------------------------------------------
-#define WP_TOP_STRIP_H   24
+// -----------------------------------------------------------------------------
+//  Map chrome
+//
+//  Three pieces, and each one only says something true. A status pill across the
+//  top: the map's name, what the scale is called ("city", "suburb"), and - only
+//  when tiles are actually failing - an amber health dot. The 9/9 tile counter
+//  that used to sit up here is on the DEV screen now; a shipped map should not
+//  show its reader a denominator. A nav banner under it, which exists only while
+//  a target is set, with the target's name, distance and direction and an X to
+//  clear it. And a centre reticle that is deliberately temporary: it is how you
+//  tell where the camera is *while you are moving it*, and it has faded out
+//  within a second of you stopping, because a crosshair parked over the middle
+//  of a map you are reading is just one more thing in the way.
+//
+//  The one tappable piece of chrome is the compass rose: tap it to lock the map
+//  to heading-up, tap again to settle back to north-up.
+// -----------------------------------------------------------------------------
+#define WP_TOP_STRIP_H   26
 #define WP_COMPASS_W     26
-#define WP_HINT_FULL_MS 5000      // hints stay at full strength this long
-#define WP_HINT_FADE_MS  900      // then fade out in three steps
+#define WP_NAV_H         24
+#define WP_HINT_FULL_MS 5200      // hints stay at full strength this long
+#define WP_HINT_FADE_MS  300      // then dim one step per this long ...
+#define WP_HINT_STEPS     6       // ... over six steps, so the fade is smooth
 
-static uint8_t  g_map_hint_alpha   = 0;      // 3 = full ... 0 = hidden
+static uint8_t  g_map_hint_alpha   = 0;      // WP_HINT_STEPS = full ... 0 = hidden
 static uint32_t g_map_hint_next_ms = 0;
+static bool     g_hints_seen       = false;  // taught once, remembered in NVS
 
 static void wp_map_hint_show(uint32_t now) {
-    g_map_hint_alpha   = 3;
+    g_map_hint_alpha   = WP_HINT_STEPS;
     g_map_hint_next_ms = now + WP_HINT_FULL_MS;
     g_need_map_redraw  = true;
+}
+
+// Remember that the gestures have been taught, so someone who knows them is not
+// shown the card on every map open (a tap still brings it back on demand). One
+// NVS write, on the first fade-out - not one per frame.
+static void wp_map_hint_mark_seen() {
+    if (g_hints_seen) return;
+    g_hints_seen = true;
+    Preferences p; p.begin("waypoint", false); p.putBool("hints", true); p.end();
 }
 
 static void wp_map_hint_tick(uint32_t now) {
     if (g_map_hint_alpha == 0 || now < g_map_hint_next_ms) return;
     g_map_hint_alpha--;
-    g_map_hint_next_ms = now + (WP_HINT_FADE_MS / 3);
+    g_map_hint_next_ms = now + WP_HINT_FADE_MS;
+    if (g_map_hint_alpha == 0) wp_map_hint_mark_seen();
     g_need_map_redraw  = true;
 }
 
 static void wp_compass_rect(int *x, int *y, int *w, int *h) {
     *w = WP_COMPASS_W;
-    *h = WP_TOP_STRIP_H - 2;
-    *x = LCD_WIDTH - WP_COMPASS_W - 8;
-    *y = 3;
+    *h = WP_TOP_STRIP_H - 4;
+    *x = LCD_WIDTH - WP_COMPASS_W - 7;
+    *y = 5;
 }
 
 static void wp_map_hint_rect(int *x, int *y, int *w, int *h) {
     // Sits just above the scale bar, and lines up with the bottom edge-swipe
     // zone: the thing that says "swipe up for tools" is the thing you swipe up
     // from.
-    *x = 6; *y = LCD_HEIGHT - 74; *w = LCD_WIDTH - 12; *h = 36;
+    *x = 6; *y = LCD_HEIGHT - 92; *w = LCD_WIDTH - 12; *h = 46;
+}
+
+// The nav banner: under the status pill, and only there while a target is set.
+static void wp_nav_rect(int *x, int *y, int *w, int *h) {
+    *x = 6; *y = WP_TOP_STRIP_H + 6; *w = LCD_WIDTH - 12; *h = WP_NAV_H;
+}
+
+// Distance to a world point, the way a person reads it.
+static void wp_fmt_distance_to(int32_t wx, int32_t wy, char *out, size_t cap) {
+    if (g_meta.units_per_metre <= 0) { snprintf(out, cap, "--"); return; }
+    const double dx = (double)wx - g_cam_x, dy = (double)wy - g_cam_y;
+    const float m = (float)(sqrt(dx * dx + dy * dy) /
+                            (double)g_meta.units_per_metre);
+    if (m < 1000.0f)       snprintf(out, cap, "%d m", (int)(m + 0.5f));
+    else if (m < 10000.0f) snprintf(out, cap, "%.1f km", m / 1000.0f);
+    else                   snprintf(out, cap, "%d km", (int)(m / 1000.0f + 0.5f));
+}
+
+// Which way to a world point, as a compass word (0 = north, 90 = east). The
+// bearing puck tells you which way to turn; this tells you which way to look.
+static const char *wp_bearing_to(int32_t wx, int32_t wy) {
+    const double dx = (double)wx - g_cam_x, dy = (double)wy - g_cam_y;
+    float b = atan2f((float)dx, (float)dy) * 180.0f / (float)M_PI;
+    if (b < 0) b += 360.0f;
+    return card_for(b);
 }
 
 // Returns true when a tap landed on chrome rather than on the map, so the map
@@ -4337,20 +5617,46 @@ static bool map_chrome_tap(int32_t x, int32_t y, uint32_t now) {
     wp_compass_rect(&cx, &cy, &cw, &ch);
     if (x >= cx && x < cx + cw && y >= cy && y < cy + ch) {
         g_rotate_with_heading = !g_rotate_with_heading;
-        if (!g_rotate_with_heading) g_map_rotation_deg = 0.0f;
+        // Heading-up hands the follow a moving target; north-up hands it zero,
+        // which the follow then eases back to instead of snapping - a map that
+        // slams back to north reads as a fault.
+        // Heading-up hands the follow a moving target; north-up hands it zero,
+        // which the follow then eases back to instead of snapping - a map that
+        // slams back to north reads as a fault. With no compass reading there is
+        // nothing to follow, so north is the answer in both cases.
+        g_heading_target = (g_rotate_with_heading && g_heading >= 0.0f)
+                         ? -g_heading : 0.0f;
+
         g_need_map_redraw = true;
         return true;
     }
     int hx, hy, hw, hh;
     wp_map_hint_rect(&hx, &hy, &hw, &hh);
     if (x >= hx && x < hx + hw && y >= hy && y < hy + hh) {
-        wp_map_hint_show(now);                 // the hint strip brings itself back
+        wp_map_hint_show(now);                 // the hint card brings itself back
         return true;
     }
-    return (y < WP_TOP_STRIP_H);               // the status strip swallows taps
+    if (g_has_nav_target) {
+        int nx, ny, nw, nh;
+        wp_nav_rect(&nx, &ny, &nw, &nh);
+        if (x >= nx && x < nx + nw && y >= ny && y < ny + nh) {
+            // The X at the far end clears the target; anywhere else on the strip
+            // is deliberately inert, so a glance at the distance cannot throw
+            // the navigation away.
+            if (x >= nx + nw - WP_NAV_H) {
+                g_has_nav_target = false;
+                g_nav_target_name = "";
+            }
+            g_need_map_redraw = true;
+            return true;
+        }
+    }
+    return (y < WP_TOP_STRIP_H + 4);           // the status pill swallows taps
 }
 
-// Scale bar (bottom-centre): shows a real-world reference distance
+// Scale bar (bottom-centre): a real-world reference distance, on a plate so it
+// stays readable over white sand, dark water and everything in between, with a
+// solid leading half so the bar reads as a length rather than a hairline.
 static void draw_scale_bar() {
     if (g_meta.units_per_metre <= 0 || g_cam_scale <= 0) return;
     const ThemePalette &t = TH();
@@ -4373,19 +5679,28 @@ static void draw_scale_bar() {
         break;
     }
     if (target_px > 200.0f) target_px = 200.0f;    // never wider than the screen
-    int bar_px = (int)target_px;
-    int cx = LCD_WIDTH/2;
-    int by = LCD_HEIGHT - 20;
-    gfx->drawLine(cx - bar_px/2, by, cx + bar_px/2, by, t.text);
-    gfx->drawLine(cx - bar_px/2, by-4, cx - bar_px/2, by+4, t.text);
-    gfx->drawLine(cx + bar_px/2, by-4, cx + bar_px/2, by+4, t.text);
+    const int bar_px = (int)target_px;
+    const int half   = bar_px / 2;
+    const int cx     = LCD_WIDTH / 2;
+    const int by     = LCD_HEIGHT - 22;
     char lbl[16];
     if (chosen < 1000) snprintf(lbl, sizeof(lbl), "%d m", (int)chosen);
     else               snprintf(lbl, sizeof(lbl), "%d km", (int)(chosen/1000));
-    int lw = (int)strlen(lbl) * 6;
+    const int lw = (int)strlen(lbl) * 6;
+
+    const int plate_w = bar_px + 24;
+    gfx->fillRoundRect(cx - plate_w/2, by - 16, plate_w, 28, 9, t.chrome_bg);
+    gfx->drawRoundRect(cx - plate_w/2, by - 16, plate_w, 28, 9, t.chrome_border);
+
     gfx->setTextColor(t.text); gfx->setTextSize(1);
-    gfx->setCursor(cx - lw/2, by - 14);
+    gfx->setCursor(cx - lw/2, by - 12);
     gfx->print(lbl);
+
+    const int bx = cx - bar_px/2;
+    gfx->fillRect(bx, by + 3, half, 4, t.text);          // solid half
+    gfx->drawRect(bx + half, by + 3, bar_px - half, 4, t.text);   // hollow half
+    gfx->drawFastVLine(bx, by + 2, 6, t.text);
+    gfx->drawFastVLine(bx + bar_px, by + 2, 6, t.text);
 }
 
 // Render beacons layer (from CSV) if enabled.
@@ -4404,37 +5719,127 @@ static void render_beacons() {
     }
 }
 
+// The centre reticle at one of four strengths (see map_feel_tick()).
+static void draw_reticle() {
+    if (g_reticle_step == 0) return;
+    const ThemePalette &t = TH();
+    const int cx = LCD_WIDTH / 2, cy = LCD_HEIGHT / 2;
+    const uint16_t col = (g_reticle_step >= 3) ? t.accent
+                       : (g_reticle_step == 2)  ? wp_mix565(t.accent, t.bg, 80)
+                                                : wp_mix565(t.accent, t.bg, 165);
+    // A dot, not a crosshair: the map already tells you where the camera is by
+    // what is under it, and a crosshair says "aim here" when it means "you are
+    // here". Three rings of decaying green make the dot glow without an alpha
+    // channel -- the AMOLED has none, so the halo is mixed toward the ground.
+    if (g_reticle_step >= 3) {
+        for (int i = 12; i >= 7; i -= 5) {
+            const uint16_t ring = wp_mix565(t.bg, t.accent, (uint8_t)(26 + (12 - i) * 10));
+            gfx->drawCircle(cx, cy, i, ring);
+        }
+    }
+    gfx->fillCircle(cx, cy, 5, col);
+    gfx->fillCircle(cx, cy, 2, wp_mix565(col, t.bg, 90));
+}
+
+// A target that is off the screen gets a chevron parked on the edge in its
+// direction, with the distance beside it: the bearing puck says which way to
+// turn, this says which way to look, and neither one replaces the other.
+static void draw_offscreen_target() {
+    if (!g_has_nav_target) return;
+    const int cx = LCD_WIDTH / 2, cy = LCD_HEIGHT / 2;
+    int sx, sy;
+    world_to_screen(g_nav_target_x, g_nav_target_y, &sx, &sy);
+    if (sx >= 20 && sx <= LCD_WIDTH - 20 && sy >= 20 && sy <= LCD_HEIGHT - 20) return;
+    const float dx = (float)(sx - cx), dy = (float)(sy - cy);
+    const float len = sqrtf(dx * dx + dy * dy);
+    if (len < 1.0f) return;
+    const float hw = (float)(cx - 18), hh = (float)(cy - 18);
+    const float kx = fabsf(dx) > 1.0f ? hw / fabsf(dx) : 1e9f;
+    const float ky = fabsf(dy) > 1.0f ? hh / fabsf(dy) : 1e9f;
+    float k = (kx < ky) ? kx : ky;
+    const int ex = cx + (int)(dx * k), ey = cy + (int)(dy * k);
+    const float ux = dx / len, uy = dy / len;         // unit vector, screen space
+    const float px = -uy, py = ux;                    // perpendicular
+    const uint16_t c = TH().warn;
+    // A triangle pointing the way you have to go.
+    gfx->fillTriangle(ex + (int)(ux * 9), ey + (int)(uy * 9),
+                      ex - (int)(ux * 5) + (int)(px * 7),
+                      ey - (int)(uy * 5) + (int)(py * 7),
+                      ex - (int)(ux * 5) - (int)(px * 7),
+                      ey - (int)(uy * 5) - (int)(py * 7), c);
+    char db[16];
+    wp_fmt_distance_to(g_nav_target_x, g_nav_target_y, db, sizeof(db));
+    int tx = ex - (int)(6 * strlen(db));
+    int ty = ey + (int)(uy * 16) - 8;
+    if (tx < 2) tx = 2;
+    if (ty < WP_TOP_STRIP_H + 4) ty = WP_TOP_STRIP_H + 4;
+    if (ty > LCD_HEIGHT - 20) ty = LCD_HEIGHT - 20;
+    gfx->setTextColor(c); gfx->setTextSize(1);
+    gfx->setCursor(tx, ty);
+    gfx->print(db);
+}
+
+// The nav banner: target name, distance, direction, and an X that clears it.
+static void draw_nav_banner() {
+    if (!g_has_nav_target) return;
+    const ThemePalette &t = TH();
+    int nx, ny, nw, nh;
+    wp_nav_rect(&nx, &ny, &nw, &nh);
+    gfx->fillRoundRect(nx, ny, nw, nh, nh / 2, t.chrome_bg);
+    gfx->drawRoundRect(nx, ny, nw, nh, nh / 2, t.accent);
+
+    char dist[16];
+    wp_fmt_distance_to(g_nav_target_x, g_nav_target_y, dist, sizeof(dist));
+    const char *dir = wp_bearing_to(g_nav_target_x, g_nav_target_y);
+    char right[32];
+    snprintf(right, sizeof(right), "%s %s", dir, dist);
+    const int rw = (int)strlen(right) * 6;
+    const int rx = nx + nw - WP_NAV_H - 8 - rw;
+
+    String nm = g_nav_target_name.length() ? g_nav_target_name : String("target");
+    const int max_chars = (rx - (nx + 10)) / 6;
+    if (max_chars > 2 && (int)nm.length() > max_chars)
+        nm = nm.substring(0, max_chars - 1) + "~";
+
+    const int ty = ny + (nh - 8) / 2;
+    gfx->setTextColor(t.warn); gfx->setTextSize(1);
+    gfx->setCursor(nx + 10, ty);
+    gfx->print(nm);
+    gfx->setTextColor(t.text);
+    gfx->setCursor(rx, ty);
+    gfx->print(right);
+
+    // The X, drawn rather than typeset: the panel font has no glyph for a
+    // cross, and two lines are cheaper than one anyway.
+    const int kx = nx + nw - WP_NAV_H / 2 - 4, ky = ny + nh / 2;
+    gfx->drawLine(kx - 4, ky - 4, kx + 4, ky + 4, t.text_dim);
+    gfx->drawLine(kx - 4, ky + 4, kx + 4, ky - 4, t.text_dim);
+}
+
 static void draw_overlay_chrome() {
     const ThemePalette &t = TH();
     char b[80];
 
-    // ---- status strip ----------------------------------------------------
-    gfx->fillRoundRect(4, 2, LCD_WIDTH - 8, WP_TOP_STRIP_H, 6, t.chrome_bg);
-    gfx->drawRoundRect(4, 2, LCD_WIDTH - 8, WP_TOP_STRIP_H, 6, t.chrome_border);
-    const int ty = 2 + (WP_TOP_STRIP_H - 8) / 2;
+    // ---- status pill ------------------------------------------------------
+    gfx->fillRoundRect(4, 3, LCD_WIDTH - 8, WP_TOP_STRIP_H, WP_TOP_STRIP_H / 2,
+                       t.chrome_bg);
+    gfx->drawRoundRect(4, 3, LCD_WIDTH - 8, WP_TOP_STRIP_H, WP_TOP_STRIP_H / 2,
+                       t.chrome_border);
+    const int ty = 3 + (WP_TOP_STRIP_H - 8) / 2;
 
     String name = g_meta.title.length() ? g_meta.title : String("map");
-    if (name.length() > 14) name = name.substring(0, 13) + "~";
+    if (name.length() > 13) name = name.substring(0, 12) + "~";
     gfx->setTextColor(t.accent); gfx->setTextSize(1);
     gfx->setCursor(12, ty);
     gfx->print(name);
 
-    // Effective (fractional) zoom: the real scale signal, continuous and still
-    // correct when the tile on screen is an overzoomed parent.
-    snprintf(b, sizeof(b), "z%.1f", (double)g_cam_zoom_eff);
-    int zx = 12 + (int)name.length() * 6 + 12;
-    gfx->setTextColor(t.text);
-    gfx->setCursor(zx, ty);
-    gfx->print(b);
-
-    // Tile health: amber the moment any tile in the visible ring fails to
-    // decode, which is the earliest sign that the tile set and the camera
-    // disagree - a missing zoom level, a partial copy, an unknown schema.
-    const bool tiles_ok = (g_hud_tiles_empty == 0 && g_hud_tiles_ok > 0);
-    snprintf(b, sizeof(b), "%u/%u", (unsigned)g_hud_tiles_ok,
-             (unsigned)(g_hud_tiles_ok + g_hud_tiles_empty));
-    gfx->setTextColor(tiles_ok ? t.text_dim : t.warn);
-    gfx->setCursor(zx + 46, ty);
+    // The scale, named. "z12.4" is a number for whoever wrote the renderer; the
+    // word is what tells a reader how close they are, so the word comes first
+    // and the number is there for anyone who wants it.
+    snprintf(b, sizeof(b), "%s %.1f", wp_zoom_band(g_cam_zoom_eff),
+             (double)g_cam_zoom_eff);
+    gfx->setTextColor(t.text_dim);
+    gfx->setCursor(12 + (int)name.length() * 6 + 10, ty);
     gfx->print(b);
 
     // ---- compass rose: tap to lock heading-up ----------------------------
@@ -4445,39 +5850,51 @@ static void draw_overlay_chrome() {
         const int r   = (ch / 2) - 1;
         const uint16_t col = g_rotate_with_heading ? t.warn : t.accent;
         gfx->drawCircle(ccx, ccy, r, t.chrome_border);
-        const float rr = g_rotate_with_heading
-                       ? (g_map_rotation_deg * (float)M_PI / 180.0f) : 0.0f;
-        const int nx = ccx + (int)(-sinf(rr) * (float)(r - 3));
-        const int ny = ccy - (int)( cosf(rr) * (float)(r - 3));
-        gfx->fillTriangle(ccx - 3, ccy + 1, ccx + 3, ccy + 1, nx, ny, col);
+        // The needle points at where north IS on the screen, which is
+        // g_map_rotation_deg in both modes: up while north-up, and swung round
+        // by the follow while heading-up. (It used to be pinned up whenever
+        // heading-up was on, which quietly claimed north was straight ahead.)
+        const float rr = g_map_rotation_deg * (float)M_PI / 180.0f;
+        const int nx2 = ccx - (int)(-sinf(rr) * (float)(r - 3));
+        const int ny2 = ccy - (int)( cosf(rr) * (float)(r - 3));
+        gfx->fillTriangle(ccx - 3, ccy + 1, ccx + 3, ccy + 1, nx2, ny2, col);
     }
 
-    // ---- crosshair: the point the camera is centred on -------------------
-    {
-        const int ccx = LCD_WIDTH / 2, ccy = LCD_HEIGHT / 2;
-        gfx->drawLine(ccx - 10, ccy, ccx + 10, ccy, t.accent);
-        gfx->drawLine(ccx, ccy - 10, ccx, ccy + 10, t.accent);
-        gfx->drawCircle(ccx, ccy, 4, t.accent);
+    // Tile health: a dot only when the visible ring is actually broken, which
+    // is the earliest sign the tile set and the camera disagree - a missing
+    // zoom level, a partial copy, an unknown schema.
+    if (g_hud_tiles_empty > 0 || g_hud_tiles_ok == 0) {
+        int cx, cy, cw, ch;
+        wp_compass_rect(&cx, &cy, &cw, &ch);
+        gfx->fillCircle(cx - 10, 3 + WP_TOP_STRIP_H / 2, 3, t.warn);
     }
 
+    draw_nav_banner();
+    draw_reticle();
+    draw_offscreen_target();
     draw_scale_bar();
 
     // ---- gesture hints, fading out so the map is not permanently covered --
     if (g_map_hint_alpha) {
         int hx, hy, hw, hh;
         wp_map_hint_rect(&hx, &hy, &hw, &hh);
-        const uint16_t hcol = (g_map_hint_alpha >= 3) ? t.text
-                            : (g_map_hint_alpha == 2)  ? t.text_dim
-                                                       : t.chrome_border;
-        gfx->fillRoundRect(hx, hy, hw, hh, 6, t.chrome_bg);
-        gfx->drawRoundRect(hx, hy, hw, hh, 6, t.chrome_border);
+        // Six steps rather than three: the difference between a card that fades
+        // and a card that visibly blinks out.
+        const uint16_t hcol = (g_map_hint_alpha >= 5) ? t.text
+                            : (g_map_hint_alpha >= 3) ? t.text_dim
+                                                      : t.chrome_border;
+        gfx->fillRoundRect(hx, hy, hw, hh, 16, t.chrome_bg);
+        gfx->drawRoundRect(hx, hy, hw, hh, 16, t.chrome_border);
         gfx->setTextColor(hcol); gfx->setTextSize(1);
-        gfx->setCursor(hx + 8, hy + 5);
-        gfx->print("swipe ^ tools       swipe v library");
-        gfx->setCursor(hx + 8, hy + 19);
-        gfx->print("tap poi   hold tools   2f tap: zoom out");
+        gfx->setCursor(hx + 14, hy + 7);
+        gfx->print("drag   pan      pinch  zoom");
+        gfx->setCursor(hx + 10, hy + 21);
+        gfx->print("tap    poi      hold   tools");
+        gfx->setCursor(hx + 10, hy + 35);
+        gfx->print("swipe from an edge: tools / library");
     }
 }
+
 
 static void draw_map_frame() {
     if (!g_need_map_redraw) return;
@@ -4535,10 +5952,15 @@ static void draw_map_frame() {
     // Warm the next ring out so panning stays smooth.
     prefetch_ring(z, ctx, cty);
 
+    // One occupancy grid per frame, cleared here rather than inside the label
+    // pass: the POI dots claim their boxes first, so the names drawn after them
+    // cannot land on top of the dots they belong to.
+    memset(g_lbl_occ, 0, sizeof(g_lbl_occ));
     render_saved();
     render_beacons();
     render_pois();
     render_labels();
+
 
     // Nav target crosshair (bright, larger than a normal saved pin)
     if (g_has_nav_target) {
@@ -4587,11 +6009,23 @@ static lv_obj_t *lbl_poi_title=nullptr, *lbl_poi_body=nullptr;
 // A blank LVGL screen used to "hide" LVGL when we are in raw-gfx modes
 static lv_obj_t *scr_blank = nullptr;
 
-#define COL_BG 0x000000
-#define COL_TXT 0xFFFFFF
-#define COL_MUTE 0x666666
-#define COL_ACCENT 0x00E5FF
-#define COL_GOLD 0xFFB300
+// LVGL speaks 0xRRGGBB; this file otherwise speaks RGB565. One conversion means
+// an LVGL screen cannot quietly keep a colour from the theme before last -- which
+// is how the menus stayed cyan and #141414 through four theme changes while the
+// map around them turned green.
+static inline uint32_t wp_hex24(uint16_t c) {
+    const uint32_t r = (uint32_t)(((c >> 11) & 0x1F) * 255 / 31);
+    const uint32_t g = (uint32_t)(((c >> 5)  & 0x3F) * 255 / 63);
+    const uint32_t b = (uint32_t)(( c        & 0x1F) * 255 / 31);
+    return (r << 16) | (g << 8) | b;
+}
+#define COL_BG     wp_hex24(TH().bg)
+#define COL_TXT    wp_hex24(TH().text)
+#define COL_MUTE   wp_hex24(TH().text_dim)
+#define COL_ACCENT wp_hex24(TH().accent)
+#define COL_GOLD   wp_hex24(TH().warn)
+#define COL_CARD   wp_hex24(TH().chrome_bg)
+#define COL_LINE   wp_hex24(TH().chrome_border)
 
 static void enter_mode(AppMode m);
 
@@ -4599,7 +6033,7 @@ static void add_back_pill(lv_obj_t *p, const char *label, lv_event_cb_t cb) {
     lv_obj_t *back = lv_btn_create(p);
     lv_obj_set_size(back, 220, 42);
     lv_obj_align(back, LV_ALIGN_BOTTOM_MID, 0, -16);
-    lv_obj_set_style_bg_color(back, lv_color_hex(0x141414), 0);
+    lv_obj_set_style_bg_color(back, lv_color_hex(COL_CARD), 0);
     lv_obj_set_style_border_color(back, lv_color_hex(COL_ACCENT), 0);
     lv_obj_set_style_border_width(back, 1, 0);
     lv_obj_set_style_radius(back, 22, 0);
@@ -4683,8 +6117,8 @@ static void build_level() {
     lv_obj_t *box = lv_obj_create(scr_level);
     lv_obj_set_size(box, 280, 280);
     lv_obj_align(box, LV_ALIGN_CENTER, 0, -20);
-    lv_obj_set_style_bg_color(box, lv_color_hex(0x080808), 0);
-    lv_obj_set_style_border_color(box, lv_color_hex(0x222222), 0);
+    lv_obj_set_style_bg_color(box, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_border_color(box, lv_color_hex(COL_LINE), 0);
     lv_obj_set_style_border_width(box, 1, 0);
     lv_obj_set_style_radius(box, 140, 0);
 
@@ -4817,7 +6251,7 @@ static void build_layers() {
     for (int i=0; i<LAY__COUNT; i++) {
         lv_obj_t *sw_row = lv_obj_create(list);
         lv_obj_set_size(sw_row, lv_pct(100), 44);
-        lv_obj_set_style_bg_color(sw_row, lv_color_hex(0x141414), 0);
+        lv_obj_set_style_bg_color(sw_row, lv_color_hex(COL_CARD), 0);
         lv_obj_set_style_border_width(sw_row, 0, 0);
         lv_obj_set_style_radius(sw_row, 8, 0);
         lv_obj_set_flex_flow(sw_row, LV_FLEX_FLOW_ROW);
@@ -4845,11 +6279,11 @@ static void set_theme(uint8_t id) {
     Preferences p; p.begin("waypoint", false); p.putUChar("theme", id); p.end();
     g_lib_redraw = true; g_need_map_redraw = true;
 }
-static lv_obj_t *g_theme_rows[4] = {nullptr,nullptr,nullptr,nullptr};
-static lv_obj_t *g_theme_ticks[4] = {nullptr,nullptr,nullptr,nullptr};
+static lv_obj_t *g_theme_rows[THEME_COUNT] = {nullptr};
+static lv_obj_t *g_theme_ticks[THEME_COUNT] = {nullptr};
 
 static void themes_refresh() {
-    for (int i=0; i<4; i++) {
+    for (int i=0; i<THEME_COUNT; i++) {
         if (g_theme_ticks[i])
             lv_label_set_text(g_theme_ticks[i], (i == g_theme_id) ? LV_SYMBOL_OK : "");
         if (g_theme_rows[i]) {
@@ -4889,7 +6323,7 @@ static void build_themes() {
                           LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(list, 12, 0);
 
-    for (int i=0; i<4; i++) {
+    for (int i=0; i<THEME_COUNT; i++) {
         lv_obj_t *b = lv_btn_create(list);
         lv_obj_add_style(b, &wp_style_menu_card, 0);
         lv_obj_add_style(b, &wp_style_pressed, LV_STATE_PRESSED);
@@ -4941,7 +6375,7 @@ static void build_savedlg() {
     lv_obj_align(save_ta, LV_ALIGN_TOP_MID, 0, 56);
     lv_textarea_set_one_line(save_ta, true);
     lv_textarea_set_placeholder_text(save_ta, "Location name");
-    lv_obj_set_style_bg_color(save_ta, lv_color_hex(0x141414), 0);
+    lv_obj_set_style_bg_color(save_ta, lv_color_hex(COL_CARD), 0);
     lv_obj_set_style_text_color(save_ta, lv_color_hex(COL_TXT), 0);
 
     lv_obj_t *ok = lv_btn_create(scr_savedlg);
@@ -5006,13 +6440,13 @@ static void build_search() {
     lv_obj_align(search_ta, LV_ALIGN_TOP_MID, 0, 52);
     lv_textarea_set_one_line(search_ta, true);
     lv_textarea_set_placeholder_text(search_ta, "Type to search");
-    lv_obj_set_style_bg_color(search_ta, lv_color_hex(0x141414), 0);
+    lv_obj_set_style_bg_color(search_ta, lv_color_hex(COL_CARD), 0);
     lv_obj_set_style_text_color(search_ta, lv_color_hex(COL_TXT), 0);
 
     search_results = lv_list_create(scr_search);
     lv_obj_set_size(search_results, 380, 200);
     lv_obj_align(search_results, LV_ALIGN_TOP_MID, 0, 104);
-    lv_obj_set_style_bg_color(search_results, lv_color_hex(0x0a0a0a), 0);
+    lv_obj_set_style_bg_color(search_results, lv_color_hex(COL_BG), 0);
 
     lv_obj_add_event_cb(search_ta, [](lv_event_t *e){
         (void)e;
@@ -5029,7 +6463,7 @@ static void build_search() {
             if (nmlow.indexOf(q) >= 0) {
                 lv_obj_t *it = lv_list_add_btn(search_results, NULL, nm.c_str());
                 lv_obj_set_style_text_color(it, lv_color_hex(COL_TXT), 0);
-                lv_obj_set_style_bg_color(it, lv_color_hex(0x141414), 0);
+                lv_obj_set_style_bg_color(it, lv_color_hex(COL_CARD), 0);
                 uint32_t *pi = (uint32_t*)lv_mem_alloc(sizeof(uint32_t));
                 *pi = i;
                 lv_obj_add_event_cb(it, [](lv_event_t *ev){
@@ -5059,7 +6493,7 @@ static void build_search() {
             if (!g_pois[i].name) continue;
             lv_obj_t *it = lv_list_add_btn(search_results, NULL, g_pois[i].name);
             lv_obj_set_style_text_color(it, lv_color_hex(COL_TXT), 0);
-            lv_obj_set_style_bg_color(it, lv_color_hex(0x141414), 0);
+            lv_obj_set_style_bg_color(it, lv_color_hex(COL_CARD), 0);
             uint32_t *pi = (uint32_t*)lv_mem_alloc(sizeof(uint32_t));
             *pi = i;
             lv_obj_add_event_cb(it, [](lv_event_t *ev){
@@ -5079,7 +6513,7 @@ static void build_search() {
     lv_obj_t *back = lv_btn_create(scr_search);
     lv_obj_set_size(back, 60, 32);
     lv_obj_align(back, LV_ALIGN_TOP_RIGHT, -10, 10);
-    lv_obj_set_style_bg_color(back, lv_color_hex(0x141414), 0);
+    lv_obj_set_style_bg_color(back, lv_color_hex(COL_CARD), 0);
     lv_obj_t *bl = lv_label_create(back); lv_label_set_text(bl, LV_SYMBOL_LEFT); lv_obj_center(bl);
     lv_obj_add_event_cb(back, cb_back_to_map, LV_EVENT_CLICKED, NULL);
 }
@@ -5088,11 +6522,11 @@ static void build_search() {
 static void build_dev() {
     if (scr_dev) return;
     scr_dev = lv_obj_create(NULL);
-    lv_obj_set_style_bg_color(scr_dev, lv_color_hex(0x0a0a0a), 0);
+    lv_obj_set_style_bg_color(scr_dev, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_bg_opa(scr_dev, LV_OPA_COVER, 0);
     lv_obj_t *t = lv_label_create(scr_dev);
     lv_label_set_text(t, "DEV / DIAGNOSTICS");
-    lv_obj_set_style_text_color(t, lv_color_hex(0x00E5FF),0);
+    lv_obj_set_style_text_color(t, lv_color_hex(COL_ACCENT),0);
     lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
     lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 20);
     lbl_dev = lv_label_create(scr_dev);
@@ -5119,11 +6553,14 @@ static void dev_refresh() {
     uint32_t heap = ESP.getFreeHeap();
     uint32_t psram = ESP.getFreePsram();
     int bat = g_has_pmu ? g_pmu.getBatteryPercent() : -1;
-    char buf[640];
+    char buf[1024];
     snprintf(buf, sizeof(buf),
         "Map:   %s\n"
-        "Zoom:  %u (%u zooms)\n"
+        "Zoom:  %u of %u levels\n"
+        "Scale: z%.1f  (%s)\n"
+        "Ring:  %u ok, %u empty\n"
         "Cam:   %.0f, %.0f  scl %.4f\n"
+        "Rot:   %.1f deg%s\n"
         "Tiles: %u indexed, %d cached\n"
         "Cache: ok%d empty%d gz%d err%d\n"
         "TileMem: %lu KB\n"
@@ -5137,7 +6574,11 @@ static void dev_refresh() {
         "Hdg:   %.1f   Mark: %.1f",
         g_meta.title.c_str(),
         (unsigned)g_cam_zoom, (unsigned)g_zoom_count,
+        (double)g_cam_zoom_eff, wp_zoom_band(g_cam_zoom_eff),
+        (unsigned)g_hud_tiles_ok, (unsigned)g_hud_tiles_empty,
         g_cam_x, g_cam_y, g_cam_scale,
+        (double)g_map_rotation_deg,
+        g_rotate_with_heading ? "  heading-up" : "",
         (unsigned)g_tile_count, cached,
         ok, empty, gz, err,
         (unsigned long)(g_cache_bytes/1024),
@@ -5148,7 +6589,8 @@ static void dev_refresh() {
         (unsigned long)(psram/1024),
         bat,
         g_has_imu?"ok":"--", g_has_mag?"ok":"--",
-        g_heading, g_marked_heading);
+        (double)g_heading, (double)g_marked_heading);
+
     lv_label_set_text(lbl_dev, buf);
 }
 
@@ -5162,11 +6604,51 @@ static void cb_tools_breadcrumb(lv_event_t *e) {
     breadcrumb_add((int32_t)g_cam_x, (int32_t)g_cam_y);
     enter_mode(MODE_MAP);
 }
-static void cb_tools_clear_nav(lv_event_t *e) {
-    (void)e;
-    g_has_nav_target = false;
-    g_need_map_redraw = true;
-    enter_mode(MODE_MAP);
+
+// One tile of the grid. A tile either goes to a mode or runs an action, and both
+// are described the same way so the rows below stay a table instead of a pile of
+// near-identical loops.
+struct ToolTile {
+    const char *icon;
+    const char *name;
+    AppMode target;
+    lv_event_cb_t cb;
+};
+
+// A captioned row of tiles. Eleven identical squares is a wall; four rows with a
+// word in front of each is a menu you can read at a glance.
+static void tools_add_row(lv_obj_t *parent, const char *cap,
+                          const ToolTile *tiles, size_t count) {
+    if (cap) {
+        lv_obj_t *c = lv_label_create(parent);
+        lv_label_set_text(c, cap);
+        lv_obj_add_style(c, &wp_style_label_dim, 0);
+        lv_obj_set_width(c, LCD_WIDTH - 32);
+        lv_obj_set_style_text_align(c, LV_TEXT_ALIGN_LEFT, 0);
+    }
+    lv_obj_t *row = lv_obj_create(parent);
+    lv_obj_set_size(row, LCD_WIDTH - 24, 66);
+    lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_SPACE_EVENLY,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    for (size_t i = 0; i < count; i++) {
+        MenuItem mi;
+        if (tiles[i].cb) {
+            MenuItem act = { tiles[i].icon, tiles[i].name, tiles[i].cb, nullptr };
+            mi = act;
+        } else {
+            AppMode *tgt = (AppMode*)lv_mem_alloc(sizeof(AppMode));
+            *tgt = tiles[i].target;
+            MenuItem go = { tiles[i].icon, tiles[i].name, cb_tools_enter_mode, tgt };
+            mi = go;
+        }
+        lv_obj_t *b = wp_create_menu_item(row, mi);
+        lv_obj_set_size(b, 92, 60);
+    }
 }
 
 static void build_tools() {
@@ -5180,46 +6662,58 @@ static void build_tools() {
     lv_obj_t *t = lv_label_create(scr_tools);
     lv_label_set_text(t, "TOOLS");
     lv_obj_add_style(t, &wp_style_label_dim, 0);
-    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 18);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 14);
 
-    // Flex-wrap grid container (Track B: no more hand-placed x/y positions).
-    lv_obj_t *grid = lv_obj_create(scr_tools);
-    lv_obj_set_size(grid, LCD_WIDTH - 24, LCD_HEIGHT - 120);
-    lv_obj_align(grid, LV_ALIGN_TOP_MID, 0, 46);
-    lv_obj_set_style_bg_opa(grid, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(grid, 0, 0);
-    lv_obj_set_style_pad_all(grid, 4, 0);
-    lv_obj_set_flex_flow(grid, LV_FLEX_FLOW_ROW_WRAP);
-    lv_obj_set_flex_align(grid, LV_FLEX_ALIGN_SPACE_EVENLY,
-                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    // One column of captioned rows, so the groups read top to bottom.
+    lv_obj_t *col = lv_obj_create(scr_tools);
+    lv_obj_set_size(col, LCD_WIDTH - 8, LCD_HEIGHT - 126);
+    lv_obj_align(col, LV_ALIGN_TOP_MID, 0, 40);
+    lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(col, 0, 0);
+    lv_obj_set_style_pad_all(col, 4, 0);
+    lv_obj_set_style_pad_row(col, 4, 0);
+    lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
 
-    struct ToolDef { const char *icon; const char *name; AppMode target; };
-    static const ToolDef defs[] = {
-        { LV_SYMBOL_SAVE,      "Save",      MODE_SAVEDIALOG },
-        { LV_SYMBOL_LIST,      "Layers",    MODE_LAYERS },
-        { LV_SYMBOL_IMAGE,     "Themes",    MODE_THEMES },
-        { LV_SYMBOL_GPS,       "Compass",   MODE_COMPASS },
-        { LV_SYMBOL_MINUS,     "Level",     MODE_LEVEL },
-        { LV_SYMBOL_CHARGE,    "Sun",       MODE_SUN },
-        { LV_SYMBOL_LOOP,      "Bearings",  MODE_BEARINGS },
-        { LV_SYMBOL_DIRECTORY, "Search",    MODE_SEARCH },
-        { LV_SYMBOL_UP,        "Block Nav", MODE_BLOCKNAV },
-        { LV_SYMBOL_EYE_OPEN,  "Explore",   MODE_EXPLORE },
-        { LV_SYMBOL_SETTINGS,  "Developer", MODE_DEV },
+    // What the map is: how it is painted, and where you left it.
+    static const ToolTile map_tiles[] = {
+        { LV_SYMBOL_SAVE,  "Save",   MODE_SAVEDIALOG, nullptr },
+        { LV_SYMBOL_LIST,  "Layers", MODE_LAYERS,     nullptr },
+        { LV_SYMBOL_IMAGE, "Themes", MODE_THEMES,     nullptr },
     };
-    for (size_t i = 0; i < sizeof(defs)/sizeof(defs[0]); i++) {
-        AppMode *tgt = (AppMode*)lv_mem_alloc(sizeof(AppMode));
-        *tgt = defs[i].target;
-        MenuItem mi = { defs[i].icon, defs[i].name, cb_tools_enter_mode, tgt };
-        wp_create_menu_item(grid, mi);
-    }
+    // Where you are going: the instruments for a direction and a distance.
+    static const ToolTile go_tiles[] = {
+        { LV_SYMBOL_GPS,       "Compass",   MODE_COMPASS,  nullptr },
+        { LV_SYMBOL_LOOP,      "Bearings",  MODE_BEARINGS, nullptr },
+        { LV_SYMBOL_UP,        "Block Nav", MODE_BLOCKNAV, nullptr },
+        { LV_SYMBOL_DIRECTORY, "Search",    MODE_SEARCH,   nullptr },
+    };
+    // What is out there: the ground under your feet and what is on it.
+    static const ToolTile ground_tiles[] = {
+        { LV_SYMBOL_CHARGE,   "Sun",        MODE_SUN,     nullptr },
+        { LV_SYMBOL_MINUS,    "Level",      MODE_LEVEL,   nullptr },
+        { LV_SYMBOL_EYE_OPEN, "Explore",    MODE_EXPLORE, nullptr },
+        { LV_SYMBOL_DOWNLOAD, "Breadcrumb", MODE_MAP,     cb_tools_breadcrumb },
+    };
+    // And the one screen that is about the app rather than the map.
+    static const ToolTile system_tiles[] = {
+        { LV_SYMBOL_SETTINGS, "Developer", MODE_DEV, nullptr },
+    };
 
-    // Quick actions -- same tile builder, gold-tinted via warn accent.
-    MenuItem drop  = { LV_SYMBOL_GPS,  "Breadcrumb", cb_tools_breadcrumb, nullptr };
-    MenuItem clear = { LV_SYMBOL_CLOSE, "Clear Nav", cb_tools_clear_nav, nullptr };
-    wp_create_menu_item(grid, drop);
-    wp_create_menu_item(grid, clear);
+    tools_add_row(col, "THE MAP", map_tiles,
+                  sizeof(map_tiles) / sizeof(map_tiles[0]));
+    tools_add_row(col, "FIND THE WAY", go_tiles,
+                  sizeof(go_tiles) / sizeof(go_tiles[0]));
+    tools_add_row(col, "THE GROUND", ground_tiles,
+                  sizeof(ground_tiles) / sizeof(ground_tiles[0]));
+    tools_add_row(col, "SYSTEM", system_tiles,
+                  sizeof(system_tiles) / sizeof(system_tiles[0]));
 
+    // Clearing a target belongs to the target: the nav banner carries its own X,
+    // so the tool that duplicated it is gone rather than sitting here confusingly
+    // next to the banner that already does it.
     add_back_pill(scr_tools, "Back to Map", cb_back_to_map);
 }
 
@@ -5268,7 +6762,7 @@ static void build_blocknav() {
         int bx = cx + pads[i].dx * (sz + 10) - sz/2;
         int by = cy - pads[i].dy * (sz + 10) - sz/2;
         lv_obj_set_pos(b, bx, by);
-        lv_obj_set_style_bg_color(b, lv_color_hex(0x141414), 0);
+        lv_obj_set_style_bg_color(b, lv_color_hex(COL_CARD), 0);
         lv_obj_set_style_border_color(b, lv_color_hex(COL_ACCENT), 0);
         lv_obj_set_style_border_width(b, 1, 0);
         lv_obj_set_style_radius(b, 14, 0);
@@ -5288,7 +6782,7 @@ static void build_blocknav() {
     lv_obj_t *sb = lv_btn_create(scr_blocknav);
     lv_obj_set_size(sb, 120, 40);
     lv_obj_align(sb, LV_ALIGN_TOP_MID, 0, 60);
-    lv_obj_set_style_bg_color(sb, lv_color_hex(0x141414), 0);
+    lv_obj_set_style_bg_color(sb, lv_color_hex(COL_CARD), 0);
     lv_obj_set_style_border_color(sb, lv_color_hex(COL_GOLD), 0);
     lv_obj_set_style_border_width(sb, 1, 0);
     lv_obj_set_style_radius(sb, 20, 0);
@@ -5378,7 +6872,7 @@ static void build_explore() {
     lv_obj_t *next = lv_btn_create(scr_explore);
     lv_obj_set_size(next, 140, 42);
     lv_obj_align(next, LV_ALIGN_BOTTOM_MID, -80, -74);
-    lv_obj_set_style_bg_color(next, lv_color_hex(0x141414), 0);
+    lv_obj_set_style_bg_color(next, lv_color_hex(COL_CARD), 0);
     lv_obj_set_style_border_color(next, lv_color_hex(COL_ACCENT), 0);
     lv_obj_set_style_border_width(next, 1, 0);
     lv_obj_set_style_radius(next, 20, 0);
@@ -5420,12 +6914,19 @@ static void build_poicard() {
     lv_label_set_text(lbl_poi_title, "");
     lv_obj_set_style_text_color(lbl_poi_title, lv_color_hex(COL_ACCENT),0);
     lv_obj_set_style_text_font(lbl_poi_title, &lv_font_montserrat_22, 0);
-    lv_obj_align(lbl_poi_title, LV_ALIGN_TOP_MID, 0, 40);
+    // A long place name wraps onto a second line instead of being clipped at
+    // the edge of the card, and the body sits clear of both lines.
+    lv_label_set_long_mode(lbl_poi_title, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl_poi_title, 360);
+    lv_obj_set_style_text_align(lbl_poi_title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lbl_poi_title, LV_ALIGN_TOP_MID, 0, 36);
     lbl_poi_body = lv_label_create(scr_poicard);
     lv_label_set_text(lbl_poi_body, "");
     lv_obj_set_style_text_color(lbl_poi_body, lv_color_hex(COL_TXT), 0);
     lv_obj_set_style_text_font(lbl_poi_body, &lv_font_montserrat_14, 0);
-    lv_obj_align(lbl_poi_body, LV_ALIGN_TOP_MID, 0, 90);
+    lv_obj_set_style_text_align(lbl_poi_body, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lbl_poi_body, LV_ALIGN_TOP_MID, 0, 104);
+
     lv_label_set_long_mode(lbl_poi_body, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(lbl_poi_body, 360);
 
@@ -5454,7 +6955,7 @@ static void build_poicard() {
     lv_obj_t *sv = lv_btn_create(scr_poicard);
     lv_obj_set_size(sv, 160, 44);
     lv_obj_align(sv, LV_ALIGN_BOTTOM_MID, 90, -74);
-    lv_obj_set_style_bg_color(sv, lv_color_hex(0x141414), 0);
+    lv_obj_set_style_bg_color(sv, lv_color_hex(COL_CARD), 0);
     lv_obj_set_style_border_color(sv, lv_color_hex(COL_ACCENT), 0);
     lv_obj_set_style_border_width(sv, 1, 0);
     lv_obj_set_style_radius(sv, 22, 0);
@@ -5480,13 +6981,26 @@ static void build_poicard() {
 static void enter_mode(AppMode m) {
     g_prev_mode = g_mode;
     g_mode = m;
+
+    // Nothing carries across a screen change: no pan coasting into a menu, no
+    // camera move still playing behind the tools screen.
+    g_fling_vx = g_fling_vy = 0.0f;
+    g_fling_rem_x = g_fling_rem_y = 0.0f;
+    g_fling_last_ms = 0;
+    g_anim_kind = WP_ANIM_NONE;
+
     switch (m) {
         case MODE_MAP:
             build_blank();
             lv_scr_load(scr_blank);
             g_need_map_redraw = true;
-            wp_map_hint_show(millis());   // teach the gestures, then get out of the way
+            // Teach the gestures the first time, then let the card fade and
+            // stay gone: it is there for someone who has never held this watch,
+            // and it is in the way of everyone else (a tap still brings it
+            // back on demand).
+            if (!g_hints_seen) wp_map_hint_show(millis());
             break;
+
         case MODE_LIBRARY:
             build_blank();
             lv_scr_load(scr_blank);
@@ -5515,8 +7029,14 @@ static void enter_mode(AppMode m) {
 static void library_open_selected() {
     if (g_map_count_lib == 0) return;
     if (g_map_sel < 0 || g_map_sel >= g_map_count_lib) return;
-    const String &path = g_maps[g_map_sel].path;
-    if (!mvt_map_open(path)) {
+    const MapEntry &ent = g_maps[g_map_sel];
+    const String &path = ent.path;
+    // A built-in map opens from flash, a card map from its folder, and both end
+    // up in the same loader -- so the map screen cannot tell which it is looking
+    // at, and neither can the tests.
+    const bool opened = (ent.bundle_id >= 0) ? mvt_map_open_bundle(ent.bundle_id)
+                                             : mvt_map_open(path);
+    if (!opened) {
         // stay in library, flash red border
         gfx->drawRoundRect(18, 108, LCD_WIDTH - 36, 244, 16, 0xF800);
         delay(500);
@@ -5562,37 +7082,128 @@ static bool     g_btn_long_fired = false;
 
 // Touch. The recogniser classifies the gesture (see wp_gesture_feed); what lives
 // here is only the state the map keeps between samples - the previous pan sample
-// and the scale the current pinch started from.
+// and the scale and pixel the current pinch started from. The coasting and
+// camera-move state sits up with the rest of the map's per-frame state, by the
+// render pipeline, because enter_mode() has to clear it and this is declared
+// after that.
 static bool     g_dragging = false;
 static int32_t  g_drag_last_x = 0, g_drag_last_y = 0;
 static bool     g_pinching = false;
 static int32_t  g_pinch_start_y = 0;
 static float    g_pinch_start_scale = 1;
+static int32_t  g_pinch_ax = 0, g_pinch_ay = 0;   // the pixel a pinch is anchored on
 
+
+
+// World offset of a screen pixel, from the one inverse implementation in the
+// motion engine. (The hand-rolled copy that used to sit in map_pan() did not
+// agree with world_to_screen() once the map was rotated, so dragging a
+// heading-up map pulled the world off at the wrong angle.)
+static void screen_to_world(int32_t sx, int32_t sy, double *wx, double *wy) {
+    double ux, uy;
+    wp_pixel_to_world_offset(sx, sy, g_screen_cx, g_screen_cy,
+                             g_map_rotation_deg, g_cam_scale, &ux, &uy);
+    *wx = g_cam_x + ux;
+    *wy = g_cam_y + uy;
+}
+
+// Pan: whatever was under the pixel the finger came from must now sit under the
+// pixel it reached, so the camera moves by the negative of the world offset of
+// that screen delta. Expressed through the shared inverse, so this is right on a
+// rotated map too - which is the case the old formula got wrong.
 static void map_pan(int dx, int dy) {
-    // Convert screen delta into world delta (inverse of world_to_screen scaling / rotation)
-    float rr = g_map_rotation_deg * (float)M_PI / 180.0f;
-    float ca = cosf(rr), sa = sinf(rr);
-    double wdx = ( dx * ca + -dy * sa) / (double)g_cam_scale;
-    double wdy = (-dx * sa + -dy * ca) / (double)g_cam_scale;
-    // note: screen +y = world -y; sign flipped via -dy above
-    g_cam_x -= wdx;
-    g_cam_y -= wdy;
+    double ux, uy;
+    wp_pixel_to_world_offset(g_screen_cx + dx, g_screen_cy + dy,
+                             g_screen_cx, g_screen_cy,
+                             g_map_rotation_deg, g_cam_scale, &ux, &uy);
+    g_cam_x -= ux;
+    g_cam_y -= uy;
+    g_cam_moved_ms = millis();
     g_need_map_redraw = true;
 }
-static void map_zoom(float factor) {
-    g_cam_scale *= factor;
+
+// Start a camera move. For a zoom, `ax/ay` is the pixel that must not move: the
+// world point under it is the same at both ends of the move, so the map grows
+// where you are looking instead of sliding out from under you.
+static void anim_start(uint8_t kind, uint32_t dur, int32_t ax, int32_t ay,
+                       double tx, double ty, float to_scale, uint32_t now) {
     float lo, hi; cam_scale_bounds(&lo, &hi);
+    if (to_scale < lo) to_scale = lo;
+    if (to_scale > hi) to_scale = hi;
+    g_anim_kind       = kind;
+    g_anim_t0         = now;
+    g_anim_dur        = dur;
+    g_anim_ax         = ax;
+    g_anim_ay         = ay;
+    g_anim_from_x     = g_cam_x;
+    g_anim_from_y     = g_cam_y;
+    g_anim_from_scale = g_cam_scale;
+    g_anim_to_scale   = to_scale;
+    if (kind == WP_ANIM_ZOOM) {
+        double wx, wy;
+        screen_to_world(ax, ay, &wx, &wy);
+        wp_cam_anchor(wx, wy, ax, ay, g_screen_cx, g_screen_cy,
+                      g_map_rotation_deg, to_scale, &g_anim_to_x, &g_anim_to_y);
+    } else {
+        g_anim_to_x = tx;
+        g_anim_to_y = ty;
+    }
+    g_need_map_redraw = true;
+}
+
+// One frame of that move. Returns true while it is still running.
+static bool anim_tick(uint32_t now) {
+    if (g_anim_kind == WP_ANIM_NONE) return false;
+    const float t = (g_anim_dur == 0) ? 1.0f
+                                      : (float)(now - g_anim_t0) / (float)g_anim_dur;
+    const float e = wp_ease_out(t);
+    float lo, hi; cam_scale_bounds(&lo, &hi);
+    g_cam_scale = g_anim_from_scale + (g_anim_to_scale - g_anim_from_scale) * e;
     if (g_cam_scale < lo) g_cam_scale = lo;
     if (g_cam_scale > hi) g_cam_scale = hi;
+    g_cam_x = g_anim_from_x + (g_anim_to_x - g_anim_from_x) * e;
+    g_cam_y = g_anim_from_y + (g_anim_to_y - g_anim_from_y) * e;
+    g_cam_moved_ms = now;
+    if (t >= 1.0f) {
+        // Land exactly on the target rather than on the ease's last ulp: a
+        // camera that stops a fraction short is a camera that keeps redrawing.
+        g_cam_scale = g_anim_to_scale;
+        g_cam_x     = g_anim_to_x;
+        g_cam_y     = g_anim_to_y;
+        g_anim_kind = WP_ANIM_NONE;
+    }
     cam_select_zoom();
     g_need_map_redraw = true;
+    return g_anim_kind != WP_ANIM_NONE;
 }
+
+// Zoom by `factor` about a screen pixel, over a few frames.
+static void map_zoom_at(float factor, int32_t ax, int32_t ay, uint32_t now) {
+    float lo, hi; cam_scale_bounds(&lo, &hi);
+    float to = g_cam_scale * factor;
+    if (to < lo) to = lo;
+    if (to > hi) to = hi;
+    if (fabsf(to - g_cam_scale) < 1e-6f) return;
+    anim_start(WP_ANIM_ZOOM, WP_ZOOM_MS, ax, ay, 0, 0, to, now);
+}
+
+// Zoom about the middle of the screen: what the BOOT button asks for.
+static void map_zoom(float factor) {
+    map_zoom_at(factor, g_screen_cx, g_screen_cy, millis());
+}
+
+// Recentre: back to the bounds centre at the middle of the ladder, as a move
+// rather than a cut. cam_bounds_target() is the same maths cam_reset_to_bounds()
+// uses, so the animated destination and the instantaneous one cannot disagree.
 static void map_recentre() {
-    cam_reset_to_bounds();
-    cam_select_zoom();
-    g_need_map_redraw = true;
+    double tx, ty; float ts; uint8_t tz;
+    cam_bounds_target(&tx, &ty, &ts, &tz);
+    anim_start(WP_ANIM_CAMERA, WP_RECENTRE_MS, g_screen_cx, g_screen_cy,
+               tx, ty, ts, millis());
+    MVT_LOG("[CAM] recentre -> %.5f,%.5f z=%u scale=%.6f\n", tx, ty,
+            (unsigned)tz, ts);
 }
+
 
 static void handle_boot_button(uint32_t now) {
     bool btn = (digitalRead(BOOT_BTN_PIN) == LOW);
@@ -5647,38 +7258,66 @@ static void handle_boot_button(uint32_t now) {
     }
 }
 
-// POI hit-test on tap (within ~14 px screen)
+// What a POI's icon family is called, in words. The card used to print the raw
+// enum ("type: 3") and the world coordinates, which is a debugging view of a
+// place rather than a description of it.
+static const char *poi_type_word(uint8_t type) {
+    switch (type) {
+        case 3:  return "Transit stop";
+        case 4:  return "School";
+        case 5:  return "Park";
+        case 1:  return "Shop";
+        default: return "Place";
+    }
+}
+
+// POI hit-test on tap. The NEAREST dot wins, not the first one the list happens
+// to mention, and at the same distance the more important place wins - tapping
+// a cluster should open the town, not the tenancy next door. The radius is
+// 24 px because a finger is not a mouse; 14 px meant aiming.
+#define WP_POI_TAP_PX 24
 static bool tap_hit_poi(int sx, int sy) {
     if (!g_pois) return false;
-    for (uint32_t i=0; i<g_poi_count; i++) {
+    uint32_t best_i = 0xFFFFFFFFu;
+    int32_t  best_d2 = WP_POI_TAP_PX * WP_POI_TAP_PX;
+    uint8_t  best_rank = 255;
+    for (uint32_t i = 0; i < g_poi_count; i++) {
+        const FMapPOI &p = g_pois[i];
+        if (!(g_layer_mask & (1u << p.layer))) continue;
+        if (g_cam_zoom_eff < (float)p.zmin) continue;   // not on screen yet
         int px, py;
-        world_to_screen(g_pois[i].x, g_pois[i].y, &px, &py);
-        int d2 = (px-sx)*(px-sx) + (py-sy)*(py-sy);
-        if (d2 < 14*14) {
-            g_poi_shown_idx = i;
-            String body;
-            body += "type: "; body += g_pois[i].type; body += "\n";
-            body += "x: "; body += g_pois[i].x; body += "\n";
-            body += "y: "; body += g_pois[i].y; body += "\n";
-            // Distance from cam
-            if (g_meta.units_per_metre > 0) {
-                double dx = (double)g_pois[i].x - g_cam_x;
-                double dy = (double)g_pois[i].y - g_cam_y;
-                float m = sqrtf((float)(dx*dx+dy*dy)) / g_meta.units_per_metre;
-                char db[24];
-                if (m < 1000) snprintf(db, 24, "distance: %d m", (int)(m+0.5f));
-                else          snprintf(db, 24, "distance: %.1f km", m/1000.0f);
-                body += db;
-            }
-            build_poicard();
-            lv_label_set_text(lbl_poi_title, g_pois[i].name ? g_pois[i].name : "(unnamed)");
-            lv_label_set_text(lbl_poi_body, body.c_str());
-            enter_mode(MODE_POI_CARD);
-            return true;
+        world_to_screen(p.x, p.y, &px, &py);
+        const int32_t ddx = (int32_t)(px - sx), ddy = (int32_t)(py - sy);
+        const int32_t d2 = ddx * ddx + ddy * ddy;
+        if (d2 < best_d2 || (d2 == best_d2 && p.rank < best_rank)) {
+            best_d2   = d2;
+            best_i    = i;
+            best_rank = p.rank;
         }
     }
-    return false;
+    if (best_i == 0xFFFFFFFFu) return false;
+
+    const FMapPOI &p = g_pois[best_i];
+    g_poi_shown_idx = best_i;
+    // The card says what this is, how far away it is and which way to look -
+    // which is everything a map card is for. The coordinates live on the DEV
+    // screen for anyone who wants them.
+    String body = poi_type_word(p.type);
+    if (g_meta.units_per_metre > 0) {
+        char db[16];
+        wp_fmt_distance_to(p.x, p.y, db, sizeof(db));
+        body += "\n";
+        body += db;
+        body += "  ";
+        body += wp_bearing_to(p.x, p.y);
+    }
+    build_poicard();
+    lv_label_set_text(lbl_poi_title, p.name ? p.name : "(unnamed)");
+    lv_label_set_text(lbl_poi_body, body.c_str());
+    enter_mode(MODE_POI_CARD);
+    return true;
 }
+
 
 // -----------------------------------------------------------------------------
 //  Gesture dispatch
@@ -5696,26 +7335,43 @@ static bool tap_hit_poi(int sx, int sy) {
 static void library_gesture(uint16_t ev, uint32_t now) {
     (void)now;
     const int n = g_map_count_lib ? g_map_count_lib : 1;
-    if (ev & WG_SWIPE_LEFT)  { g_map_sel = (g_map_sel + 1) % n;     g_lib_redraw = true; }
-    if (ev & WG_SWIPE_RIGHT) { g_map_sel = (g_map_sel - 1 + n) % n; g_lib_redraw = true; }
+    if (ev & WG_SWIPE_LEFT)  { g_map_sel = wp_lib_step(g_map_sel, n, +1); g_lib_redraw = true; }
+    if (ev & WG_SWIPE_RIGHT) { g_map_sel = wp_lib_step(g_map_sel, n, -1); g_lib_redraw = true; }
     if (ev & WG_SWIPE_UP)    { if (!g_lib_info) { g_lib_info = true;  g_lib_redraw = true; } }
     if (ev & WG_SWIPE_DOWN)  { if (g_lib_info)  { g_lib_info = false; g_lib_redraw = true; } }
     if (ev & WG_LONG_PRESS)  { g_lib_info = !g_lib_info; g_lib_redraw = true; }
 
     if (ev & WG_TAP) {
-        const int32_t x = g_gesture.sx, y = g_gesture.sy;
-        const int card_x = 20, card_y = 110, card_w = LCD_WIDTH - 40, card_h = 240;
-        const bool in_card = (x >= card_x && x < card_x + card_w &&
-                              y >= card_y && y < card_y + card_h);
-        if (!in_card) {
-            if (g_lib_info) { g_lib_info = false; g_lib_redraw = true; }
-            return;
+        // The tap is classified against the rects the screen was drawn with, so
+        // the plates that look like arrows step the carousel, a chip is a
+        // shortcut straight to its map, and the card opens the one you see. The
+        // old version kept its own copy of the card geometry, which had drifted
+        // away from the painter's.
+        WpLibLayout L;
+        wp_lib_layout(LCD_WIDTH, LCD_HEIGHT, &L);
+        WpLibShelf S;
+        wp_lib_shelf(n, g_map_sel, L.shelf_x, L.shelf_w, WP_LIB_SHELF_GAP, &S);
+        int chip = -1;
+        switch (wp_lib_hit(g_gesture.sx, g_gesture.sy, n, &L, &S, &chip)) {
+            case WP_LIB_HIT_PREV:
+                g_map_sel = wp_lib_step(g_map_sel, n, -1);
+                g_lib_redraw = true;
+                break;
+            case WP_LIB_HIT_NEXT:
+                g_map_sel = wp_lib_step(g_map_sel, n, +1);
+                g_lib_redraw = true;
+                break;
+            case WP_LIB_HIT_SHELF:
+                if (chip >= 0 && chip < n) g_map_sel = chip;
+                g_lib_redraw = true;
+                break;
+            case WP_LIB_HIT_OPEN:
+                library_open_selected();
+                return;
+            default:
+                if (g_lib_info) { g_lib_info = false; g_lib_redraw = true; }
+                break;
         }
-        // The arrows either side of the card step through the library; a tap
-        // anywhere else on the card opens the map.
-        if (n > 1 && x < card_x + 70)               { g_map_sel = (g_map_sel - 1 + n) % n; g_lib_redraw = true; }
-        else if (n > 1 && x > card_x + card_w - 70) { g_map_sel = (g_map_sel + 1) % n;     g_lib_redraw = true; }
-        else                                        { library_open_selected(); }
     }
 }
 
@@ -5730,6 +7386,19 @@ static void library_gesture(uint16_t ev, uint32_t now) {
 //  does the same thing without that caveat.
 // -----------------------------------------------------------------------------
 static void map_gesture(uint16_t ev, uint32_t now) {
+    // ---- the finger always wins ------------------------------------------
+    // A new press stops the coasting and interrupts a camera move where it is.
+    // Nothing feels worse than fighting the map for control of itself, and it
+    // is the one thing an inertia implementation has to get right.
+    if (g_tch_pressed && g_gesture.down) {
+        if (g_fling_vx != 0.0f || g_fling_vy != 0.0f) {
+            g_fling_vx = g_fling_vy = 0.0f;
+            g_fling_rem_x = g_fling_rem_y = 0.0f;
+            g_fling_last_ms = 0;
+        }
+        if (g_anim_kind != WP_ANIM_NONE) g_anim_kind = WP_ANIM_NONE;
+    }
+
     // ---- continuous: one finger pans, two fingers zoom -------------------
     if (g_tch_pressed && g_gesture.down) {
         if (g_gesture.two_finger) {
@@ -5738,39 +7407,94 @@ static void map_gesture(uint16_t ev, uint32_t now) {
                 g_dragging = false;
                 g_pinch_start_y = g_tch_y;
                 g_pinch_start_scale = g_cam_scale;
+                g_pinch_ax = g_tch_x;      // the pixel the zoom is anchored on
+                g_pinch_ay = g_tch_y;
             }
             const int32_t dy = g_tch_y - g_pinch_start_y;
             float ns = g_pinch_start_scale * expf((float)(-dy) * 0.006f);
             float lo, hi; cam_scale_bounds(&lo, &hi);
             if (ns < lo) ns = lo;
             if (ns > hi) ns = hi;
-            if (fabsf(ns - g_cam_scale) > 1e-4f) {
+            const bool fingers_moved = (g_pinch_ax != g_tch_x) ||
+                                       (g_pinch_ay != g_tch_y);
+            const bool rescaled = fabsf(ns - g_cam_scale) > 1e-4f;
+            if (fingers_moved || rescaled) {
+                // Anchor on where the fingers are NOW, not where they landed.
+                // The world point under them keeps its pixel, which is the whole
+                // of what a two-finger pinch means: the map grows about your
+                // hand, and moving both fingers pans at the same time instead of
+                // the map sliding out from under them. (The scale itself is
+                // still measured from where the pinch started, so it cannot
+                // drift as the anchor follows.)
+                g_pinch_ax = g_tch_x;
+                g_pinch_ay = g_tch_y;
+                double wx, wy;
+                screen_to_world(g_pinch_ax, g_pinch_ay, &wx, &wy);
                 g_cam_scale = ns;
+                wp_cam_anchor(wx, wy, g_pinch_ax, g_pinch_ay,
+                              g_screen_cx, g_screen_cy, g_map_rotation_deg,
+                              g_cam_scale, &g_cam_x, &g_cam_y);
                 cam_select_zoom();
+                g_cam_moved_ms = now;
                 g_need_map_redraw = true;
             }
+
         } else if (g_gesture.dragged) {
             if (!g_dragging) {
                 g_dragging = true;
                 g_pinching = false;
                 g_drag_last_x = g_tch_x;
                 g_drag_last_y = g_tch_y;
+                g_fling_vx = g_fling_vy = 0.0f;   // a fresh drag, a fresh flick
+                g_drag_last_ms = now;
             }
             const int32_t dx = g_tch_x - g_drag_last_x;
             const int32_t dy = g_tch_y - g_drag_last_y;
+            const uint32_t dt = now - g_drag_last_ms;
             if (dx || dy) {
                 map_pan((int)dx, (int)dy);
                 g_drag_last_x = g_tch_x;
                 g_drag_last_y = g_tch_y;
             }
+            // Flick velocity, weighted toward the newest sample so that a fast
+            // drag which SLOWS to a stop before the finger lifts ends up with
+            // no fling at all -- which is what a hand expects.
+            if (dt > 0 && dt < 120) {
+                const float k = 0.55f;
+                g_fling_vx = g_fling_vx * (1.0f - k) + k * ((float)dx / (float)dt);
+                g_fling_vy = g_fling_vy * (1.0f - k) + k * ((float)dy / (float)dt);
+            }
+            g_drag_last_ms = now;
         }
     }
-    if (ev & WG_RELEASE) { g_dragging = false; g_pinching = false; }
+
+    if (ev & WG_RELEASE) {
+        const bool was_pan = g_dragging && !g_pinching;
+        g_dragging = false;
+        g_pinching = false;
+        if (was_pan) {
+            // Hand the pan over to the motion engine: the map keeps moving the
+            // way the finger was moving, and the loop coasts it to a stop.
+            wp_fling_cap(&g_fling_vx, &g_fling_vy);
+            const float speed = sqrtf(g_fling_vx * g_fling_vx +
+                                      g_fling_vy * g_fling_vy);
+            if (speed >= WP_FLING_MIN_START) {
+                g_fling_last_ms = now;
+                g_fling_rem_x = g_fling_rem_y = 0.0f;
+            } else {
+                g_fling_vx = g_fling_vy = 0.0f;
+            }
+        } else {
+            g_fling_vx = g_fling_vy = 0.0f;
+        }
+    }
 
     // ---- discrete --------------------------------------------------------
     if (ev & WG_LONG_PRESS) enter_mode(MODE_TOOLS);
-    if (ev & WG_DOUBLE_TAP) map_zoom(1.5f);
-    if (ev & WG_TWO_TAP)    map_zoom(1.0f / 1.5f);
+    // Zoom about the point that was tapped, so the place you aimed at is the
+    // place that stays put while the map grows.
+    if (ev & WG_DOUBLE_TAP) map_zoom_at(1.5f, g_gesture.sx, g_gesture.sy, now);
+    if (ev & WG_TWO_TAP)    map_zoom_at(1.0f / 1.5f, g_gesture.sx, g_gesture.sy, now);
 
     if (ev & WG_SWIPE_DOWN) {
         const bool edge = (g_gesture.edge == WP_EDGE_TOP) &&
@@ -5789,7 +7513,17 @@ static void map_gesture(uint16_t ev, uint32_t now) {
             wp_map_hint_show(now);      // any tap brings the gesture hints back
         }
     }
+
+    // A named gesture is not a coast: swiping away, zooming or opening a menu
+    // never leaves the map still drifting underneath it.
+    if (ev & (WG_SWIPE_LEFT | WG_SWIPE_RIGHT | WG_SWIPE_UP | WG_SWIPE_DOWN |
+              WG_DOUBLE_TAP | WG_TWO_TAP | WG_LONG_PRESS)) {
+        g_fling_vx = g_fling_vy = 0.0f;
+        g_fling_rem_x = g_fling_rem_y = 0.0f;
+        g_fling_last_ms = 0;
+    }
 }
+
 
 // -----------------------------------------------------------------------------
 //  Menu screens: tap a row to act on it, swipe down to go back a level, swipe
@@ -5837,6 +7571,93 @@ static void handle_map_touch(uint32_t now) {
     menu_gesture(ev, now);
 }
 
+// -----------------------------------------------------------------------------
+//  One frame of "feel".
+//
+//  The only place a coasting pan, a camera move or a turning wrist becomes
+//  pixels: a still map does no work at all here, because everything it reads is
+//  state some gesture handler set. Order matters - the coast feeds the camera,
+//  then the camera move, then the heading follow, and the frame loop paints
+//  whatever the three of them agreed on.
+// -----------------------------------------------------------------------------
+#define WP_RETICLE_HOLD_MS  900      // the centre reticle stays lit this long
+#define WP_RETICLE_FADE_MS  280      // then one dimmer step per this long
+
+
+
+static void map_feel_tick(uint32_t now) {
+    // --- the reticle: lit while you are moving the camera, then out of the way
+    // Each step asks for one more frame and no more, so a 410 px panel is not
+    // repainting a crosshair thirty times a second while you read the map.
+    if ((now - g_cam_moved_ms) < WP_RETICLE_HOLD_MS) {
+        if (g_reticle_step != 3) { g_reticle_step = 3; g_need_map_redraw = true; }
+        g_reticle_next_ms = now + WP_RETICLE_HOLD_MS;
+    } else if (g_reticle_step > 0 && (int32_t)(now - g_reticle_next_ms) >= 0) {
+        g_reticle_step--;
+        g_reticle_next_ms = now + WP_RETICLE_FADE_MS;
+        g_need_map_redraw = true;
+    }
+
+    // --- coasting -----------------------------------------------------------
+    if (g_fling_vx != 0.0f || g_fling_vy != 0.0f) {
+        const uint32_t last = g_fling_last_ms ? g_fling_last_ms : now;
+        const float dt = (float)(now - last);
+        g_fling_last_ms = now;
+        float dx, dy;
+        const bool still_moving = wp_fling_step(&g_fling_vx, &g_fling_vy,
+                                                dt, &dx, &dy);
+        // Sub-pixel carry: a slow flick moves less than a pixel per frame, and
+        // rounding that away every frame would stall it long before the curve
+        // says it is done.
+        g_fling_rem_x += dx;
+        g_fling_rem_y += dy;
+        const int ix = (int)g_fling_rem_x, iy = (int)g_fling_rem_y;
+        if (ix || iy) {
+            g_fling_rem_x -= (float)ix;
+            g_fling_rem_y -= (float)iy;
+            map_pan(ix, iy);
+        }
+        if (!still_moving) {
+            g_fling_last_ms  = 0;
+            g_fling_rem_x    = 0.0f;
+            g_fling_rem_y    = 0.0f;
+        }
+    }
+
+    // --- a camera move in flight -------------------------------------------
+    anim_tick(now);
+
+    // --- the rotation follow -----------------------------------------------
+    //  One target drives this either way: the compass while heading-up is on,
+    //  or zero while the map is settling back to north-up after being switched
+    //  off. Both are eased, so neither is a jump.
+    if (g_heading_target > -900.0f) {
+        const float dt = (float)(now - g_feel_last_ms);
+        const float alpha = 1.0f - expf(-dt / WP_ROT_TAU_MS);
+        const float left = fabsf(wp_angle_delta(g_map_rotation_deg,
+                                                g_heading_target));
+        // Heading-up chases only while the watch is actually being turned, or
+        // when the map is badly out of date. A magnetometer wanders by a degree
+        // or two on a stationary wrist, and repainting at 30 fps to follow that
+        // is how a watch spends its battery without looking any better. Settling
+        // to north has no such excuse: it runs to completion, then stops.
+        const bool chase = g_rotate_with_heading
+                         ? (left > 6.0f || (wp_imu_motion_detected() && left > 0.05f))
+                         : (left > 0.05f);
+        if (chase) {
+            g_map_rotation_deg = wp_angle_step(g_map_rotation_deg,
+                                               g_heading_target, alpha);
+            g_cam_moved_ms = now;
+            g_need_map_redraw = true;
+        } else if (!g_rotate_with_heading) {
+            g_map_rotation_deg = 0.0f;      // land exactly north, then stop
+            g_heading_target   = -999.0f;
+            g_need_map_redraw  = true;
+        }
+    }
+    g_feel_last_ms = now;
+}
+
 // =============================================================================
 //  setup / loop
 // =============================================================================
@@ -5876,10 +7697,11 @@ void setup() {
                 "Controls - gestures first (see WaypointOS.ino header):\n"
                 "  library: swipe < > browse, tap the card to open,\n"
                 "           swipe ^ for details, swipe v to put them away\n"
-                "  map:     drag pan, double tap zoom in, 2-finger tap zoom\n"
-                "           out, 2-finger drag to zoom, tap a POI,\n"
-                "           hold for Tools, swipe ^ from the bottom strip for\n"
-                "           Tools, swipe v from the top strip back to the library\n"
+                "  map:     drag pans (it coasts on after a flick), double tap\n"
+                "           zooms in where you tapped, 2-finger tap zooms out,\n"
+                "           2-finger drag pinches about your fingers, tap picks\n"
+                "           a POI, hold opens Tools, a flick from the bottom\n"
+                "           strip opens Tools, one from the top goes back\n"
                 "  menus:   tap a row, swipe v back a level, swipe < > between\n"
                 "           the screens that belong together\n"
                 "  BOOT tap        - library: next map / map: zoom in\n"
@@ -5887,6 +7709,7 @@ void setup() {
                 "  BOOT hold 0.5s  - library: open / map: recentre\n"
                 "  BOOT hold 1.5s  - back one level (sub -> map -> lib -> launcher)\n"
                 "  BOOT hold 4s    - direct return to LauncherOS from anywhere\n"
+
             );
             rf.close();
         }
@@ -5898,9 +7721,13 @@ void setup() {
 
     // NVS restore
     Preferences p; p.begin("waypoint", true);
-    g_theme_id       = p.getUChar("theme", THEME_FUSION_DARK);
-    if (g_theme_id > THEME_CHILL) g_theme_id = THEME_FUSION_DARK;
+    g_theme_id       = p.getUChar("theme", THEME_KIWI);
+    // A stored id from an older build must not index past the table: this used to
+    // clamp against the last theme that happened to exist then.
+    if (g_theme_id >= THEME_COUNT) g_theme_id = THEME_KIWI;
     wp_sync_styles();   // Track B: prime shared LVGL styles from restored theme
+    g_hints_seen = p.getBool("hints", false);   // the gesture card is taught once
+
     g_mx_off = p.getFloat("mxo", 0); g_my_off = p.getFloat("myo", 0); g_mz_off = p.getFloat("mzo", 0);
     g_mx_scl = p.getFloat("mxs", 1); g_my_scl = p.getFloat("mys", 1); g_mz_scl = p.getFloat("mzs", 1);
     g_marked_heading = p.getFloat("mark_hdg", -1);
@@ -5908,6 +7735,18 @@ void setup() {
     p.end();
 
     splash_show();
+
+    // Open the built-in bundle once. A bundle that is missing, truncated or from
+    // another version fails here and leaves the library exactly as it was.
+#ifdef WP_HAS_BUNDLE
+    g_bundle_ok = wp_bundle_open(&g_bundle, WP_MAPS_BUNDLE, WP_MAPS_BUNDLE_BYTES);
+    if (g_bundle_ok)
+        MVT_LOG("[BUNDLE] %d built-in maps, %u tiles, %u bytes\n",
+                wp_bundle_map_count(&g_bundle), (unsigned)g_bundle.tiles,
+                (unsigned)WP_MAPS_BUNDLE_BYTES);
+    else
+        MVT_LOG("[BUNDLE] wp_maps_bundle.h is present but not a WPB1 bundle\n");
+#endif
 
     library_scan();
 
@@ -5949,16 +7788,17 @@ void loop() {
         if (g_has_mag) {
             float h = tilt_comp_heading();
             g_heading = h;
-            if (g_rotate_with_heading && g_mode == MODE_MAP) {
-                // Throttle: only redraw when heading moved more than 3° since last drawn frame
-                float dh = fabsf(h - g_last_rot_drawn_deg);
-                if (dh > 180) dh = 360 - dh;
-                if (g_last_rot_drawn_deg < -900 || dh > 3.0f) {
-                    g_map_rotation_deg = h;
-                    g_last_rot_drawn_deg = h;
-                    g_need_map_redraw = true;
-                }
-            }
+            // Heading-up: hand the follow a target and let map_feel_tick() ease
+            // toward it on every frame. The target is -h, not h: a world bearing
+            // b lands on screen at (b + g_map_rotation_deg), so facing east
+            // (+90) has to turn the map by -90 to put east up. The old code set
+            // the rotation to +h, which spun heading-up maps the wrong way.
+            // Only ever SET the target here. Clearing it (as this used to) would
+            // cancel a map that is still easing back to north-up after
+            // heading-up was switched off - leaving it rotated while the rose
+            // said north-up.
+            if (g_rotate_with_heading) g_heading_target = -h;
+
         }
         // Update LVGL labels only on their screens
         if (g_mode == MODE_COMPASS && lbl_hdg && g_heading >= 0) {
@@ -5999,16 +7839,20 @@ void loop() {
 
     // Raw-gfx frames (map & library)
     // Frame-rate throttle: cap draw_map_frame() at ~30 fps so many small pan
-    // events between frames coalesce into a single redraw. map_pan() keeps
-    // g_cam_x/y up to date every touch tick, so the *camera* never lags --
-    // only the render is capped, which is what actually costs time & battery.
+    // events between frames coalesce into a single redraw. The gesture handler
+    // keeps g_cam_x/y up to date every touch tick, so the *camera* never lags
+    // -- only the render is capped, which is what actually costs time & battery.
     #define WP_MIN_FRAME_MS  33         // ~30 fps
     if (g_mode == MODE_LIBRARY) library_draw();
     else if (g_mode == MODE_MAP) {
         static uint32_t last_frame = 0;
-        bool time_ok      = (now - last_frame) >= WP_MIN_FRAME_MS;
-        bool heading_tick = g_rotate_with_heading && (now - last_frame > 250);
-        if ((g_need_map_redraw && time_ok) || heading_tick) {
+        // Motion first, pixels second: coasting, a camera move in flight and the
+        // heading follow all move the camera, then one frame paints the result.
+        // This replaces the old "repaint every 250 ms just because heading-up is
+        // on" tick - a turning map now asks for frames itself, and a still wrist
+        // asks for none at all.
+        map_feel_tick(now);
+        if (g_need_map_redraw && (now - last_frame) >= WP_MIN_FRAME_MS) {
             draw_map_frame();
             last_frame = now;
         }
