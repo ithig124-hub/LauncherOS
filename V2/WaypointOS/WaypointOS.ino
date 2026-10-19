@@ -44,8 +44,19 @@
 //    menus    tap a row to act on it, swipe v to go back a level, swipe < > to
 //             walk between the screens that belong together (sensors, setup,
 //             tools)
-//    BOOT     tap next / 2x tap prev / 0.5 s open or recentre / 1.5 s back a
-//             level / 4 s straight back to LauncherOS
+//
+//  No button for NAVIGATION. Every screen is reachable with one finger: leaving
+//  for LauncherOS is the EXIT pill on the library, or a swipe down from the top
+//  edge. The side button has exactly one job, and it is the one BookOS gives it:
+//  hold it for 1.2 s and the watch goes back to the launcher. That is the exit
+//  that still works when a screen has stopped answering, which is the only kind
+//  of exit worth having on a device with no keyboard.
+//
+//  Diagnostics: this build talks on the watch's USB-C port itself (HWCDC, the
+//  same way LauncherOS does), not on UART0, so the Arduino monitor shows
+//  [boot] / [touch] / [beat] lines. A [beat] once a second says the app is
+//  still looping, which screen it is on, whether touch started and how many
+//  gestures arrived -- so "it froze" can be told apart from "the panel died".
 //
 //  Look    : Kiwi -- an ink-black canvas, one vivid green that only ever means
 //            "act" or "you are here", and a map of quiet grey-greens drawn from
@@ -85,6 +96,49 @@
 #include <esp_system.h>
 #include <esp_heap_caps.h>
 #include <esp_bt.h>
+
+// -----------------------------------------------------------------------------
+//  Where the diagnostics go.
+//  On this board `Serial` is UART0 unless the build has "USB CDC On Boot"
+//  enabled, and the watch's USB-C port is the NATIVE one. A sketch that prints
+//  to Serial therefore looks perfectly silent in the Arduino monitor even while
+//  it is running happily -- which is exactly how "frozen after the splash" and
+//  "nothing in the serial monitor" end up being reported together.
+//  LauncherOS opens that port itself (its object is USBSerial); this sketch does
+//  the same through the core's own HWCDCSerial, so the monitor is on the port
+//  it is listening to.
+//
+//  Which object that is has to be decided from the CHIP and the board menu, and
+//  every branch below is a test the preprocessor can answer by itself. Naming
+//  `HWCDC` on a target that has no USB-Serial-JTAG peripheral -- a plain ESP32,
+//  or simply the wrong board picked in the IDE -- fails the whole build with
+//  "'HWCDC' does not name a type", so the capability is checked first.
+// -----------------------------------------------------------------------------
+#if defined(SOC_USB_SERIAL_JTAG_SUPPORTED) && SOC_USB_SERIAL_JTAG_SUPPORTED && \
+    defined(ARDUINO_USB_MODE) && ARDUINO_USB_MODE
+  // USB Mode = "Hardware CDC and JTAG": the peripheral the cable enumerates.
+  // The core names that object HWCDCSerial and only creates it when "USB CDC On
+  // Boot" is enabled -- otherwise `Serial` is UART0 and nothing else exists, so
+  // the object is declared here (HWCDC.cpp's definition is behind the same
+  // guard, so there is no duplicate).
+  #include "HWCDC.h"
+  #if !defined(ARDUINO_USB_CDC_ON_BOOT) || !ARDUINO_USB_CDC_ON_BOOT
+HWCDC HWCDCSerial;
+  #endif
+  #define WP_LOG_SERIAL HWCDCSerial
+#else
+  // Either the chip has no USB-Serial-JTAG, or the board menu gives the port to
+  // TinyUSB. `Serial` is then the only object that exists -- the CDC when "USB
+  // CDC On Boot" is enabled, UART0 otherwise -- so logging follows it and this
+  // build still compiles and runs.
+  #warning "WaypointOS: USB logging needs ESP32S3 + 'USB Mode: Hardware CDC and JTAG' (or 'USB CDC On Boot: Enabled'). Logging to Serial instead."
+  #define WP_LOG_SERIAL Serial
+#endif
+// Logging is gated on a connected host: HWCDC's write() takes a lock and can
+// spend up to a tenth of a second per call when the port is open but the reader
+// has stalled, and a watch that logs to nobody should pay nothing at all. With
+// no monitor attached every line below is a single boolean test.
+#define WP_LOG(...) do { if (WP_LOG_SERIAL) WP_LOG_SERIAL.printf(__VA_ARGS__); } while (0)
 
 // The map library that ships inside the app. tools/bake_bundle.py writes this
 // header; a fresh checkout has none, and then the library is card-only. The
@@ -417,7 +471,7 @@ static int wp_gunzip(unsigned char *dest, unsigned long *destlen,
 #define MVT_DEBUG 0
 #endif
 #if MVT_DEBUG
-  #define MVT_LOG(...)  do { Serial.printf(__VA_ARGS__); } while (0)
+  #define MVT_LOG(...)  do { WP_LOG_SERIAL.printf(__VA_ARGS__); } while (0)
 #else
   #define MVT_LOG(...)  do { } while (0)
 #endif
@@ -894,12 +948,21 @@ static void my_touchpad_read(lv_indev_drv_t *, lv_indev_data_t *data) {
     g_gesture_events |= wp_gesture_feed(&g_gesture, pressed, x, y, fingers, now,
                                         LCD_WIDTH, LCD_HEIGHT);
 
+    // LauncherOS logs every touch's start and end; the same two lines are what
+    // tell a dark screen with a silent monitor apart from a dead panel with a
+    // live app.
+    const bool was_pressed = g_tch_pressed;
     if (pressed) {
         data->state=LV_INDEV_STATE_PR; data->point.x=x; data->point.y=y;
         g_tch_pressed=true; g_tch_x=x; g_tch_y=y;
+        if (!was_pressed) WP_LOG("[touch] start (%d, %d) fingers=%d\n", (int)x, (int)y, fingers);
     } else {
         data->state=LV_INDEV_STATE_REL;
-        if (g_tch_pressed) { g_tch_x=x; g_tch_y=y; }
+        if (was_pressed) {
+            WP_LOG("[touch] end dx=%d dy=%d dur=%lu\n",
+                   (int)g_gesture.dx, (int)g_gesture.dy, (unsigned long)g_gesture.dur);
+            g_tch_x=x; g_tch_y=y;
+        }
         g_tch_pressed=false;
     }
 
@@ -981,23 +1044,195 @@ static void wp_idle_dim_tick(uint32_t now) {
     }
 }
 
+// ---- shared time block (spec: TIME_CONTRACT.md) -----------------------------
+//  Inlined verbatim from LauncherOS V2 / BookOS. The watch's wall clock lives in
+//  ONE NVS namespace, so whichever app wrote it last, every app reads the same
+//  time. Only the two lines below may differ per app: the serial port it reports
+//  on, and who is writing (a module vs the launcher).
+#define TIME_SERIAL   WP_LOG_SERIAL
+#define TIME_SRC_ID   TIME_SRC_MODULE
+// ===== SHARED TIME BLOCK v2 =================================================
+//  Namespace "rtcsave" -- the ONE place the watch's wall clock lives:
+//      t    uint32  unix epoch seconds, UTC
+//      gmt  int32   local offset from UTC, in SECONDS   (+28800 = UTC+8)
+//      seq  uint32  write counter, ++ on every publish  (diagnostics)
+//      man  uint8   1 = a human set this clock, 0 = machine (NTP/boot)
+//      src  uint8   0 = launcher, 1 = module            (diagnostics)
+//
+//  Two different things have to survive a reboot, and only one of them does:
+//    * the EPOCH lives in the chip's RTC timer. It survives every software
+//      reset and every deep sleep, so a launcher <-> module reboot inherits it
+//      for free -- but power loss wipes it, and then this snapshot is the only
+//      thing between the user and "00:00".
+//    * the TIMEZONE lives in the C library's TZ string, which is RAM-ONLY. It
+//      dies on EVERY reboot and no app can inherit it from the previous one.
+//      NVS is therefore the offset's only home.
+//  => epoch is inherited through the RTC, backed up here. Timezone is stored
+//     here and re-applied by every single boot.
+// ============================================================================
+#define TIME_VALID_MIN      1700000000UL   // ~2023-11-14: "the RTC has been set"
+#define TIME_ADOPT_SLACK_S  2L             // ignore sub-2 s snapshot/rtc skew
+#define TIME_SRC_LAUNCHER   0
+#define TIME_SRC_MODULE     1
+
+static int32_t  g_tp_gmt   = 0;   // local offset from UTC, in seconds
+static uint32_t g_tp_seq   = 0;   // last seq we read or wrote
+static bool     g_tp_valid = false;   // a plausible wall clock is available
+
+// Point the C library at the local UTC offset. TZ is RAM-only, so this must run
+// on EVERY boot in EVERY app or the watch silently renders UTC.
+// POSIX counts the offset backwards from local to UTC, hence the minus.
+static void time_apply_tz(int32_t gmt_sec) {
+    long mins = -(gmt_sec / 60);
+    long a    = labs(mins);
+    char tz[24];
+    snprintf(tz, sizeof(tz), "UTC%c%ld:%02ld", mins < 0 ? '-' : '+', a / 60, a % 60);
+    setenv("TZ", tz, 1);
+    tzset();
+    g_tp_gmt = gmt_sec;
+}
+
+// Is the shared NVS snapshot a better clock than the one the chip is holding?
+//   nothing saved yet        -> leave everything alone
+//   chip has no valid clock  -> cold boot / dead battery: adopt the NVS
+//   a human set it (man=1)   -> their correction wins in EITHER direction
+//   snapshot runs ahead      -> somebody moved the clock forward: adopt
+//   otherwise                -> the RTC is the live clock, keep it
+// (uint8_t return keeps the Arduino .ino auto-prototype generator, which runs
+//  before this enum is declared, happy.)
+enum TimeDecision { TIME_DEC_NOTHING = 0, TIME_DEC_KEEP_RTC = 1, TIME_DEC_ADOPT = 2 };
+static uint8_t time_decide(time_t rtc_now, uint32_t snap_t, uint8_t snap_man) {
+    if (snap_t < TIME_VALID_MIN)                       return TIME_DEC_NOTHING;
+    if (rtc_now < (time_t)TIME_VALID_MIN)              return TIME_DEC_ADOPT;
+    if (snap_man && labs((long)snap_t - (long)rtc_now) > TIME_ADOPT_SLACK_S)
+                                                       return TIME_DEC_ADOPT;
+    if ((int32_t)(snap_t - (uint32_t)rtc_now) > TIME_ADOPT_SLACK_S)
+                                                       return TIME_DEC_ADOPT;
+    return TIME_DEC_KEEP_RTC;
+}
+
+// WRITE half of the contract: epoch + offset + provenance. Call it after every
+// NTP sync, after a manual set, and on the way out of the app (before restart).
+static void time_publish(const char *why, bool manual) {
+    time_t now; time(&now);
+    if (now < (time_t)TIME_VALID_MIN) return;      // RTC not set yet
+    Preferences p;
+    if (!p.begin("rtcsave", false)) return;
+    uint32_t prev     = p.getULong("t", 0);
+    uint8_t  prev_man = p.getUChar("man", 0);
+    // A human's correction stays in force while the snapshot still describes the
+    // same instant. Every boot refreshes `t` by a second or so and must not
+    // quietly demote the clock back to "machine". A machine that lands a
+    // genuinely DIFFERENT epoch (an NTP sync) does take the clock over.
+    bool machine_moved_it = !prev ||
+                            labs((long)now - (long)prev) > TIME_ADOPT_SLACK_S;
+    uint8_t man = (manual || (prev_man && !machine_moved_it)) ? 1 : 0;
+    p.putULong("t",   (uint32_t)now);
+    p.putLong ("gmt", g_tp_gmt);
+    p.putUChar("man", man);
+    p.putUChar("src", TIME_SRC_ID);
+    g_tp_seq = p.getULong("seq", 0) + 1;           // read-modify-write, session open
+    p.putULong("seq", g_tp_seq);
+    p.end();
+    TIME_SERIAL.printf("[time] publish t=%lu gmt=%ld seq=%lu man=%d (%s)\n",
+                       (unsigned long)now, (long)g_tp_gmt,
+                       (unsigned long)g_tp_seq, man, why);
+}
+
+// READ half: reconcile the EPOCH, then ALWAYS re-apply the TIMEZONE, then
+// republish so the snapshot never lags the running clock by more than a boot.
+// Call this at the very top of setup(), before anything that shows a time.
+static void time_restore_from_nvs() {
+    time_t rtc_now = 0; time(&rtc_now);
+
+    uint32_t snap_t = 0, snap_seq = 0;
+    int32_t  snap_gmt = 0;
+    uint8_t  snap_man = 0;
+    Preferences p;
+    if (p.begin("rtcsave", true)) {
+        snap_t   = p.getULong("t",   0);
+        snap_gmt = p.getLong ("gmt", 0);
+        snap_seq = p.getULong("seq", 0);
+        snap_man = p.getUChar("man", 0);
+        p.end();
+    }
+    if (snap_seq == 0 && snap_t) snap_seq = 1;     // pre-v2 snapshot
+
+    uint8_t d = time_decide(rtc_now, snap_t, snap_man);
+    if (d == TIME_DEC_ADOPT) {
+        struct timeval tv = { (time_t)snap_t, 0 };
+        settimeofday(&tv, NULL);                   // writes the chip RTC as well
+        g_tp_valid = true;
+        TIME_SERIAL.printf("[time] adopted NVS t=%lu (rtc was %ld man=%d)\n",
+                           (unsigned long)snap_t, (long)rtc_now, snap_man);
+    } else if (d == TIME_DEC_KEEP_RTC) {
+        g_tp_valid = true;                         // never rewind a live RTC
+        TIME_SERIAL.printf("[time] RTC live t=%ld -- NVS kept as fallback\n",
+                           (long)rtc_now);
+    } else {
+        TIME_SERIAL.println("[time] no persisted clock -- waiting for NTP");
+    }
+
+    // TZ is the part that never survives a reboot: take it from here, always.
+    if (snap_t) time_apply_tz(snap_gmt);
+    g_tp_seq = snap_seq;
+    time_publish("boot", false);                   // keep the snapshot current
+}
+// ===== END SHARED TIME BLOCK v2 =============================================
+
+// ---- LauncherOS return (BookOS parity) --------------------------------------
+//  Same body BookOS uses: publish the clock FIRST, then point the bootloader at
+//  the factory partition (or the other OTA slot) and restart. The publish is
+//  what keeps the launcher's face on the right time after the switch; without
+//  it the module's last minutes of clock are lost.
 static void return_to_launcher() {
+    WP_LOG("[exit] back to LauncherOS\n");
+    time_publish("exit", false);
     const esp_partition_t *factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, NULL);
     if (factory) esp_ota_set_boot_partition(factory);
     else { const esp_partition_t *o = esp_ota_get_next_update_partition(NULL); if (o && o!=esp_ota_get_running_partition()) esp_ota_set_boot_partition(o); }
     delay(80); esp_restart();
 }
 
+static bool g_touch_ok = false;      // did the touch controller answer at boot?
+
 static void launcher_app_boot() {
-    Serial.begin(115200);
+    Serial.begin(115200);            // UART0, unchanged
+    WP_LOG_SERIAL.begin(115200);     // the port the Arduino monitor is actually on
+    WP_LOG("\n=== WaypointOS boot ===\n");
     pinMode(BOOT_BTN_PIN, INPUT_PULLUP); pinMode(PWR_BTN_PIN, INPUT_PULLUP); btStop();
-    if (!gfx->begin()) Serial.println("gfx fail");
+    if (!gfx->begin()) { Serial.println("gfx fail"); WP_LOG("[boot] gfx->begin() failed\n"); }
     gfx->fillScreen(0x0000);
     pinMode(IIC_SCL, OUTPUT);
     for (int i=0; i<9; i++) { digitalWrite(IIC_SCL,LOW); delayMicroseconds(5); digitalWrite(IIC_SCL,HIGH); delayMicroseconds(5); }
     Wire.begin(IIC_SDA, IIC_SCL);
+    Wire.setClock(400000);           // LauncherOS v6.3: fast-mode I2C
     pinMode(TP_RESET, OUTPUT); digitalWrite(TP_RESET, LOW); delay(50); digitalWrite(TP_RESET, HIGH); delay(200);
-    FT3168->begin();
+    // Touch bring-up, LauncherOS parity. Three things here are load-bearing and
+    // were all missing before, any one of which leaves a live app that answers
+    // nothing:
+    //   * TP_INT as a pulled-up input -- the driver's interrupt flag rides on it;
+    //   * retry until the controller ACKs, instead of believing one attempt
+    //     (one bad power-up used to leave the panel dead for the whole session);
+    //   * TOUCH_POWER_MONITOR -- without it the FT3168 can sit in its idle mode
+    //     and never report coordinates.
+    pinMode(TP_INT, INPUT_PULLUP);
+    int tp_tries = 0;
+    while (!FT3168->begin()) {
+        tp_tries++;
+        WP_LOG("[boot] FT3168 init fail (%d)\n", tp_tries);
+        if (tp_tries >= 20) break;   // 20 x 250 ms = 5 s, then carry on and say so
+        delay(250);
+    }
+    g_touch_ok = (tp_tries < 20);
+    if (g_touch_ok) {
+        FT3168->IIC_Write_Device_State(
+            FT3168->Arduino_IIC_Touch::Device::TOUCH_POWER_MODE,
+            FT3168->Arduino_IIC_Touch::Device_Mode::TOUCH_POWER_MONITOR);
+        WP_LOG("[boot] FT3168 ready\n");
+    } else {
+        WP_LOG("[boot] NO TOUCH after 5 s -- the UI will not respond\n");
+    }
     // The gesture state is a static (so already zero), but reset it explicitly:
     // it documents that a boot starts with no half-finished gesture in flight.
     wp_gesture_reset(&g_gesture);
@@ -1016,15 +1251,24 @@ static void launcher_app_boot() {
     SD_MMC.begin("/sdcard", true);
 }
 
-static void time_restore_from_launcher() {
-    Preferences p;
-    if (!p.begin("rtcsave", true)) return;
-    uint32_t t = p.getULong("t", 0); long gmt = p.getLong("gmt", 0); p.end();
-    if (t > 1700000000) {
-        struct timeval tv = { .tv_sec=(time_t)t, .tv_usec=0 };
-        settimeofday(&tv, NULL);
-        char tz[16]; snprintf(tz, sizeof(tz), "UTC%+ld", -gmt/3600);
-        setenv("TZ", tz, 1); tzset();
+// ---- BookOS "back to launcher": a hold on the side button --------------------
+//  BookOS can always be left, even when its screen stops answering, because a
+//  long press on the side button does the one job the screen cannot: pivot the
+//  bootloader back to the launcher. Same here, same 1.2 s, and it publishes the
+//  clock on the way out (return_to_launcher does that). Nothing else uses this
+//  button, so it cannot collide with a gesture.
+#define WP_EXIT_HOLD_MS 1200
+static void wp_exit_button_poll() {
+    static uint32_t hold = 0;      // millis() when the press started
+    static bool     down_before = false;
+    const uint32_t now = millis();
+    if (digitalRead(BOOT_BTN_PIN) != LOW) { down_before = false; hold = 0; return; }
+    if (!down_before) { down_before = true; hold = now; return; }
+    if ((uint32_t)(now - hold) >= WP_EXIT_HOLD_MS) {
+        down_before = false; hold = 0;
+        WP_LOG("[exit] side button held %lums -- back to LauncherOS\n",
+               (unsigned long)WP_EXIT_HOLD_MS);
+        return_to_launcher();
     }
 }
 // ===== END SHARED BOOT BLOCK =================================================
@@ -1080,6 +1324,25 @@ static const ThemePalette THEMES[] = {
 };
 static uint8_t g_theme_id = THEME_KIWI;
 static inline const ThemePalette &TH() { return THEMES[g_theme_id]; }
+
+// LVGL speaks 0xRRGGBB; this file otherwise speaks RGB565. One conversion means
+// an LVGL screen cannot quietly keep a colour from the theme before last -- which
+// is how the menus stayed cyan and #141414 through four theme changes while the
+// map around them turned green.
+static inline uint32_t wp_hex24(uint16_t c) {
+    const uint32_t r = (uint32_t)(((c >> 11) & 0x1F) * 255 / 31);
+    const uint32_t g = (uint32_t)(((c >> 5)  & 0x3F) * 255 / 63);
+    const uint32_t b = (uint32_t)(( c        & 0x1F) * 255 / 31);
+    return (r << 16) | (g << 8) | b;
+}
+#define COL_BG     wp_hex24(TH().bg)
+#define COL_TXT    wp_hex24(TH().text)
+#define COL_MUTE   wp_hex24(TH().text_dim)
+#define COL_ACCENT wp_hex24(TH().accent)
+#define COL_GOLD   wp_hex24(TH().warn)
+#define COL_CARD   wp_hex24(TH().chrome_bg)
+#define COL_LINE   wp_hex24(TH().chrome_border)
+
 
 // Track B -- shared LVGL style system. Push the active theme's colours into the
 // central styles used by every menu/card. Call after any theme change.
@@ -1642,9 +1905,19 @@ static inline float wpb_lef32(const uint8_t *p) {
     return f;
 }
 
+// Two sizes, because a pack on the card is no longer read whole. `size` is the
+// pack's size on the card and bounds every offset in it; `mem` is how much of
+// it sits at `data` right now. For a pack baked into the firmware they are the
+// same number and nothing below behaves differently. For a pack on the card,
+// `mem` covers the header, the two tables and every name/metadata/thumbnail --
+// the ~46 KB a 12 MB pack actually needs resident -- while the tile bodies stay
+// on the card and are read one at a time. Every place that dereferences `data`
+// proves its range against `mem`; every place that only does arithmetic proves
+// it against `size`.
 struct WpBundle {
     const uint8_t *data;
     uint32_t size;
+    uint32_t mem;
     uint16_t maps;
     uint32_t tiles;
     uint32_t map_dir;
@@ -1665,22 +1938,28 @@ struct WpBundleMap {
 // Validate the header once, at boot. A bundle that is absent, truncated or from
 // another format version must fail here rather than produce a library of maps
 // that open onto nothing.
-static bool wp_bundle_open(WpBundle *b, const uint8_t *data, uint32_t size) {
+static bool wp_bundle_open(WpBundle *b, const uint8_t *data, uint32_t size,
+                           uint32_t mem) {
     if (!b) return false;
     memset(b, 0, sizeof(*b));
-    if (!data || size < WPB_HEADER) return false;
+    if (!data || mem < WPB_HEADER || mem > size) return false;
     if (!(data[0] == 'W' && data[1] == 'P' && data[2] == 'B' && data[3] == '1')) return false;
     if (wpb_le16(data + 4) != 1) return false;
     b->data     = data;
     b->size     = size;
+    b->mem      = mem;
     b->maps     = wpb_le16(data + 6);
     b->tiles    = wpb_le32(data + 8);
     b->map_dir  = wpb_le32(data + 12);
     b->tile_dir = wpb_le32(data + 16);
     b->str_off  = wpb_le32(data + 20);
-    if (b->map_dir  > size || (uint32_t)b->maps  * WPB_MAP_REC  > size - b->map_dir)  return false;
-    if (b->tile_dir > size || b->tiles * WPB_TILE_REC > size - b->tile_dir) return false;
-    if (b->str_off  > size) return false;
+    // The tables themselves have to be RAM: every lookup reads them. Tiles do
+    // not, so their records are only proved against the file (`size`).
+    // Division, not multiplication: a corrupt `tiles` field times 20 wraps a
+    // uint32 and would sail past this check on a 64 KB file.
+    if (b->map_dir  > mem || (uint32_t)b->maps  > (mem - b->map_dir)  / WPB_MAP_REC)  return false;
+    if (b->tile_dir > mem || b->tiles > (mem - b->tile_dir) / WPB_TILE_REC) return false;
+    if (b->str_off  > mem) return false;
 
     // Every offset is proved once, here. A blob that was truncated in transit or
     // half-rewritten by a bad bake then fails at boot with the library untouched,
@@ -1693,10 +1972,10 @@ static bool wp_bundle_open(WpBundle *b, const uint8_t *data, uint32_t size) {
         const uint16_t meta_len = wpb_le16(r + 8);
         const uint16_t pv_len   = wpb_le16(r + 10);
         const uint32_t pv_off   = wpb_le32(r + 12);
-        if (name_off >= size || meta_off >= size) return false;
-        if (!memchr(b->data + name_off, 0, size - name_off)) return false;
-        if (!meta_len || meta_len > size - meta_off) return false;
-        if (pv_len && (pv_off > size || pv_len > size - pv_off)) return false;
+        if (name_off >= mem || meta_off >= mem) return false;
+        if (!memchr(b->data + name_off, 0, mem - name_off)) return false;
+        if (!meta_len || meta_len > mem - meta_off) return false;
+        if (pv_len && (pv_off > mem || pv_len > mem - pv_off)) return false;
     }
     for (uint32_t i = 0; i < b->tiles; i++) {
         const uint8_t *r = b->data + b->tile_dir + i * WPB_TILE_REC;
@@ -1739,10 +2018,10 @@ static bool wp_bundle_map(const WpBundle *b, int i, WpBundleMap *out) {
     // truncated or hand-edited blob could otherwise point either one past the end
     // of flash and be believed. A name must be terminated; the metadata must lie
     // inside the blob, because its length is what bounds it.
-    if (name_off >= b->size || meta_off >= b->size) return false;
-    if (!memchr(b->data + name_off, 0, b->size - name_off)) return false;
-    if (!meta_len || meta_len > b->size - meta_off) return false;
-    if (prv_len && (prv_off > b->size || prv_len > b->size - prv_off)) return false;
+    if (name_off >= b->mem || meta_off >= b->mem) return false;
+    if (!memchr(b->data + name_off, 0, b->mem - name_off)) return false;
+    if (!meta_len || meta_len > b->mem - meta_off) return false;
+    if (prv_len && (prv_off > b->mem || prv_len > b->mem - prv_off)) return false;
     memset(out, 0, sizeof(*out));
     out->name       = (const char *)(b->data + name_off);
     out->meta       = (const char *)(b->data + meta_off);
@@ -1759,11 +2038,14 @@ static bool wp_bundle_map(const WpBundle *b, int i, WpBundleMap *out) {
 }
 
 // Binary search over the index, which the packer sorts by (map, z, x, y).
-// Returns a pointer INTO the blob: the tile bytes are already gzip'd MVT, so the
-// decoder reads them in place and nothing is copied until it inflates.
-static bool wp_bundle_tile(const WpBundle *b, int map, int z, int32_t x, int32_t y,
-                           const uint8_t **out, uint32_t *out_len) {
-    if (out) *out = nullptr;
+// Returns the tile's byte RANGE in the pack -- offset and length, not a pointer.
+// A pack on the card only keeps its index resident, so the range is what the
+// caller needs: inside `mem` it can be used in place, past `mem` it is a seek on
+// the open pack file. Asking "is there a tile here?" never needs the bytes at
+// all, and goes through this too.
+static bool wp_bundle_tile_span(const WpBundle *b, int map, int z, int32_t x, int32_t y,
+                                uint32_t *out_off, uint32_t *out_len) {
+    if (out_off) *out_off = 0;
     if (out_len) *out_len = 0;
     if (!b || !b->data || map < 0 || !b->tiles) return false;
     int32_t lo = 0, hi = (int32_t)b->tiles - 1;
@@ -1784,7 +2066,7 @@ static bool wp_bundle_tile(const WpBundle *b, int map, int z, int32_t x, int32_t
             const uint32_t off = wpb_le32(r + 12);
             const uint32_t len = wpb_le32(r + 16);
             if (off > b->size || len > b->size - off) return false;
-            if (out)     *out     = b->data + off;
+            if (out_off) *out_off = off;
             if (out_len) *out_len = len;
             return true;
         }
@@ -1907,12 +2189,285 @@ static bool wp_img_decode(const WpImg *im, uint16_t *dst, int dw, int dh) {
 static String     g_map_folder = "/WATCH/WayPoint";
 static String     g_map_dir_path;              // full SD path of the loaded map's dir
 static bool       g_map_loaded = false;
-// -1 = the loaded map came from the card (or nothing is loaded). Otherwise this
-// is the map's index in the built-in bundle, and every tile lookup goes to flash
-// instead of to the filesystem.
-static WpBundle   g_bundle;
+// -1 = the loaded map came from a folder of tile files. Otherwise this is the
+// map's index in a bundle, and every tile lookup goes to that blob instead of
+// to the filesystem.
+static WpBundle   g_bundle;          // the pack baked into the firmware (if any)
 static bool       g_bundle_ok = false;
 static int        g_map_bundle = -1;
+
+// -----------------------------------------------------------------------------
+//  Map packs on the CARD:  /WATCH/WayPoint/<name>.wpb
+//
+//  A .wpb is a WPB1 bundle that happens to live on the SD card instead of in
+//  the firmware. Only its HEAD is read into RAM: the header, the two index
+//  tables, the map names, the metadata.json text and the thumbnails. For a real
+//  12 MB pack that is 46 KB -- the tile bodies stay on the card and are read
+//  one at a time, when the renderer asks for them. The old reader held the
+//  whole pack in one allocation, which is why a 12.6 MB state pack was refused
+//  on a board with 8 MB of PSRAM that also owes 3 MB to the tile cache.
+//
+//  Everything above this is unchanged: same WPB1 validation, same binary
+//  search, same library card, same renderer. A card pack and a baked-in pack
+//  differ in exactly one place -- whether the offset the index returns is
+//  dereferenced or seeked to.
+// -----------------------------------------------------------------------------
+#define WP_SD_BUNDLE_SLOTS 3
+// How much of a pack may live in RAM: index, strings, thumbnails. Reached only
+// by a pack that stores its map details behind its tiles instead of in front.
+#define WP_SD_BUNDLE_MAX   (6u * 1024u * 1024u)
+// The whole pack on the card, tiles included. Only the scan pays for this.
+#define WP_SD_BUNDLE_FILE_MAX (64u * 1024u * 1024u)
+
+struct WpSdBundle {
+    String  path;                 // where the bytes came from (rescan key too)
+    uint8_t *data;                // the resident head, NOT the whole pack
+    uint32_t size;                // the file's size on the card
+    WpBundle b;
+    bool    ok;                   // validated WPB1, listed in the library
+    bool    broken;               // a .wpb was here but its bytes made no sense
+    const char *why;              // why it is broken, in words, for the card
+};
+static WpSdBundle g_sd_bundles[WP_SD_BUNDLE_SLOTS];
+static int        g_sd_bundle_count = 0;
+// Which pack the OPEN map came from: -1 = the baked one, >= 0 = g_sd_bundles[].
+static int8_t     g_map_bundle_slot = -1;
+
+// Which blob the open map reads from. One accessor, so the places that ask for
+// a tile, a zoom row or the map's header cannot disagree about which bundle
+// they mean.
+static const WpBundle *wp_bundle_of(int slot) {
+    if (slot >= 0) {
+        if (slot >= g_sd_bundle_count || !g_sd_bundles[slot].ok) return nullptr;
+        return &g_sd_bundles[slot].b;
+    }
+    return g_bundle_ok ? &g_bundle : nullptr;
+}
+static const WpBundle *wp_map_bundle() {
+    return wp_bundle_of(g_map_bundle_slot);
+}
+
+// Drop every card pack (a rescan, or a card pulled out from under us).
+static void wp_sd_bundles_reset() {
+    for (int i = 0; i < g_sd_bundle_count; i++) {
+        free(g_sd_bundles[i].data);
+        g_sd_bundles[i].data = nullptr;
+        g_sd_bundles[i].size = 0;
+        g_sd_bundles[i].ok = false;
+        g_sd_bundles[i].broken = false;
+        g_sd_bundles[i].why = nullptr;
+        g_sd_bundles[i].path = String();
+        g_sd_bundles[i].b = WpBundle();
+    }
+    g_sd_bundle_count = 0;
+}
+
+// How many bytes of the pack's head must be resident for every name, metadata
+// blob and thumbnail to be addressable. Returns 0 when `have` already covers
+// them all. A name has no stored length, so one that runs off the end asks for
+// 256 more bytes rather than being called broken -- the caller grows the head
+// and asks again.
+static uint32_t wp_sd_head_need(const uint8_t *buf, uint32_t have, uint16_t maps,
+                                uint32_t map_dir) {
+    uint32_t need = 0;
+    for (uint16_t i = 0; i < maps; i++) {
+        const uint8_t *r = buf + map_dir + (uint32_t)i * WPB_MAP_REC;
+        const uint32_t name_off = wpb_le32(r + 0);
+        const uint32_t meta_off = wpb_le32(r + 4);
+        const uint16_t meta_len = wpb_le16(r + 8);
+        const uint16_t pv_len   = wpb_le16(r + 10);
+        const uint32_t pv_off   = wpb_le32(r + 12);
+        uint32_t end = 0;
+        if (meta_len) end = meta_off + (uint32_t)meta_len;
+        if (pv_len) {
+            const uint32_t pv_end = pv_off + (uint32_t)pv_len;
+            if (pv_end > end) end = pv_end;
+        }
+        if (name_off >= have) {
+            // The name starts past what we have. One more byte would not prove
+            // it is terminated, so ask for room to read a whole short name.
+            const uint32_t want = name_off + 256;
+            if (want > need) need = want;
+        } else {
+            const uint8_t *nul = (const uint8_t*)memchr(buf + name_off, 0, have - name_off);
+            if (!nul) {
+                const uint32_t want = name_off + 256;
+                if (want > need) need = want;
+                if (end > need) need = end;
+                continue;
+            }
+            const uint32_t name_end = name_off + (uint32_t)(nul - (buf + name_off)) + 1;
+            if (name_end > end) end = name_end;
+        }
+        if (end > have && end > need) need = end;
+    }
+    return need;
+}
+
+// Read `len` bytes at `off` out of one card pack. The tile bodies live here:
+// the index says where they are, this fetches exactly one of them into the
+// caller's buffer, and nothing else of the pack is touched.
+static bool wp_sd_pack_read(int slot, uint32_t off, uint32_t len, uint8_t *dst) {
+    if (slot < 0 || slot >= g_sd_bundle_count || !dst || !len) return false;
+    const WpSdBundle &s = g_sd_bundles[slot];
+    if (!s.size || off > s.size || len > s.size - off) return false;
+    File f = SD_MMC.open(s.path, FILE_READ);
+    if (!f) return false;
+    bool ok = false;
+    if (f.seek(off)) ok = (f.read(dst, len) == (size_t)len);
+    f.close();
+    return ok;
+}
+
+// Read one .wpb's head, prove the header, and claim a slot for it. Returns the
+// slot, or -1 only when there is no slot left to claim.
+//
+// Every other failure still claims the slot and leaves a REASON in it, because
+// the library lists what is on the card: a pack the user copied over and cannot
+// open has to appear as a card that says why, not vanish. "Out of memory" in
+// particular has to read differently from "this is not a map pack" - the first
+// one is the app's fault and the second one is the file's.
+static int wp_sd_bundle_load(const String &path) {
+    if (g_sd_bundle_count >= WP_SD_BUNDLE_SLOTS) {
+        WP_LOG("[WPB] '%s' -- only %d pack slots, ignored\n",
+                path.c_str(), WP_SD_BUNDLE_SLOTS);
+        return -1;
+    }
+    const int slot = g_sd_bundle_count;
+    WpSdBundle &s = g_sd_bundles[slot];
+    s.path   = path;
+    s.data   = nullptr;
+    s.size   = 0;
+    s.b      = WpBundle();
+    s.ok     = false;
+    s.broken = true;
+    s.why    = "it could not be read";
+    g_sd_bundle_count++;      // from here on the pack is listed either way
+
+    File f = SD_MMC.open(path, FILE_READ);
+    if (!f || f.isDirectory()) {
+        if (f) f.close();
+        s.why = "the file could not be opened";
+        WP_LOG("[WPB] '%s' -- could not be opened\n", path.c_str());
+        return slot;
+    }
+    const uint32_t sz = (uint32_t)f.size();
+    s.size = sz;              // kept even on failure: the size is the diagnosis
+    if (sz < WPB_HEADER) {
+        f.close();
+        s.why = "the file is smaller than a map pack header";
+        WP_LOG("[WPB] '%s' -- %u bytes, under the %u byte header\n",
+                path.c_str(), (unsigned)sz, (unsigned)WPB_HEADER);
+        return slot;
+    }
+    if (sz > WP_SD_BUNDLE_FILE_MAX) {
+        f.close();
+        s.why = "it is larger than a map pack this build will open";
+        WP_LOG("[WPB] '%s' -- %u bytes, over the %u byte pack limit\n",
+                path.c_str(), (unsigned)sz, (unsigned)WP_SD_BUNDLE_FILE_MAX);
+        return slot;
+    }
+    // The header says where the two tables are, and the tables say where
+    // everything else is, so the head is grown in the order the format reveals
+    // it. Reading the header alone first also means a file that is not a pack
+    // costs 24 bytes to reject instead of the whole file.
+    uint8_t hdr[WPB_HEADER];
+    if (f.read(hdr, WPB_HEADER) != WPB_HEADER) {
+        f.close();
+        s.why = "its header could not be read";
+        WP_LOG("[WPB] '%s' -- short header read\n", path.c_str());
+        return slot;
+    }
+    if (!(hdr[0] == 'W' && hdr[1] == 'P' && hdr[2] == 'B' && hdr[3] == '1')) {
+        f.close();
+        s.why = "it does not begin with the letters WPB1, so it is not a map pack";
+        WP_LOG("[WPB] '%s' -- not a WPB1 pack\n", path.c_str());
+        return slot;
+    }
+    if (wpb_le16(hdr + 4) != 1) {
+        f.close();
+        s.why = "the header says WPB1 but in a format version this build does not read";
+        WP_LOG("[WPB] '%s' -- format version %u\n", path.c_str(), (unsigned)wpb_le16(hdr + 4));
+        return slot;
+    }
+    const uint16_t maps     = wpb_le16(hdr + 6);
+    const uint32_t tiles    = wpb_le32(hdr + 8);
+    const uint32_t map_dir  = wpb_le32(hdr + 12);
+    const uint32_t tile_dir = wpb_le32(hdr + 16);
+    const uint32_t str_off  = wpb_le32(hdr + 20);
+    if (map_dir > sz || (uint32_t)maps > (sz - map_dir) / WPB_MAP_REC ||
+        tile_dir > sz || tiles > (sz - tile_dir) / WPB_TILE_REC || str_off > sz) {
+        f.close();
+        s.why = "the header says WPB1 but an index inside points out of range";
+        WP_LOG("[WPB] '%s' -- index runs past the end of the file\n", path.c_str());
+        return slot;
+    }
+
+    uint32_t head = map_dir + (uint32_t)maps * WPB_MAP_REC;
+    if (tile_dir + tiles * WPB_TILE_REC > head) head = tile_dir + tiles * WPB_TILE_REC;
+    if (str_off + 1 > head) head = str_off + 1;
+    if (head > sz) head = sz;
+
+    // PSRAM first, internal heap only as a fallback. `have` is what was really
+    // read: the index and every string/thumbnail the map table names.
+    uint8_t *buf = nullptr;
+    uint32_t have = 0;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        if (head > WP_SD_BUNDLE_MAX) {
+            s.why = "it stores its index and map details behind its tiles, so opening it needs more memory than this build has";
+            break;
+        }
+        buf = (uint8_t*)ps_malloc(head);
+        if (!buf) buf = (uint8_t*)malloc(head);
+        if (!buf) {
+            s.why = "there was not enough free memory to hold its index";
+            break;
+        }
+        if (!f.seek(0) || f.read(buf, head) != (size_t)head) {
+            free(buf); buf = nullptr;
+            s.why = "the read stopped before the end of the file";
+            break;
+        }
+        have = head;
+        const uint32_t need = wp_sd_head_need(buf, have, maps, map_dir);
+        if (!need) break;                 // everything the header names is here
+        free(buf); buf = nullptr;
+        uint32_t next = (need > have) ? need : have + 1;
+        if (next > sz) next = sz;
+        if (next == have) {
+            s.why = "the header says WPB1 but an index inside points out of range";
+            break;
+        }
+        head = next;
+    }
+    f.close();
+    if (!buf) {
+        s.b = WpBundle();
+        WP_LOG("[WPB] '%s' -- %s\n", path.c_str(), s.why);
+        return slot;
+    }
+
+    s.data = buf;
+    s.ok   = wp_bundle_open(&s.b, buf, sz, have);
+    if (!s.ok) {
+        const bool looks = (buf[0] == 'W' && buf[1] == 'P' &&
+                            buf[2] == 'B' && buf[3] == '1');
+        s.why = looks
+              ? "the header says WPB1 but an index inside points out of range"
+              : "it does not begin with the letters WPB1, so it is not a map pack";
+        WP_LOG("[WPB] '%s' -- %s\n", path.c_str(), s.why);
+        free(s.data);
+        s.data = nullptr;
+        s.b    = WpBundle();
+        return slot;
+    }
+    s.broken = false;
+    s.why    = nullptr;
+    WP_LOG("[WPB] '%s' -- %d maps, %u tiles, %u bytes (%u of them in RAM)\n",
+            path.c_str(), (int)s.b.maps, (unsigned)s.b.tiles, (unsigned)sz,
+            (unsigned)have);
+    return slot;
+}
 
 static FMapMeta   g_meta;
 static FMapZoom   g_zooms[MAX_ZOOMS];
@@ -3063,7 +3618,9 @@ static void tile_probe_remember_missing(int32_t z, int32_t x, int32_t y) {
 static bool tile_exists_on_disk(int32_t z, int32_t x, int32_t y) {
     if (tile_probe_missing(z, x, y)) return false;
     if (g_map_bundle >= 0) {
-        if (wp_bundle_tile(&g_bundle, g_map_bundle, z, x, y, nullptr, nullptr))
+        // The index answers this; the tile bytes never leave the card for it.
+        const WpBundle *B = wp_map_bundle();
+        if (B && wp_bundle_tile_span(B, g_map_bundle, z, x, y, nullptr, nullptr))
             return true;
     } else if (mvt_tile_path(z, x, y).length() > 0) {
         return true;
@@ -3132,9 +3689,9 @@ static FMapTile *tile_load(int8_t z, int32_t x, int32_t y) {
     slot->last_use_ms = millis();
 
     if (g_map_bundle >= 0) {
-        const uint8_t *span = nullptr;
-        uint32_t len = 0;
-        if (!wp_bundle_tile(&g_bundle, g_map_bundle, z, x, y, &span, &len)) {
+        const WpBundle *B = wp_map_bundle();
+        uint32_t off = 0, len = 0;
+        if (!B || !wp_bundle_tile_span(B, g_map_bundle, z, x, y, &off, &len)) {
             // Not an error state to cache: a tile the bundle does not hold is
             // simply outside this map, exactly like a missing file on the card.
             MVT_LOG("[TILE] z=%d x=%d y=%d -- not in the bundle\n", (int)z, (int)x, (int)y);
@@ -3147,9 +3704,24 @@ static FMapTile *tile_load(int8_t z, int32_t x, int32_t y) {
             MVT_LOG("[TILE]   malloc(%u) FAILED -- skipping\n", (unsigned)sz);
             slot->loaded = true; slot->status = TILE_ST_OOM; return slot;
         }
-        memcpy(buf, span, sz);
-        MVT_LOG("[TILE] z=%d x=%d y=%d bundle bytes=%u\n",
-                (int)z, (int)x, (int)y, (unsigned)sz);
+        // Inside the resident head the bytes are already there (that is every
+        // tile of a baked-in pack, and none of a real card pack). Past it, the
+        // pack's own index gave the offset, so this is one seek + one read of
+        // exactly the tile asked for -- not a re-read of the pack.
+        if (off <= B->mem && len <= B->mem - off) {
+            memcpy(buf, B->data + off, sz);
+            MVT_LOG("[TILE] z=%d x=%d y=%d bundle bytes=%u\n",
+                    (int)z, (int)x, (int)y, (unsigned)sz);
+        } else if (wp_sd_pack_read(g_map_bundle_slot, off, len, buf)) {
+            MVT_LOG("[TILE] z=%d x=%d y=%d card pack bytes=%u off=%u\n",
+                    (int)z, (int)x, (int)y, (unsigned)sz, (unsigned)off);
+        } else {
+            MVT_LOG("[TILE] z=%d x=%d y=%d card pack read FAILED (off=%u len=%u)\n",
+                    (int)z, (int)x, (int)y, (unsigned)off, (unsigned)len);
+            free(buf);
+            slot->loaded = true; slot->status = TILE_ST_IOERR;
+            return slot;
+        }
     } else {
         path = mvt_tile_path(z, x, y);
         if (!path.length()) {
@@ -3477,7 +4049,10 @@ static bool mvt_meta_from_bundle(const WpBundleMap &bm, FMapMeta &out) {
 
 // Count tile files under one zoom dir (small helper for library metadata).
 static uint32_t count_tiles_at_zoom(const String &dir_path, uint8_t z) {
-    if (g_map_bundle >= 0) return wp_bundle_zoom_tiles(&g_bundle, g_map_bundle, z);
+    if (g_map_bundle >= 0) {
+        const WpBundle *B = wp_map_bundle();
+        return B ? wp_bundle_zoom_tiles(B, g_map_bundle, z) : 0;
+    }
     char zb[16]; snprintf(zb, sizeof(zb), "/%u", (unsigned)z);
     File zd = SD_MMC.open((dir_path + zb).c_str());
     if (!zd || !zd.isDirectory()) { if (zd) zd.close(); return 0; }
@@ -3509,6 +4084,7 @@ static void mvt_map_close() {
     g_map_loaded = false;
     g_map_dir_path = String();
     g_map_bundle = -1;          // the next open says where ITS tiles come from
+    g_map_bundle_slot = -1;
     poi_reset();
     g_zoom_count = 0;
     g_tile_count = 0;
@@ -3602,20 +4178,24 @@ static bool mvt_map_open(const String &dir_path) {
     return true;
 }
 
-// Open a built-in map. Everything after "where do the tiles come from" is the
-// same as a card map, so it is the same code: the ladder comes from the bundle
-// index instead of from probing folders, and the projection tail is shared.
-static bool mvt_map_open_bundle(int idx) {
+// Open a bundled map. sd_slot says WHICH pack (-1 = the one baked into the
+// firmware, >= 0 = a .wpb on the card); idx is the map inside it. Everything
+// after "where do the tiles come from" is the same as a folder map, so it is
+// the same code: the ladder comes from the bundle index instead of from probing
+// folders, and the projection tail is shared.
+static bool mvt_map_open_bundle(int sd_slot, int idx) {
     mvt_map_close();
+    const WpBundle *B = wp_bundle_of(sd_slot);
     WpBundleMap bm;
-    if (!g_bundle_ok || !wp_bundle_map(&g_bundle, idx, &bm)) return false;
+    if (!B || !wp_bundle_map(B, idx, &bm)) return false;
     if (!mvt_meta_from_bundle(bm, g_meta)) return false;
     g_map_dir_path = String();
-    g_map_bundle   = idx;
+    g_map_bundle     = idx;
+    g_map_bundle_slot = (int8_t)sd_slot;
     g_zoom_count = 0;
     g_tile_count = 0;
     for (uint8_t z = 0; z <= 22; z++) {
-        uint32_t tc = wp_bundle_zoom_tiles(&g_bundle, idx, z);
+        uint32_t tc = wp_bundle_zoom_tiles(B, idx, z);
         if (!tc) continue;
         if (g_zoom_count >= MAX_ZOOMS) {
             MVT_LOG("[MAP] bundle zoom list full at MAX_ZOOMS=%u - z%u ignored\n",
@@ -3628,10 +4208,12 @@ static bool mvt_map_open_bundle(int idx) {
     if (g_zoom_count == 0) {
         MVT_LOG("[MAP] bundle map %d holds no tiles -- aborting open\n", idx);
         g_map_bundle = -1;
+        g_map_bundle_slot = -1;
         return false;
     }
-    MVT_LOG("[MAP] bundled '%s': %u zooms, %u tiles\n",
-            bm.name, (unsigned)g_zoom_count, (unsigned)g_tile_count);
+    MVT_LOG("[MAP] %s '%s': %u zooms, %u tiles\n",
+            sd_slot >= 0 ? "card pack" : "built-in", bm.name,
+            (unsigned)g_zoom_count, (unsigned)g_tile_count);
     mvt_map_finish_open();
     return true;
 }
@@ -4215,11 +4797,17 @@ struct MapEntry {
     // once during the scan so the shelf and the card can say "recent" without
     // asking NVS again on every redraw.
     int8_t recent_rank = -1;
-    // Built-in maps: -1 means the tiles live on the card. Anything else is the
-    // map's index in the flash bundle, and it cannot be removed from the library
-    // because it is part of the firmware.
+    // Built-in maps: -1 means the tiles live on the card as loose folders.
+    // Anything else is the map's index in a PACK, and it cannot be removed from
+    // the library because it is the pack itself.
     int8_t bundle_id = -1;
     bool   builtin   = false;
+    // A .wpb on the card: which pack slot, or -1 when the tiles are loose files
+    // in a folder (or the pack is the one baked into the firmware).
+    int8_t sd_slot   = -1;
+    // Listed but unreadable: the file was there and its bytes were not a pack
+    // this firmware understands. The card says so rather than hiding it.
+    bool   broken    = false;
     // A thumbnail, already painted, sitting in flash. 0 = none: a map on the card
     // has no picture unless its pack ships one, and the card simply loses the
     // band rather than showing an empty box.
@@ -4489,8 +5077,90 @@ static bool dir_looks_like_mvt_map(const String &dir_path) {
     return false;
 }
 
+// One library card per map inside a card pack -- and, when the pack would not
+// parse, one card that says so. A file the user put on the card deserves to be
+// seen either way: hiding an unreadable WA.wpb is how a broken export looks
+// exactly like no file at all.
+static bool wp_sd_bundle_entries(int slot) {
+    WpSdBundle &s = g_sd_bundles[slot];
+    String file = s.path;
+    int slash = file.lastIndexOf('/');
+    if (slash >= 0) file = file.substring(slash + 1);
+
+    if (!s.ok) {
+        if (g_map_count_lib >= MAX_MAPS) return false;
+        MapEntry &e = g_maps[g_map_count_lib++];
+        e.path   = s.path;
+        e.title  = file;
+        char why[300];
+        const unsigned kb = (unsigned)((s.size + 1023u) / 1024u);
+        const char *reason = s.why ? s.why : "unknown reason";
+        // The WPB1 advice only helps when the bytes are not a pack. A file that
+        // IS a pack but could not be opened -- too large, index damaged, no RAM
+        // for its index -- must not be sent off to be re-exported, which is what
+        // this message used to do to a perfectly good pack that was simply big.
+        const char *hint = (s.why && strstr(s.why, "does not begin"))
+            ? "A map pack is one file that starts with the four bytes WPB1 - "
+              "re-export it, or copy a folder of {z}/{x}/{y}.pbf tiles instead."
+            : "It is a map pack, but this build cannot open it as it is. The "
+              "Developer screen lists every pack it scanned, and why it failed.";
+        if (s.size)
+            snprintf(why, sizeof(why),
+                     "%u KB on the card, and it could not be opened: %s.\n\n%s",
+                     kb, reason, hint);
+        else
+            snprintf(why, sizeof(why),
+                     "This file on the card could not be opened: %s.\n\n%s",
+                     reason, hint);
+        e.desc   = why;
+        e.has_meta = false;
+        e.builtin = false;
+        e.sd_slot = -1;
+        e.bundle_id = -1;
+        e.broken = true;
+        e.preview = nullptr;
+        e.preview_len = 0;
+        e.recent_rank = -1;
+        e.zmin = 10; e.zmax = 17;
+        e.min_lat = e.min_lon = e.max_lat = e.max_lon = 0;
+        return false;
+    }
+
+    int added = 0;
+    for (int i = 0; i < wp_bundle_map_count(&s.b) && g_map_count_lib < MAX_MAPS; i++) {
+        WpBundleMap bm;
+        if (!wp_bundle_map(&s.b, i, &bm)) continue;
+        FMapMeta m;
+        if (!mvt_meta_from_bundle(bm, m)) continue;
+        MapEntry &e = g_maps[g_map_count_lib];
+        // The '#index' distinguishes two maps inside one pack for the recent
+        // ring, and everything that SHOWS the path strips it again.
+        e.path   = s.path + "#" + String(i);
+        e.title  = m.title.length() ? m.title : String(bm.name);
+        e.desc   = m.desc.length()  ? m.desc
+                 : String("Map pack on the card (") + file + ")";
+        e.zmin = m.minzoom; e.zmax = m.maxzoom;
+        e.min_lat = m.min_lat; e.min_lon = m.min_lon;
+        e.max_lat = m.max_lat; e.max_lon = m.max_lon;
+        e.has_meta    = true;
+        e.builtin     = false;
+        e.sd_slot     = (int8_t)slot;
+        e.bundle_id   = (int8_t)i;
+        e.broken      = false;
+        e.preview     = bm.preview;
+        e.preview_len = bm.preview_len;
+        e.recent_rank = -1;
+        g_map_count_lib++;
+        added++;
+    }
+    return added > 0;
+}
+
 static void library_scan() {
     g_map_count_lib = 0;
+    // Packs are read once per scan. Dropping them here first means a second
+    // scan cannot keep pointing at bytes that were freed by the first.
+    wp_sd_bundles_reset();
 
     // Built-in maps come first, and they are listed even when the card is absent
     // or empty: they are the firmware's own library, not a copy of one.
@@ -4546,6 +5216,8 @@ static void library_scan() {
                         // not keep a pointer into flash from an earlier one.
                         e.bundle_id   = -1;
                         e.builtin     = false;
+                        e.sd_slot     = -1;
+                        e.broken      = false;
                         e.preview     = nullptr;
                         e.preview_len = 0;
                         e.recent_rank = -1;
@@ -4553,9 +5225,25 @@ static void library_scan() {
                     }
                 }
             }
+        } else {
+            // A pack on the card: /WATCH/WayPoint/<name>.wpb. The scan used to
+            // walk only directories, so a .wpb dropped beside them was never
+            // listed -- which is why WA.wpb did not exist as far as the
+            // library was concerned.
+            String n = ent.name();
+            int p = n.lastIndexOf('/'); if (p >= 0) n = n.substring(p + 1);
+            String ext;
+            int dot = n.lastIndexOf('.');
+            if (dot >= 0) { ext = n.substring(dot); ext.toLowerCase(); }
+            if (ext == ".wpb" && n.length() && n[0] != '.') {
+                const int slot = wp_sd_bundle_load(g_map_folder + "/" + n);
+                if (slot >= 0) wp_sd_bundle_entries(slot);
+            }
         }
         ent = d.openNextFile();
     }
+    // A card that only holds packs still gets an open handle closed behind us.
+    d.close();
 
     // The card can shadow the app. When the full pack is on the card as well as
     // the coarse copy in flash, both entries would carry the same name, and the
@@ -4623,345 +5311,652 @@ static void library_scan() {
     if (g_map_sel >= g_map_count_lib) g_map_sel = g_map_count_lib ? g_map_count_lib - 1 : 0;
 }
 
-// One plate: the shape every piece of chrome on this screen is cut from, so the
-// pill, the shelf chips and the card cannot end up with three corner radii.
-static void lib_plate(int x, int y, int w, int h, int r, uint16_t fill,
-                      uint16_t border) {
-    gfx->fillRoundRect(x, y, w, h, r, fill);
-    if (border) gfx->drawRoundRect(x, y, w, h, r, border);
+// =============================================================================
+//  Library screen  (LVGL)
+//
+//  The library is the one screen whose whole job is to answer "which map?", and
+//  it used to answer by painting the panel with Arduino_GFX: every rect, every
+//  wrapped line and every chip placed by hand. That worked, and it could not
+//  follow a theme, a font or a new card shape without all of that arithmetic
+//  being redone by hand - which is how it drifted into looking like a different
+//  app from the menus next to it.
+//
+//  It is LVGL now, like every other screen. The arithmetic that DECIDES things -
+//  which map is selected, which chips are in the window, how a long title is
+//  folded, where a zoom range sits on the ladder - stays in WP_LIB_ENGINE above,
+//  because that is the part the host tests pin down. This region only turns
+//  those answers into widgets.
+//
+//  The map itself is still drawn with Arduino_GFX (draw_map_frame). A vector
+//  tile layer turned into LVGL objects would be slower and larger for no gain:
+//  UI in LVGL, cartography in GFX. That split is deliberate, not a leftover.
+// =============================================================================
+#define WP_LIB_CHIPS    8       // widgets allocated; the shelf windows them
+#define WP_LIB_ART_W   350      // thumbnail band inside the card
+#define WP_LIB_ART_H    88
+
+static lv_obj_t *scr_library  = nullptr;
+static lv_obj_t *lib_chip[WP_LIB_CHIPS];
+static lv_obj_t *lib_chip_lbl[WP_LIB_CHIPS];
+static lv_obj_t *lib_card     = nullptr;   // the big slab
+static lv_obj_t *lib_art      = nullptr;   // picture, or its placeholder
+static lv_obj_t *lib_art_letter = nullptr;
+static lv_obj_t *lib_img      = nullptr;
+static lv_obj_t *lib_title    = nullptr;
+static lv_obj_t *lib_badge    = nullptr;
+static lv_obj_t *lib_sub      = nullptr;
+static lv_obj_t *lib_ladder   = nullptr;   // real span, not two numbers
+static lv_obj_t *lib_ladder_txt = nullptr;
+static lv_obj_t *lib_desc     = nullptr;
+static lv_obj_t *lib_count    = nullptr;
+static lv_obj_t *lib_empty    = nullptr;
+static lv_obj_t *lib_prev     = nullptr;
+static lv_obj_t *lib_next     = nullptr;
+static lv_obj_t *lib_open     = nullptr;
+static lv_obj_t *lib_open_lbl = nullptr;
+static lv_obj_t *lib_details  = nullptr;
+static lv_obj_t *lib_exit     = nullptr;
+static lv_obj_t *lib_toast    = nullptr;
+static lv_obj_t *lib_hint     = nullptr;
+
+static uint16_t      *lib_art_buf = nullptr;   // decoded thumbnail (PSRAM)
+static lv_img_dsc_t   lib_art_dsc;
+static uint32_t       lib_toast_until = 0;
+
+static void library_refresh();
+static void library_open_selected();
+
+// Dark ink on a bright accent, light ink on a dark one. The screen background is
+// one of the theme's two ends, so using it as the text colour keeps the primary
+// button legible in every theme instead of assuming the accent is always dark.
+static inline uint32_t lib_ink_on(uint16_t bg565) {
+    return (wp_luma565(bg565) > 150) ? 0x000000 : 0xFFFFFF;
 }
 
-// The card's thumbnail is a bitmap, so its corners are square unless they are
-// taken off. These four arcs paint card background over the corners the image
-// sticks out of -- cheaper than an alpha mask, and it matches the radius of every
-// other plate on the screen instead of inventing a second shape language.
-static void lib_mask_corners(int x, int y, int w, int h, int r, uint16_t bg) {
-    for (int i = 0; i < r; i++) {
-        const int dy = r - 1 - i;
-        const int dx = r - (int)sqrtf((float)(r * r - dy * dy));
-        if (dx <= 0) continue;
-        if (dx > w / 2) continue;
-        gfx->drawFastHLine(x, y + i, dx, bg);
-        gfx->drawFastHLine(x + w - dx, y + i, dx, bg);
-        gfx->drawFastHLine(x, y + h - 1 - i, dx, bg);
-        gfx->drawFastHLine(x + w - dx, y + h - 1 - i, dx, bg);
+// One small rounded plate. Every secondary action on this screen is cut from
+// this: same radius family as the card, same hairline border.
+static lv_obj_t *lib_pill(lv_obj_t *parent, int w, int h) {
+    lv_obj_t *b = lv_btn_create(parent);
+    lv_obj_remove_style_all(b);
+    lv_obj_set_size(b, w, h);
+    lv_obj_set_style_radius(b, h / 2, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(COL_CARD), 0);
+    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_set_style_border_color(b, lv_color_hex(COL_LINE), 0);
+    // Press feedback: the plate dims and tightens rather than moving, which on a
+    // 410 px panel reads as a press instead of the layout jumping.
+    lv_obj_set_style_bg_color(b, lv_color_hex(COL_ACCENT), LV_STATE_PRESSED);
+    lv_obj_set_style_bg_opa(b, LV_OPA_30, LV_STATE_PRESSED);
+    lv_obj_set_style_transform_width(b, -1, LV_STATE_PRESSED);
+    lv_obj_set_style_transform_height(b, -1, LV_STATE_PRESSED);
+    return b;
+}
+
+static lv_obj_t *lib_pill_text(lv_obj_t *b, const char *txt, uint32_t col,
+                               const lv_font_t *font) {
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_color(l, lv_color_hex(col), 0);
+    lv_obj_set_style_text_font(l, font, 0);
+    lv_obj_center(l);
+    return l;
+}
+
+// ---- callbacks -------------------------------------------------------------
+static void cb_lib_prev(lv_event_t*) {
+    g_map_sel = wp_lib_step(g_map_sel, g_map_count_lib, -1);
+    g_lib_redraw = true;
+}
+static void cb_lib_next(lv_event_t*) {
+    g_map_sel = wp_lib_step(g_map_sel, g_map_count_lib, +1);
+    g_lib_redraw = true;
+}
+static void cb_lib_open(lv_event_t*)   { library_open_selected(); }
+static void cb_lib_details(lv_event_t*) { g_lib_info = !g_lib_info; g_lib_redraw = true; }
+static void cb_lib_exit(lv_event_t*)   { return_to_launcher(); }
+static void cb_lib_chip(lv_event_t *e) {
+    const intptr_t i = (intptr_t)lv_event_get_user_data(e);
+    if (i >= 0 && i < g_map_count_lib) g_map_sel = (int)i;
+    g_lib_redraw = true;
+}
+
+// ---- build -----------------------------------------------------------------
+static void build_library() {
+    if (scr_library) return;
+    wp_sync_styles();
+
+    scr_library = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_library, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_bg_opa(scr_library, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(scr_library, 0, 0);
+    lv_obj_clear_flag(scr_library, LV_OBJ_FLAG_SCROLLABLE);
+
+    // ---- header: what this screen is, how much of it there is, and the way out
+    lv_obj_t *h = lv_label_create(scr_library);
+    lv_label_set_text(h, "MAP LIBRARY");
+    lv_obj_set_style_text_color(h, lv_color_hex(COL_MUTE), 0);
+    lv_obj_set_style_text_letter_space(h, 3, 0);
+    lv_obj_set_style_text_font(h, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(h, 18, 12);
+
+    lib_count = lv_label_create(scr_library);
+    lv_label_set_text(lib_count, "");
+    lv_obj_set_style_text_color(lib_count, lv_color_hex(COL_TXT), 0);
+    lv_obj_set_style_text_font(lib_count, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(lib_count, 136, 12);
+
+    // Leaving for LauncherOS used to be a 1.5 s hold of the BOOT button. It is a
+    // button now, in the corner, because the whole app is supposed to be reachable
+    // with a finger.
+    lib_exit = lib_pill(scr_library, 78, 30);
+    lv_obj_align(lib_exit, LV_ALIGN_TOP_RIGHT, -14, 6);
+    lib_pill_text(lib_exit, "EXIT", COL_MUTE, &lv_font_montserrat_12);
+    lv_obj_add_event_cb(lib_exit, cb_lib_exit, LV_EVENT_CLICKED, NULL);
+
+    // ---- shelf: the library as a strip of tabs -------------------------------
+    // Not an LVGL scroller: the window is chosen by WP_LIB_ENGINE and stepped by
+    // a swipe, so the shelf cannot scroll itself out from under the selection.
+    for (int i = 0; i < WP_LIB_CHIPS; i++) {
+        lv_obj_t *c = lib_pill(scr_library, 70, 32);
+        lv_obj_add_flag(c, LV_OBJ_FLAG_HIDDEN);
+        lib_chip[i] = c;
+        lib_chip_lbl[i] = lib_pill_text(c, "", COL_MUTE, &lv_font_montserrat_12);
+        lv_obj_add_event_cb(c, cb_lib_chip, LV_EVENT_CLICKED, (void*)(intptr_t)i);
     }
+
+    // ---- the card ------------------------------------------------------------
+    lib_card = lv_obj_create(scr_library);
+    lv_obj_remove_style_all(lib_card);
+    lv_obj_set_size(lib_card, LCD_WIDTH - 28, 276);
+    lv_obj_set_pos(lib_card, 14, 92);
+    lv_obj_set_style_radius(lib_card, 24, 0);
+    lv_obj_set_style_bg_color(lib_card, lv_color_hex(COL_CARD), 0);
+    lv_obj_set_style_bg_opa(lib_card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(lib_card, 1, 0);
+    lv_obj_set_style_border_color(lib_card, lv_color_hex(COL_LINE), 0);
+    lv_obj_set_style_pad_all(lib_card, 0, 0);
+    lv_obj_clear_flag(lib_card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(lib_card, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(lib_card, cb_lib_open, LV_EVENT_CLICKED, NULL);
+
+    lib_art = lv_obj_create(lib_card);
+    lv_obj_remove_style_all(lib_art);
+    lv_obj_set_size(lib_art, WP_LIB_ART_W, WP_LIB_ART_H);
+    lv_obj_set_pos(lib_art, 16, 16);
+    lv_obj_set_style_radius(lib_art, 16, 0);
+    lv_obj_set_style_bg_color(lib_art, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_bg_opa(lib_art, LV_OPA_COVER, 0);
+    lv_obj_set_style_clip_corner(lib_art, true, 0);
+    lv_obj_clear_flag(lib_art, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(lib_art, LV_OBJ_FLAG_CLICKABLE);
+
+    // A map with no baked picture still gets a face: its initial, in the hairline
+    // colour. Hiding the band instead would make those maps look broken.
+    lib_art_letter = lv_label_create(lib_art);
+    lv_label_set_text(lib_art_letter, "");
+    lv_obj_set_style_text_color(lib_art_letter, lv_color_hex(COL_LINE), 0);
+    lv_obj_set_style_text_font(lib_art_letter, &lv_font_montserrat_48, 0);
+    lv_obj_center(lib_art_letter);
+
+    lib_img = lv_img_create(lib_art);
+    lv_obj_set_pos(lib_img, 0, 0);
+    lv_obj_clear_flag(lib_img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(lib_img, LV_OBJ_FLAG_HIDDEN);
+
+    lib_title = lv_label_create(lib_card);
+    lv_label_set_text(lib_title, "");
+    lv_obj_set_style_text_color(lib_title, lv_color_hex(COL_TXT), 0);
+    lv_obj_set_style_text_font(lib_title, &lv_font_montserrat_28, 0);
+    lv_obj_set_pos(lib_title, 16, 112);
+    lv_obj_set_width(lib_title, 240);
+    lv_label_set_long_mode(lib_title, LV_LABEL_LONG_DOT);
+
+    // Recency or a missing metadata.json, said in the corner rather than in the
+    // description: the reader wants the map first and its caveats second.
+    lib_badge = lv_label_create(lib_card);
+    lv_label_set_text(lib_badge, "");
+    lv_obj_set_style_text_color(lib_badge, lv_color_hex(COL_GOLD), 0);
+    lv_obj_set_style_text_font(lib_badge, &lv_font_montserrat_12, 0);
+    lv_obj_align(lib_badge, LV_ALIGN_TOP_RIGHT, -16, 120);
+
+    lib_sub = lv_label_create(lib_card);
+    lv_label_set_text(lib_sub, "");
+    lv_obj_set_style_text_color(lib_sub, lv_color_hex(COL_MUTE), 0);
+    lv_obj_set_style_text_font(lib_sub, &lv_font_montserrat_12, 0);
+    lv_obj_set_pos(lib_sub, 16, 148);
+    lv_obj_set_width(lib_sub, WP_LIB_ART_W);
+    lv_label_set_long_mode(lib_sub, LV_LABEL_LONG_DOT);
+
+    // The zoom range as a span you can see the shape of. A one-level map still
+    // gets a visible bar, because a zero-width bar is a rendering bug to a reader.
+    lib_ladder = lv_bar_create(lib_card);
+    lv_obj_set_size(lib_ladder, WP_LIB_ART_W, 8);
+    lv_obj_set_pos(lib_ladder, 16, 186);
+    lv_bar_set_range(lib_ladder, WP_LIB_LADDER_LO, WP_LIB_LADDER_HI);
+    lv_obj_set_style_radius(lib_ladder, 4, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(lib_ladder, lv_color_hex(COL_BG), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(lib_ladder, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(lib_ladder, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(lib_ladder, lv_color_hex(COL_LINE), LV_PART_MAIN);
+    lv_obj_set_style_radius(lib_ladder, 4, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(lib_ladder, lv_color_hex(COL_ACCENT), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(lib_ladder, LV_OPA_COVER, LV_PART_INDICATOR);
+
+    lib_ladder_txt = lv_label_create(lib_card);
+    lv_label_set_text(lib_ladder_txt, "");
+    lv_obj_set_style_text_color(lib_ladder_txt, lv_color_hex(COL_MUTE), 0);
+    lv_obj_set_style_text_font(lib_ladder_txt, &lv_font_montserrat_12, 0);
+    lv_obj_align(lib_ladder_txt, LV_ALIGN_TOP_RIGHT, -16, 166);
+
+    lib_desc = lv_label_create(lib_card);
+    lv_label_set_text(lib_desc, "");
+    lv_obj_set_style_text_color(lib_desc, lv_color_hex(COL_TXT), 0);
+    lv_obj_set_style_text_font(lib_desc, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(lib_desc, 16, 204);
+    lv_obj_set_size(lib_desc, WP_LIB_ART_W, 60);
+    lv_label_set_long_mode(lib_desc, LV_LABEL_LONG_DOT);
+
+    // ---- the row under the card ---------------------------------------------
+    lib_prev = lib_pill(scr_library, 52, 52);
+    lv_obj_set_pos(lib_prev, 14, 376);
+    lv_obj_set_style_radius(lib_prev, LV_RADIUS_CIRCLE, 0);
+    lib_pill_text(lib_prev, LV_SYMBOL_LEFT, COL_TXT, &lv_font_montserrat_20);
+    lv_obj_add_event_cb(lib_prev, cb_lib_prev, LV_EVENT_CLICKED, NULL);
+
+    lib_next = lib_pill(scr_library, 52, 52);
+    lv_obj_set_pos(lib_next, LCD_WIDTH - 14 - 52, 376);
+    lv_obj_set_style_radius(lib_next, LV_RADIUS_CIRCLE, 0);
+    lib_pill_text(lib_next, LV_SYMBOL_RIGHT, COL_TXT, &lv_font_montserrat_20);
+    lv_obj_add_event_cb(lib_next, cb_lib_next, LV_EVENT_CLICKED, NULL);
+
+    lib_open = lv_btn_create(scr_library);
+    lv_obj_remove_style_all(lib_open);
+    lv_obj_set_size(lib_open, LCD_WIDTH - 76 - 52, 52);
+    lv_obj_set_pos(lib_open, 72, 376);
+    lv_obj_set_style_radius(lib_open, 26, 0);
+    lv_obj_set_style_bg_color(lib_open, lv_color_hex(COL_ACCENT), 0);
+    lv_obj_set_style_bg_opa(lib_open, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(lib_open, LV_OPA_80, LV_STATE_PRESSED);
+    lib_open_lbl = lib_pill_text(lib_open, "OPEN MAP", lib_ink_on(TH().accent),
+                                 &lv_font_montserrat_16);
+    lv_obj_add_event_cb(lib_open, cb_lib_open, LV_EVENT_CLICKED, NULL);
+
+    lib_details = lib_pill(scr_library, LCD_WIDTH - 28, 30);
+    lv_obj_set_pos(lib_details, 14, 436);
+    lib_pill_text(lib_details, "DETAILS", COL_MUTE, &lv_font_montserrat_12);
+    lv_obj_add_event_cb(lib_details, cb_lib_details, LV_EVENT_CLICKED, NULL);
+
+    // ---- empty state ---------------------------------------------------------
+    lib_empty = lv_label_create(scr_library);
+    lv_label_set_text(lib_empty,
+        "No maps yet.\n\n"
+        "Copy a map pack (.wpb) into /WATCH/WayPoint/, or a folder of\n"
+        "{z}/{x}/{y}.pbf tiles, and it appears here.\n\n"
+        "The folder is checked every time this screen opens.");
+    lv_label_set_long_mode(lib_empty, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(lib_empty, lv_color_hex(COL_MUTE), 0);
+    lv_obj_set_style_text_font(lib_empty, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_align(lib_empty, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(lib_empty, LCD_WIDTH - 70);
+    lv_obj_align(lib_empty, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_add_flag(lib_empty, LV_OBJ_FLAG_HIDDEN);
+
+    // ---- toast: a failure that stays on the screen it happened on -----------
+    lib_toast = lv_label_create(scr_library);
+    lv_label_set_long_mode(lib_toast, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lib_toast, LCD_WIDTH - 90);
+    lv_obj_set_style_text_align(lib_toast, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(lib_toast, lv_color_hex(0xF05040), 0);
+    lv_obj_set_style_text_font(lib_toast, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_bg_color(lib_toast, lv_color_hex(COL_CARD), 0);
+    lv_obj_set_style_bg_opa(lib_toast, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(lib_toast, 1, 0);
+    lv_obj_set_style_border_color(lib_toast, lv_color_hex(0xF05040), 0);
+    lv_obj_set_style_radius(lib_toast, 14, 0);
+    lv_obj_set_style_pad_all(lib_toast, 10, 0);
+    lv_obj_align(lib_toast, LV_ALIGN_BOTTOM_MID, 0, -120);
+    lv_obj_add_flag(lib_toast, LV_OBJ_FLAG_HIDDEN);
+
+    // ---- the gestures, in one line, because the map teaches them separately --
+    lib_hint = lv_label_create(scr_library);
+    lv_label_set_text(lib_hint, "swipe " LV_SYMBOL_LEFT LV_SYMBOL_RIGHT
+                                " browse   " LV_SYMBOL_UP " details   "
+                                LV_SYMBOL_DOWN " exit");
+    lv_obj_set_style_text_color(lib_hint, lv_color_hex(COL_MUTE), 0);
+    lv_obj_set_style_text_font(lib_hint, &lv_font_montserrat_12, 0);
+    lv_obj_align(lib_hint, LV_ALIGN_BOTTOM_MID, 0, -8);
 }
 
-// One bitmap, reused: the library draws one card at a time, so a second buffer
-// would only be a second thing to free.
-static uint16_t *g_lib_prev = nullptr;
-static int g_lib_prev_w = 0, g_lib_prev_h = 0;
-
-// Draw a wrapped paragraph between y and y_bottom, through the tested wrapper,
-// and return the y the next block should start at. Every caller that prints more
-// than a word goes through here: hand-rolled wrap loops are how a description
-// ends up half drawn and a panel ends up frozen.
-static int lib_para(int x, int y, int y_bottom, int width, const char *text,
-                    uint16_t col, uint8_t size) {
-    const int max_chars = width / (WP_LIB_CHAR_W * size);
-    if (max_chars < 1) return y;
-    char line[96];
-    gfx->setTextColor(col); gfx->setTextSize(size);
-    int from = 0;
-    while (from >= 0 && y + WP_LIB_CHAR_H * size <= y_bottom) {
-        from = wp_lib_wrap_line(text, from, max_chars, line, sizeof(line));
-        gfx->setCursor(x, y);
-        gfx->print(line);
-        y += WP_LIB_CHAR_H * size + 6;
-    }
-    return y;
-}
-
-// The four gestures, in the same voice as the map's own hints, so the two
-// screens do not have to be learned twice.
-static void library_draw_hints(const WpLibLayout *L, const ThemePalette &t) {
-    const char *hint[4];
-    hint[0] = "swipe left/right   browse the library";
-    hint[1] = "tap the card       open the map";
-    hint[2] = g_lib_info ? "swipe down         hide the details"
-                         : "swipe up           details of this map";
-    hint[3] = "hold 1.5 s         back to LauncherOS";
-    gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
-    int y = L->hint_y;
-    for (int i = 0; i < 4; i++) {
-        gfx->setCursor(L->card_x, y);
-        gfx->print(hint[i]);
-        y += L->hint_line;
-    }
-}
-
-static void library_draw() {
-    if (!g_lib_redraw) return;
+// ---- repaint ---------------------------------------------------------------
+// Everything below only ever writes values into widgets that already exist: the
+// refresh runs on every swipe, and rebuilding the screen there would churn the
+// LVGL heap until it fragmented.
+static void library_refresh() {
+    if (!scr_library) build_library();
     g_lib_redraw = false;
+
     const ThemePalette &t = TH();
-    gfx->fillScreen(t.bg);
+    const bool empty = (g_map_count_lib == 0);
 
-    WpLibLayout L;
-    wp_lib_layout(LCD_WIDTH, LCD_HEIGHT, &L);
+    // Theme can change while a card is on screen, so the colours are re-applied
+    // here rather than only at build time.
+    lv_obj_set_style_bg_color(scr_library, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_bg_color(lib_card, lv_color_hex(COL_CARD), 0);
+    lv_obj_set_style_border_color(lib_card, lv_color_hex(COL_LINE), 0);
+    lv_obj_set_style_bg_color(lib_art, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_text_color(lib_art_letter, lv_color_hex(COL_LINE), 0);
+    lv_obj_set_style_text_color(lib_title, lv_color_hex(COL_TXT), 0);
+    lv_obj_set_style_text_color(lib_sub, lv_color_hex(COL_MUTE), 0);
+    lv_obj_set_style_text_color(lib_badge, lv_color_hex(COL_GOLD), 0);
+    lv_obj_set_style_text_color(lib_desc, lv_color_hex(COL_TXT), 0);
+    lv_obj_set_style_text_color(lib_ladder_txt, lv_color_hex(COL_MUTE), 0);
+    lv_obj_set_style_bg_color(lib_ladder, lv_color_hex(COL_BG), LV_PART_MAIN);
+    lv_obj_set_style_border_color(lib_ladder, lv_color_hex(COL_LINE), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(lib_ladder, lv_color_hex(COL_ACCENT), LV_PART_INDICATOR);
+    lv_obj_set_style_text_color(lv_obj_get_child(lib_details, 0),
+                                lv_color_hex(COL_MUTE), 0);
+    lv_obj_set_style_text_color(lib_count, lv_color_hex(COL_TXT), 0);
 
-    // ---- header: the same status pill the map wears, because these two screens
-    //      sit next to each other in the flow and should look like one app ----
-    lib_plate(L.pill_x, L.pill_y, L.pill_w, L.pill_h, L.pill_h / 2,
-              t.chrome_bg, t.chrome_border);
-    const int ty = L.pill_y + (L.pill_h - WP_LIB_CHAR_H) / 2;
-    gfx->setTextColor(t.accent); gfx->setTextSize(1);
-    gfx->setCursor(L.pill_x + 12, ty);
-    gfx->print("MAP LIBRARY");
     char pos[32];
-    snprintf(pos, sizeof(pos), "%d / %d", g_map_count_lib ? g_map_sel + 1 : 0,
+    snprintf(pos, sizeof(pos), (g_map_count_lib == 1) ? "%d map" : "%d maps",
              g_map_count_lib);
-    gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
-    gfx->setCursor(L.pill_x + L.pill_w - 12 -
-                   (int)strlen(pos) * WP_LIB_CHAR_W, ty);
-    gfx->print(pos);
+    lv_label_set_text(lib_count, pos);
 
-    if (g_map_count_lib == 0) {
-        // Nothing to browse: say exactly where a map goes, in the same card a
-        // map is described in, so the screen teaches instead of scolding.
-        lib_plate(L.card_x, L.card_y, L.card_w, L.card_h, WP_LIB_CARD_R,
-                  t.chrome_bg, t.chrome_border);
-        gfx->setTextColor(t.text); gfx->setTextSize(2);
-        gfx->setCursor(L.card_x + 18, L.card_y + 16);
-        gfx->print("No maps yet");
-        int y = lib_para(L.card_x + 18, L.card_y + 48,
-                         L.card_y + L.card_h - 12, L.card_w - 36,
-                         "No maps at all. Bake one into the app with "
-                         "tools/bake_bundle.py, or copy a map under "
-                         "/WATCH/WayPoint/ with its tiles in {z}/{x}/{y}.pbf "
-                         "folders, then open this screen again.",
-                         t.text, 1);
-        y = lib_para(L.card_x + 18, y + 8, L.card_y + L.card_h - 12,
-                     L.card_w - 36,
-                     "A metadata.json beside the tiles names the map and gives "
-                     "its bounds and zoom range; without one the folder name is "
-                     "the title and the range is discovered when it opens.",
-                     t.text_dim, 1);
-        library_draw_hints(&L, t);
+    // The empty library has nothing to put on a card, so the card goes away and
+    // the explanation takes its place - the same screen, not a second one.
+    if (empty) {
+        lv_obj_add_flag(lib_card, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lib_open, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lib_prev, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lib_next, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lib_details, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(lib_empty, LV_OBJ_FLAG_HIDDEN);
+        for (int i = 0; i < WP_LIB_CHIPS; i++) lv_obj_add_flag(lib_chip[i], LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(lib_hint, "no map packs on the card");
         return;
     }
+    lv_obj_clear_flag(lib_card, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lib_empty, LV_OBJ_FLAG_HIDDEN);
 
     const MapEntry &e = g_maps[g_map_sel];
     const bool multi = (g_map_count_lib > 1);
-    // The arrow plates own the first 30 px of each side, so the title and the
-    // body start clear of them instead of running underneath.
-    const int pad_l = 16 + (multi ? L.arrow_w + 10 : 0);
-    const int pad_r = 16 + (multi ? L.arrow_w + 10 : 0);
-    const int inner = L.card_w - pad_l - pad_r;
 
-    // ---- shelf: the library as a strip of tabs, recent maps marked ----------
+    // ---- shelf --------------------------------------------------------------
     WpLibShelf S;
-    wp_lib_shelf(g_map_count_lib, g_map_sel, L.shelf_x, L.shelf_w,
+    wp_lib_shelf(g_map_count_lib, g_map_sel, 14, LCD_WIDTH - 28,
                  WP_LIB_SHELF_GAP, &S);
-    const int chip_chars = wp_lib_chip_chars(&S);
-    for (int i = 0; i < S.slots; i++) {
+    for (int i = 0; i < WP_LIB_CHIPS; i++) {
+        const bool used = (i < S.slots);
+        if (!used) { lv_obj_add_flag(lib_chip[i], LV_OBJ_FLAG_HIDDEN); continue; }
         const int idx = S.first + i;
-        const int cxp = wp_lib_chip_x(&S, i);
+        if (idx >= g_map_count_lib) { lv_obj_add_flag(lib_chip[i], LV_OBJ_FLAG_HIDDEN); continue; }
         const bool on = (idx == g_map_sel);
-        lib_plate(cxp, L.shelf_y, S.chip_w, L.shelf_h, L.shelf_h / 2,
-                  on ? t.chrome_bg : t.bg, on ? t.accent : t.chrome_border);
+        lv_obj_clear_flag(lib_chip[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_pos(lib_chip[i], wp_lib_chip_x(&S, i), 50);
+        lv_obj_set_size(lib_chip[i], S.chip_w, 32);
+        lv_obj_set_style_radius(lib_chip[i], 16, 0);
+        lv_obj_set_style_bg_color(lib_chip[i],
+            lv_color_hex(on ? COL_ACCENT : COL_CARD), 0);
+        lv_obj_set_style_border_color(lib_chip[i],
+            lv_color_hex(on ? COL_ACCENT : COL_LINE), 0);
         char lbl[48];
-        wp_lib_fold(g_maps[idx].title.c_str(), lbl, sizeof(lbl), chip_chars);
-        gfx->setTextColor(on ? t.accent : t.text_dim); gfx->setTextSize(1);
-        gfx->setCursor(cxp + WP_LIB_CHIP_PAD,
-                       L.shelf_y + (L.shelf_h - WP_LIB_CHAR_H) / 2);
-        gfx->print(lbl);
-        if (g_maps[idx].recent_rank >= 0)     // a recent map keeps its mark
-            gfx->fillCircle(cxp + S.chip_w - 8, L.shelf_y + 8, 2, t.warn);
-    }
-    // There is more library in that direction: the strip is a window on a shelf,
-    // and saying so is cheaper than eight dots that mean nothing at this size.
-    gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
-    if (S.first > 0) {
-        gfx->setCursor(L.shelf_x - 8, L.shelf_y + (L.shelf_h - WP_LIB_CHAR_H) / 2);
-        gfx->print("<");
-    }
-    if (S.first + S.slots < g_map_count_lib) {
-        gfx->setCursor(L.shelf_x + L.shelf_w + 1,
-                       L.shelf_y + (L.shelf_h - WP_LIB_CHAR_H) / 2);
-        gfx->print(">");
+        wp_lib_fold(g_maps[idx].title.c_str(), lbl, sizeof(lbl),
+                    wp_lib_chip_chars(&S));
+        lv_label_set_text(lib_chip_lbl[i], lbl);
+        lv_obj_set_style_text_color(lib_chip_lbl[i],
+            lv_color_hex(on ? lib_ink_on(t.accent) : COL_MUTE), 0);
     }
 
     // ---- the card -----------------------------------------------------------
-    lib_plate(L.card_x, L.card_y, L.card_w, L.card_h, WP_LIB_CARD_R,
-              t.chrome_bg, t.accent);
+    if (multi) {
+        lv_obj_clear_flag(lib_prev, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(lib_next, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(lib_prev, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lib_next, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_obj_clear_flag(lib_open, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(lib_details, LV_OBJ_FLAG_HIDDEN);
 
-    // What the title cannot say lives in the corner: how recently this map was
-    // opened, or that there is no metadata describing it.
+    // A pack this build could not read is not hidden and not silently retried:
+    // the card is red, says why, and the OPEN button refuses instead of lying.
+    lv_obj_set_style_border_color(lib_card,
+        lv_color_hex(e.broken ? 0xF05040 : COL_LINE), 0);
+    lv_obj_set_style_border_width(lib_card, e.broken ? 2 : 1, 0);
+
+    lv_label_set_text(lib_title, e.title.c_str());
     char badge[24];
-    wp_lib_badge(e.recent_rank, e.has_meta ? 1 : 0, badge, sizeof(badge));
-    const int badge_w = (int)strlen(badge) * WP_LIB_CHAR_W + 16;
-    char title[64];
-    wp_lib_fold(e.title.c_str(), title, sizeof(title),
-                (inner - (badge[0] ? badge_w + 10 : 0)) / 12);
-    gfx->setTextColor(t.text); gfx->setTextSize(2);
-    gfx->setCursor(L.card_x + pad_l, L.card_y + 16);
-    gfx->print(title);
-    if (badge[0]) {
-        const int bx = L.card_x + L.card_w - pad_r - badge_w;
-        lib_plate(bx, L.card_y + 15, badge_w, 18, 5, t.bg, t.chrome_border);
-        gfx->setTextColor(e.recent_rank >= 0 ? t.warn : t.text_dim);
-        gfx->setTextSize(1);
-        gfx->setCursor(bx + 8, L.card_y + 20);
-        gfx->print(badge);
-    }
+    if (e.broken)                   snprintf(badge, sizeof(badge), "unreadable");
+    else if (e.sd_slot >= 0)        snprintf(badge, sizeof(badge), "map pack");
+    else wp_lib_badge(e.recent_rank, e.has_meta ? 1 : 0, badge, sizeof(badge));
+    lv_label_set_text(lib_badge, badge);
+    lv_obj_set_style_text_color(lib_badge,
+        lv_color_hex(e.broken ? 0xF05040
+                   : e.recent_rank >= 0 ? COL_GOLD : COL_MUTE), 0);
 
-    // Where the map comes from: the title can say anything, this is the folder
-    // (or the fact that there is no folder, because it is in the firmware).
-    char dir[80], dir_lbl[96];
-    String dn = e.path;
-    int slash = dn.lastIndexOf('/');
-    if (slash >= 0) dn = dn.substring(slash + 1);
-    wp_lib_fold(dn.c_str(), dir, sizeof(dir), inner / WP_LIB_CHAR_W - 5);
-    if (e.builtin) snprintf(dir_lbl, sizeof(dir_lbl), "in the app  %s", dir);
-    else           snprintf(dir_lbl, sizeof(dir_lbl), "dir %s", dir);
-    gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
-    gfx->setCursor(L.card_x + pad_l, L.card_y + 46);
-    gfx->print(dir_lbl);
+    // Where the map comes from. A pack on the card names its file; a wildcard
+    // path or the firmware's own index would be a debug string wearing a label.
+    char sub[96];
+    String base = e.path;
+    int hash = base.indexOf('#');
+    if (hash >= 0) base = base.substring(0, hash);
+    int slash = base.lastIndexOf('/');
+    if (slash >= 0) base = base.substring(slash + 1);
+    if (e.broken)          snprintf(sub, sizeof(sub), "%s", base.c_str());
+    else if (e.sd_slot >= 0) snprintf(sub, sizeof(sub), "pack  %s", base.c_str());
+    else if (e.builtin)    snprintf(sub, sizeof(sub), "in the app  %s", base.c_str());
+    else                   snprintf(sub, sizeof(sub), "dir  %s", base.c_str());
+    lv_label_set_text(lib_sub, sub);
 
-    // ---- the detail ladder: the zoom range as a span you can see the shape of,
-    //      rather than two numbers you have to compare ------------------------
-    const int ly = L.card_y + 68;
-    char zrange[24];
-    if (e.has_meta) snprintf(zrange, sizeof(zrange), "z%u-%u",
-                             (unsigned)e.zmin, (unsigned)e.zmax);
-    else            snprintf(zrange, sizeof(zrange), "on open");
-    const int zrw = (int)strlen(zrange) * WP_LIB_CHAR_W;
-    gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
-    gfx->setCursor(L.card_x + pad_l, ly);
-    gfx->print("detail");
-    gfx->setTextColor(e.has_meta ? t.text : t.text_dim);
-    gfx->setCursor(L.card_x + L.card_w - pad_r - zrw, ly);
-    gfx->print(zrange);
-    const int track_x = L.card_x + pad_l + 7 * WP_LIB_CHAR_W + 6;
-    const int track_w = L.card_x + L.card_w - pad_r - zrw - 10 - track_x;
-    if (track_w > 10) {
-        gfx->drawRect(track_x, ly, track_w, 8, t.chrome_border);
-        if (e.has_meta) {
-            int z0, z1;
-            wp_lib_ladder_span(e.zmin, e.zmax, track_w - 2, &z0, &z1);
-            gfx->fillRect(track_x + 1 + z0, ly + 1, z1 - z0, 6, t.accent);
-        }
-    }
-
-    // ---- the map itself, as a picture ---------------------------------------
-    // Baked at 320x96 and scaled to whatever the text column is this time, so
-    // the band survives the arrows appearing and the card narrowing.
-    int body_y = ly + 18;
+    // ---- thumbnail ----------------------------------------------------------
+    bool art_ok = false;
     if (e.preview && e.preview_len) {
-        const int bh = 88;
-        if (g_lib_prev_w != inner || g_lib_prev_h != bh) {
-            free(g_lib_prev);
-            g_lib_prev = (uint16_t*)ps_malloc((size_t)inner * bh * sizeof(uint16_t));
-            g_lib_prev_w = g_lib_prev ? inner : 0;
-            g_lib_prev_h = g_lib_prev ? bh : 0;
+        if (!lib_art_buf) {
+            lib_art_buf = (uint16_t*)ps_malloc((size_t)WP_LIB_ART_W * WP_LIB_ART_H *
+                                              sizeof(uint16_t));
         }
         WpImg im;
-        if (g_lib_prev && wp_img_open(&im, e.preview, e.preview_len) &&
-            wp_img_decode(&im, g_lib_prev, inner, bh)) {
-            const int bx = L.card_x + pad_l, byy = ly + 16;
-            gfx->draw16bitRGBBitmap(bx, byy, g_lib_prev, inner, bh);
-            lib_mask_corners(bx, byy, inner, bh, 14, t.chrome_bg);
-            gfx->drawRoundRect(bx, byy, inner, bh, 14, t.chrome_border);
-            body_y = byy + bh + 10;
+        if (lib_art_buf && wp_img_open(&im, e.preview, e.preview_len) &&
+            wp_img_decode(&im, lib_art_buf, WP_LIB_ART_W, WP_LIB_ART_H)) {
+            if (!lib_art_dsc.data) {
+                lib_art_dsc.header.always_zero = 0;
+                lib_art_dsc.header.w = WP_LIB_ART_W;
+                lib_art_dsc.header.h = WP_LIB_ART_H;
+                lib_art_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+                lib_art_dsc.data_size = (uint32_t)WP_LIB_ART_W * WP_LIB_ART_H *
+                                        sizeof(lv_color_t);
+                lib_art_dsc.data = (const uint8_t*)lib_art_buf;
+            }
+            lv_img_set_src(lib_img, &lib_art_dsc);
+            // The descriptor points at a buffer we rewrote in place, so LVGL has
+            // no way to know the pixels changed: say so.
+            lv_obj_invalidate(lib_img);
+            art_ok = true;
         }
     }
-
-    // ---- body: the description, or - with the details panel open - what the
-    //      description leaves out --------------------------------------------
-    const int by_max = L.card_y + L.card_h - 12;
-    if (g_lib_info) {
-        // The first line of the details is "where this map actually is". For a
-        // built-in map that is the firmware, not a path, and printing
-        // "@bundle/WA" at the user would be a debug string wearing a label.
-        int by = lib_para(L.card_x + pad_l, body_y, by_max, inner,
-                          e.builtin ? "in the app, no card needed" : e.path.c_str(),
-                          t.text, 1);
-        if (e.has_meta && (e.min_lat != 0 || e.max_lat != 0)) {
-            char bb[96];
-            snprintf(bb, sizeof(bb), "bounds %.4f,%.4f to %.4f,%.4f",
-                     (double)e.min_lon, (double)e.min_lat,
-                     (double)e.max_lon, (double)e.max_lat);
-            by = lib_para(L.card_x + pad_l, by, by_max, inner, bb,
-                          t.text_dim, 1);
-        } else if (e.has_meta) {
-            by = lib_para(L.card_x + pad_l, by, by_max, inner,
-                          "bounds are not stated in metadata.json",
-                          t.text_dim, 1);
-        } else {
-            by = lib_para(L.card_x + pad_l, by, by_max, inner,
-                          "No metadata.json, so the folder name is the title "
-                          "and the zoom range is discovered when the map opens.",
-                          t.text_dim, 1);
-        }
+    if (art_ok) {
+        lv_obj_clear_flag(lib_img, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(lib_art_letter, LV_OBJ_FLAG_HIDDEN);
     } else {
-        lib_para(L.card_x + pad_l, body_y, by_max, inner, e.desc.c_str(),
-                 t.text, 1);
+        lv_obj_add_flag(lib_img, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(lib_art_letter, LV_OBJ_FLAG_HIDDEN);
+        char initial[2] = { (char)toupper((unsigned char)e.title[0]), 0 };
+        lv_label_set_text(lib_art_letter, initial);
     }
 
-    // ---- the arrow plates: drawn from the same width the hit test uses, so the
-    //      plate you press is the plate that steps ---------------------------
+    // ---- the ladder ---------------------------------------------------------
+    char zr[24];
+    if (e.has_meta) snprintf(zr, sizeof(zr), "z%u-%u",
+                             (unsigned)e.zmin, (unsigned)e.zmax);
+    else            snprintf(zr, sizeof(zr), "range on open");
+    lv_label_set_text(lib_ladder_txt, zr);
+    if (e.has_meta && !e.broken) {
+        lv_obj_clear_flag(lib_ladder, LV_OBJ_FLAG_HIDDEN);
+        lv_bar_set_start_value(lib_ladder, (int16_t)e.zmin, LV_ANIM_OFF);
+        lv_bar_set_value(lib_ladder, (int16_t)e.zmax, LV_ANIM_OFF);
+    } else {
+        lv_obj_add_flag(lib_ladder, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    // ---- what the card says -------------------------------------------------
+    // The primary button wears the refusal too: an accent-coloured "OPEN MAP"
+    // over a card that cannot be opened is a button that lies about its state.
+    if (e.broken) {
+        lv_obj_set_style_bg_color(lib_open, lv_color_hex(COL_CARD), 0);
+        lv_obj_set_style_border_width(lib_open, 1, 0);
+        lv_obj_set_style_border_color(lib_open, lv_color_hex(0xF05040), 0);
+        lv_obj_set_style_text_color(lib_open_lbl, lv_color_hex(0xF05040), 0);
+    } else {
+        lv_obj_set_style_bg_color(lib_open, lv_color_hex(COL_ACCENT), 0);
+        lv_obj_set_style_border_width(lib_open, 0, 0);
+        lv_obj_set_style_text_color(lib_open_lbl, lv_color_hex(lib_ink_on(t.accent)), 0);
+    }
+
+    if (e.broken) {
+        lv_label_set_text(lib_desc, e.desc.c_str());
+        lv_label_set_text(lib_open_lbl, "NOT A MAP PACK");
+    } else if (g_lib_info) {
+        // The details are "where this really is", which for a baked map is the
+        // firmware and not a path - and for a card pack is the file plus the map
+        // inside it, because one pack can hold several.
+        char info[220];
+        int n = snprintf(info, sizeof(info), "%s\n", e.path.c_str());
+        if (e.has_meta && (e.min_lat != 0 || e.max_lat != 0)) {
+            n += snprintf(info + n, sizeof(info) - (size_t)n,
+                          "bounds %.4f,%.4f to %.4f,%.4f",
+                          (double)e.min_lon, (double)e.min_lat,
+                          (double)e.max_lon, (double)e.max_lat);
+        } else if (!e.has_meta) {
+            snprintf(info + n, sizeof(info) - (size_t)n,
+                     "no metadata.json, so the folder name is the title");
+        }
+        lv_label_set_text(lib_desc, info);
+        lv_label_set_text(lib_open_lbl, "OPEN MAP");
+    } else {
+        lv_label_set_text(lib_desc, e.desc.c_str());
+        lv_label_set_text(lib_open_lbl, "OPEN MAP");
+    }
+
     if (multi) {
-        const int ay = L.card_y + L.card_h / 2 - L.arrow_h / 2;
-        const int aw = L.arrow_w - 4;
-        lib_plate(L.card_x + 4, ay, aw, L.arrow_h, aw / 2, t.bg, t.accent);
-        gfx->setTextColor(t.accent); gfx->setTextSize(2);
-        gfx->setCursor(L.card_x + 4 + aw / 2 - 6, ay + L.arrow_h / 2 - 8);
-        gfx->print("<");
-        const int rx = L.card_x + L.card_w - 4 - aw;
-        lib_plate(rx, ay, aw, L.arrow_h, aw / 2, t.bg, t.accent);
-        gfx->setCursor(rx + aw / 2 - 6, ay + L.arrow_h / 2 - 8);
-        gfx->print(">");
+        snprintf(pos, sizeof(pos), "%d / %d", g_map_sel + 1, g_map_count_lib);
+        lv_label_set_text(lib_count, pos);
     }
+    lv_label_set_text(lib_hint, g_lib_info
+        ? "swipe " LV_SYMBOL_DOWN " hide the details"
+        : "swipe " LV_SYMBOL_LEFT LV_SYMBOL_RIGHT " browse   "
+          LV_SYMBOL_UP " details   " LV_SYMBOL_DOWN " exit");
+}
 
-    // ---- where you are in the library --------------------------------------
-    const int pw = (int)strlen(pos) * WP_LIB_CHAR_W + 24;
-    const int px = L.card_x + L.card_w / 2 - pw / 2;
-    lib_plate(px, L.row_y, pw, L.row_h, L.row_h / 2, t.chrome_bg,
-              t.chrome_border);
-    gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
-    gfx->setCursor(px + 12, L.row_y + (L.row_h - WP_LIB_CHAR_H) / 2);
-    gfx->print(pos);
-    if (S.slots < g_map_count_lib) {
-        char more[32];
-        snprintf(more, sizeof(more), "%d more", g_map_count_lib - S.slots);
-        gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
-        gfx->setCursor(px + pw + 10, L.row_y + (L.row_h - WP_LIB_CHAR_H) / 2);
-        gfx->print(more);
+// A failed open reports itself on the card that failed. Nothing else on the
+// screen moves, so the next tap is unambiguous.
+static void library_open_failed() {
+    if (!scr_library) build_library();
+    lv_label_set_text(lib_toast, "Could not open that map.\n"
+                                 "Check the pack, or the tile folders inside it.");
+    lv_obj_clear_flag(lib_toast, LV_OBJ_FLAG_HIDDEN);
+    lib_toast_until = millis() + 3200;
+    g_lib_redraw = true;
+}
+
+static void library_tick(uint32_t now) {
+    if (lib_toast_until && (int32_t)(now - lib_toast_until) >= 0) {
+        lib_toast_until = 0;
+        if (lib_toast) lv_obj_add_flag(lib_toast, LV_OBJ_FLAG_HIDDEN);
     }
-
-    library_draw_hints(&L, t);
 }
 
 // =============================================================================
 //  Splash
+//
+//  The first screen, and the only one that runs before the library exists. It is
+//  an LVGL screen like every other so the boot looks like the app it is booting
+//  into, and it carries a real progress bar: setup() reports each stage here
+//  instead of the panel showing a hand-drawn frame loop and then a hard cut.
 // =============================================================================
-static void splash_show() {
-    int cx = LCD_WIDTH/2, cy = LCD_HEIGHT/2;
-    const ThemePalette &t = TH();
-    for (int f = 0; f < 22; f++) {
-        gfx->fillScreen(t.bg);
-        // isometric grid pulse
-        int step = 20 + (f % 6) * 2;
-        for (int x = -LCD_HEIGHT; x < LCD_WIDTH; x += step) {
-            gfx->drawLine(x, 0, x + LCD_HEIGHT, LCD_HEIGHT, t.chrome_bg);
-        }
-        // pin
-        gfx->fillCircle(cx, cy - 20, 22, t.accent);
-        gfx->fillCircle(cx, cy - 20, 10, t.bg);
-        gfx->fillTriangle(cx - 22, cy - 8, cx + 22, cy - 8, cx, cy + 30, t.accent);
-        // ring
-        gfx->drawCircle(cx, cy - 20, 40 + (f % 8), t.warn);
-        gfx->setTextColor(t.text); gfx->setTextSize(2);
-        gfx->setCursor(cx - 100, LCD_HEIGHT - 90);
-        gfx->print("WAYPOINT / OS");
-        gfx->setTextColor(t.text_dim); gfx->setTextSize(1);
-        gfx->setCursor(cx - 62, LCD_HEIGHT - 66);
-        gfx->print("offline vector nav");
-        delay(35);
-    }
+static lv_obj_t *scr_splash       = nullptr;
+static lv_obj_t *lbl_splash_stage = nullptr;
+static lv_obj_t *bar_splash       = nullptr;
+
+static void splash_begin() {
+    if (scr_splash) return;
+    scr_splash = lv_obj_create(NULL);
+    lv_obj_set_style_bg_color(scr_splash, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_bg_opa(scr_splash, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(scr_splash, 0, 0);
+    lv_obj_clear_flag(scr_splash, LV_OBJ_FLAG_SCROLLABLE);
+
+    // The mark: a GPS arrow in the accent colour. Drawn from a font glyph so it
+    // costs nothing to draw and follows the theme, which a baked bitmap would not.
+    lv_obj_t *mark = lv_label_create(scr_splash);
+    lv_label_set_text(mark, LV_SYMBOL_GPS);
+    lv_obj_set_style_text_color(mark, lv_color_hex(COL_ACCENT), 0);
+    lv_obj_set_style_text_font(mark, &lv_font_montserrat_48, 0);
+    lv_obj_align(mark, LV_ALIGN_TOP_MID, 0, 96);
+
+    lv_obj_t *word = lv_label_create(scr_splash);
+    lv_label_set_text(word, "WAYPOINT");
+    lv_obj_set_style_text_color(word, lv_color_hex(COL_TXT), 0);
+    lv_obj_set_style_text_font(word, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_letter_space(word, 2, 0);
+    lv_obj_align(word, LV_ALIGN_TOP_MID, 0, 190);
+
+    lv_obj_t *os = lv_label_create(scr_splash);
+    lv_label_set_text(os, "O S");
+    lv_obj_set_style_text_color(os, lv_color_hex(COL_ACCENT), 0);
+    lv_obj_set_style_text_font(os, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_letter_space(os, 7, 0);
+    lv_obj_align(os, LV_ALIGN_TOP_MID, 0, 226);
+
+    lv_obj_t *tag = lv_label_create(scr_splash);
+    lv_label_set_text(tag, "offline vector nav");
+    lv_obj_set_style_text_color(tag, lv_color_hex(COL_MUTE), 0);
+    lv_obj_set_style_text_font(tag, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_letter_space(tag, 2, 0);
+    lv_obj_align(tag, LV_ALIGN_TOP_MID, 0, 258);
+
+    bar_splash = lv_bar_create(scr_splash);
+    lv_obj_set_size(bar_splash, 220, 6);
+    lv_obj_align(bar_splash, LV_ALIGN_TOP_MID, 0, 330);
+    lv_bar_set_range(bar_splash, 0, 100);
+    lv_bar_set_value(bar_splash, 0, LV_ANIM_OFF);
+    lv_obj_set_style_radius(bar_splash, 3, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar_splash, lv_color_hex(COL_CARD), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bar_splash, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar_splash, 3, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(bar_splash, lv_color_hex(COL_ACCENT), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(bar_splash, LV_OPA_COVER, LV_PART_INDICATOR);
+
+    lbl_splash_stage = lv_label_create(scr_splash);
+    lv_label_set_text(lbl_splash_stage, "starting");
+    lv_obj_set_style_text_color(lbl_splash_stage, lv_color_hex(COL_MUTE), 0);
+    lv_obj_set_style_text_font(lbl_splash_stage, &lv_font_montserrat_12, 0);
+    lv_obj_align(lbl_splash_stage, LV_ALIGN_TOP_MID, 0, 344);
+
+    lv_obj_t *foot = lv_label_create(scr_splash);
+    lv_label_set_text(foot, "swipe  tap  hold");
+    lv_obj_set_style_text_color(foot, lv_color_hex(COL_LINE), 0);
+    lv_obj_set_style_text_font(foot, &lv_font_montserrat_12, 0);
+    lv_obj_align(foot, LV_ALIGN_BOTTOM_MID, 0, -24);
+
+    lv_scr_load(scr_splash);
 }
 
+// Advance the bar and pump LVGL while the stage runs. The pump is the point: the
+// panel has to keep drawing during a card scan that takes a second, or the boot
+// looks like a crash for exactly as long as it is doing the most work.
+static void splash_stage(const char *msg, uint8_t pct) {
+    if (!scr_splash) return;
+    if (msg && lbl_splash_stage) lv_label_set_text(lbl_splash_stage, msg);
+    if (bar_splash) lv_bar_set_value(bar_splash, pct, LV_ANIM_ON);
+    // Long enough for the bar to visibly move between two stages, short enough
+    // that four stages are not most of a second of boot.
+    const uint32_t until = millis() + 90;
+    while ((int32_t)(millis() - until) < 0) {
+        lv_timer_handler();
+        delay(4);
+    }
+}
 // =============================================================================
 //  Map render pipeline
 // =============================================================================
@@ -5016,6 +6011,7 @@ static void prefetch_ring(int8_t z, int32_t ctx, int32_t cty) {
 }
 
 static void draw_map_frame();  // fwd
+static void map_recentre();    // fwd: the status pill is the only way to ask now
 static bool g_need_map_redraw = true;
 
 // -----------------------------------------------------------------------------
@@ -5651,7 +6647,16 @@ static bool map_chrome_tap(int32_t x, int32_t y, uint32_t now) {
             return true;
         }
     }
-    return (y < WP_TOP_STRIP_H + 4);           // the status pill swallows taps
+    if (y < WP_TOP_STRIP_H + 4) {
+        // Tapping the status pill re-centres the camera. The pill is already the
+        // "where am I" plate, so making it the re-centre control costs no new
+        // chrome - and it replaces what used to be a medium hold of the BOOT
+        // button, which nothing on screen ever mentioned.
+        map_recentre();
+        wp_map_hint_show(now);
+        return true;
+    }
+    return false;
 }
 
 // Scale bar (bottom-centre): a real-world reference distance, on a plate so it
@@ -6008,24 +7013,6 @@ static lv_obj_t *lbl_poi_title=nullptr, *lbl_poi_body=nullptr;
 
 // A blank LVGL screen used to "hide" LVGL when we are in raw-gfx modes
 static lv_obj_t *scr_blank = nullptr;
-
-// LVGL speaks 0xRRGGBB; this file otherwise speaks RGB565. One conversion means
-// an LVGL screen cannot quietly keep a colour from the theme before last -- which
-// is how the menus stayed cyan and #141414 through four theme changes while the
-// map around them turned green.
-static inline uint32_t wp_hex24(uint16_t c) {
-    const uint32_t r = (uint32_t)(((c >> 11) & 0x1F) * 255 / 31);
-    const uint32_t g = (uint32_t)(((c >> 5)  & 0x3F) * 255 / 63);
-    const uint32_t b = (uint32_t)(( c        & 0x1F) * 255 / 31);
-    return (r << 16) | (g << 8) | b;
-}
-#define COL_BG     wp_hex24(TH().bg)
-#define COL_TXT    wp_hex24(TH().text)
-#define COL_MUTE   wp_hex24(TH().text_dim)
-#define COL_ACCENT wp_hex24(TH().accent)
-#define COL_GOLD   wp_hex24(TH().warn)
-#define COL_CARD   wp_hex24(TH().chrome_bg)
-#define COL_LINE   wp_hex24(TH().chrome_border)
 
 static void enter_mode(AppMode m);
 
@@ -6591,6 +7578,34 @@ static void dev_refresh() {
         g_has_imu?"ok":"--", g_has_mag?"ok":"--",
         (double)g_heading, (double)g_marked_heading);
 
+    // Map packs, because "my .wpb does not show up" is the one question this
+    // screen can actually answer. A pack is listed here whether or not it
+    // parsed, with its size - so a 0-byte copy and a wrong-format export look
+    // different instead of both looking like an empty library.
+    int used = (int)strlen(buf);
+    if (used < (int)sizeof(buf) - 40) {
+        used += snprintf(buf + used, sizeof(buf) - (size_t)used,
+                         "\nPacks: %d on card, built-in %s\n",
+                         g_sd_bundle_count, g_bundle_ok ? "ok" : "none");
+        for (int i = 0; i < g_sd_bundle_count && used < (int)sizeof(buf) - 80; i++) {
+            const WpSdBundle &pk = g_sd_bundles[i];
+            String n = pk.path;
+            int sl = n.lastIndexOf('/'); if (sl >= 0) n = n.substring(sl + 1);
+            if (pk.ok)
+                // The second figure is what the pack cost in RAM: its index,
+                // strings and thumbnail. The rest of it stayed on the card.
+                used += snprintf(buf + used, sizeof(buf) - (size_t)used,
+                                 "  %s  %luK  %d maps  %lu tiles  %luK in RAM\n", n.c_str(),
+                                 (unsigned long)(pk.size / 1024), (int)pk.b.maps,
+                                 (unsigned long)pk.b.tiles,
+                                 (unsigned long)(pk.b.mem / 1024));
+            else
+                used += snprintf(buf + used, sizeof(buf) - (size_t)used,
+                                 "  %s  %luK  NOT a WPB1 pack\n", n.c_str(),
+                                 (unsigned long)(pk.size / 1024));
+        }
+    }
+
     lv_label_set_text(lbl_dev, buf);
 }
 
@@ -6599,6 +7614,7 @@ static void cb_tools_enter_mode(lv_event_t *e) {
     AppMode *tp = (AppMode*)lv_event_get_user_data(e);
     if (tp) enter_mode(*tp);
 }
+static void cb_tools_launcher(lv_event_t*) { return_to_launcher(); }
 static void cb_tools_breadcrumb(lv_event_t *e) {
     (void)e;
     breadcrumb_add((int32_t)g_cam_x, (int32_t)g_cam_y);
@@ -6697,9 +7713,13 @@ static void build_tools() {
         { LV_SYMBOL_EYE_OPEN, "Explore",    MODE_EXPLORE, nullptr },
         { LV_SYMBOL_DOWNLOAD, "Breadcrumb", MODE_MAP,     cb_tools_breadcrumb },
     };
-    // And the one screen that is about the app rather than the map.
+    // And the screens that are about the app rather than the map. "Launcher"
+    // belongs here rather than behind a button: it is the one exit that has to
+    // be findable from anywhere, and Tools is reachable from the map with one
+    // hold.
     static const ToolTile system_tiles[] = {
-        { LV_SYMBOL_SETTINGS, "Developer", MODE_DEV, nullptr },
+        { LV_SYMBOL_SETTINGS, "Developer", MODE_DEV,  nullptr },
+        { LV_SYMBOL_POWER,    "Launcher",  MODE_TOOLS, cb_tools_launcher },
     };
 
     tools_add_row(col, "THE MAP", map_tiles,
@@ -7002,8 +8022,20 @@ static void enter_mode(AppMode m) {
             break;
 
         case MODE_LIBRARY:
-            build_blank();
-            lv_scr_load(scr_blank);
+            // LVGL owns this screen now, so it is loaded like every menu rather
+            // than painted over a blank one.
+            build_library();
+            lv_scr_load(scr_library);
+            // Re-read the card on the way in. A pack copied on a PC while the
+            // watch was running is otherwise invisible until the next reboot --
+            // which is indistinguishable, from the outside, from "it does not
+            // load this map". Nothing is open at this point (library_close()
+            // closes first), so the packs being freed underneath are unreferenced.
+            if (lib_hint) {
+                lv_label_set_text(lib_hint, "checking the card...");
+                lv_refr_now(NULL);
+            }
+            library_scan();
             g_lib_redraw = true;
             break;
         case MODE_TOOLS:      build_tools();     lv_scr_load(scr_tools); break;
@@ -7031,16 +8063,18 @@ static void library_open_selected() {
     if (g_map_sel < 0 || g_map_sel >= g_map_count_lib) return;
     const MapEntry &ent = g_maps[g_map_sel];
     const String &path = ent.path;
-    // A built-in map opens from flash, a card map from its folder, and both end
-    // up in the same loader -- so the map screen cannot tell which it is looking
-    // at, and neither can the tests.
-    const bool opened = (ent.bundle_id >= 0) ? mvt_map_open_bundle(ent.bundle_id)
-                                             : mvt_map_open(path);
+    // Three kinds of map, one loader: a pack baked into the firmware, a pack on
+    // the card (a .wpb), and a folder of loose tiles. The map screen cannot
+    // tell which it is looking at, and neither can the renderer.
+    const bool opened = ent.broken  ? false
+                      : ent.sd_slot >= 0 ? mvt_map_open_bundle(ent.sd_slot, ent.bundle_id)
+                      : ent.builtin      ? mvt_map_open_bundle(-1, ent.bundle_id)
+                                         : mvt_map_open(path);
     if (!opened) {
-        // stay in library, flash red border
-        gfx->drawRoundRect(18, 108, LCD_WIDTH - 36, 244, 16, 0xF800);
-        delay(500);
-        g_lib_redraw = true;
+        // Stay in the library and say so on the card itself: a hard-edged red
+        // rectangle around a fixed box was drawn where the LVGL card used to
+        // be, which left nothing to actually read.
+        library_open_failed();
         return;
     }
     saved_load();
@@ -7074,12 +8108,14 @@ static void library_close() {
 }
 
 // =============================================================================
-//  Interaction: BOOT button state machine + touch (pan / pinch / long-press)
+//  Interaction: touch only (pan / pinch / swipe / tap / hold)
+//
+//  There is no button state machine here any more. The BOOT button used to be a
+//  parallel set of controls - step the carousel, open, zoom in and out, back one
+//  level, back to the launcher - which meant half the app was invisible unless
+//  you knew to press a button on the side of a watch. Every one of those now has
+//  a gesture, and the screen says which.
 // =============================================================================
-static uint32_t g_btn_down_t = 0;
-static uint32_t g_last_release_t = 0;
-static bool     g_btn_long_fired = false;
-
 // Touch. The recogniser classifies the gesture (see wp_gesture_feed); what lives
 // here is only the state the map keeps between samples - the previous pan sample
 // and the scale and pixel the current pinch started from. The coasting and
@@ -7187,11 +8223,6 @@ static void map_zoom_at(float factor, int32_t ax, int32_t ay, uint32_t now) {
     anim_start(WP_ANIM_ZOOM, WP_ZOOM_MS, ax, ay, 0, 0, to, now);
 }
 
-// Zoom about the middle of the screen: what the BOOT button asks for.
-static void map_zoom(float factor) {
-    map_zoom_at(factor, g_screen_cx, g_screen_cy, millis());
-}
-
 // Recentre: back to the bounds centre at the middle of the ladder, as a move
 // rather than a cut. cam_bounds_target() is the same maths cam_reset_to_bounds()
 // uses, so the animated destination and the instantaneous one cannot disagree.
@@ -7204,59 +8235,6 @@ static void map_recentre() {
             (unsigned)tz, ts);
 }
 
-
-static void handle_boot_button(uint32_t now) {
-    bool btn = (digitalRead(BOOT_BTN_PIN) == LOW);
-    if (btn) wp_mark_activity(now);
-    if (btn) {
-        if (!g_btn_down_t) { g_btn_down_t = now; g_btn_long_fired = false; }
-        else {
-            uint32_t held = now - g_btn_down_t;
-            // Escape hatch: >= 4 s hold = direct return to LauncherOS from ANY mode.
-            if (held >= 4000) {
-                return_to_launcher();
-            }
-            // Regular 1.5 s hold = back one level (matches MapOS behaviour).
-            if (!g_btn_long_fired && held > 1500) {
-                g_btn_long_fired = true;
-                if (g_mode == MODE_MAP)              library_close();
-                else if (g_mode == MODE_LIBRARY)     return_to_launcher();
-                else                                 enter_mode(MODE_MAP);
-            }
-        }
-    } else if (g_btn_down_t) {
-        uint32_t held = now - g_btn_down_t;
-        g_btn_down_t = 0;
-        if (g_btn_long_fired) { /* handled */ }
-        else if (held >= 400 && held <= 1200) {
-            if (g_mode == MODE_LIBRARY) library_open_selected();
-            else if (g_mode == MODE_MAP) map_recentre();
-            g_last_release_t = 0;
-        } else if (held < 400) {
-            if (g_last_release_t && (now - g_last_release_t) < 500) {
-                // double tap
-                if (g_mode == MODE_LIBRARY) {
-                    g_map_sel = (g_map_sel - 1 + g_map_count_lib) % (g_map_count_lib?g_map_count_lib:1);
-                    g_lib_redraw = true;
-                } else if (g_mode == MODE_MAP) {
-                    map_zoom(1.0f / 1.5f);
-                }
-                g_last_release_t = 0;
-            } else {
-                g_last_release_t = now;
-            }
-        }
-    }
-    if (g_last_release_t && (now - g_last_release_t) > 500) {
-        if (g_mode == MODE_LIBRARY) {
-            g_map_sel = (g_map_sel + 1) % (g_map_count_lib?g_map_count_lib:1);
-            g_lib_redraw = true;
-        } else if (g_mode == MODE_MAP) {
-            map_zoom(1.5f);
-        }
-        g_last_release_t = 0;
-    }
-}
 
 // What a POI's icon family is called, in words. The card used to print the raw
 // enum ("type: 3") and the world coordinates, which is a debugging view of a
@@ -7341,37 +8319,17 @@ static void library_gesture(uint16_t ev, uint32_t now) {
     if (ev & WG_SWIPE_DOWN)  { if (g_lib_info)  { g_lib_info = false; g_lib_redraw = true; } }
     if (ev & WG_LONG_PRESS)  { g_lib_info = !g_lib_info; g_lib_redraw = true; }
 
-    if (ev & WG_TAP) {
-        // The tap is classified against the rects the screen was drawn with, so
-        // the plates that look like arrows step the carousel, a chip is a
-        // shortcut straight to its map, and the card opens the one you see. The
-        // old version kept its own copy of the card geometry, which had drifted
-        // away from the painter's.
-        WpLibLayout L;
-        wp_lib_layout(LCD_WIDTH, LCD_HEIGHT, &L);
-        WpLibShelf S;
-        wp_lib_shelf(n, g_map_sel, L.shelf_x, L.shelf_w, WP_LIB_SHELF_GAP, &S);
-        int chip = -1;
-        switch (wp_lib_hit(g_gesture.sx, g_gesture.sy, n, &L, &S, &chip)) {
-            case WP_LIB_HIT_PREV:
-                g_map_sel = wp_lib_step(g_map_sel, n, -1);
-                g_lib_redraw = true;
-                break;
-            case WP_LIB_HIT_NEXT:
-                g_map_sel = wp_lib_step(g_map_sel, n, +1);
-                g_lib_redraw = true;
-                break;
-            case WP_LIB_HIT_SHELF:
-                if (chip >= 0 && chip < n) g_map_sel = chip;
-                g_lib_redraw = true;
-                break;
-            case WP_LIB_HIT_OPEN:
-                library_open_selected();
-                return;
-            default:
-                if (g_lib_info) { g_lib_info = false; g_lib_redraw = true; }
-                break;
-        }
+    // Taps are not handled here any more: the card, the arrows and the shelf are
+    // real LVGL widgets, so LVGL already knows what was pressed and calls the
+    // handler for exactly that object. Doing it twice is how a tap on "open"
+    // also stepped the carousel.
+
+    if (ev & WG_SWIPE_DOWN) {
+        // Swipe down from the top edge leaves for LauncherOS. The library is the
+        // bottom of this app, so "down" is the way out - and it is a flick that
+        // starts at the edge, so an ordinary tap can never throw the app away.
+        if (g_gesture.edge == WP_EDGE_TOP && g_gesture.dur <= WP_EDGE_SWIPE_MAX_MS)
+            return_to_launcher();
     }
 }
 
@@ -7561,10 +8519,16 @@ static void menu_gesture(uint16_t ev, uint32_t now) {
         menu_cycle((ev & WG_SWIPE_LEFT) ? 1 : -1);
 }
 
+static uint32_t g_ev_count = 0;      // completed gestures, for the heartbeat
+
 static void handle_map_touch(uint32_t now) {
     const uint16_t ev = g_gesture_events;
     g_gesture_events = WG_NONE;
     if (ev || g_tch_pressed) wp_mark_activity(now);
+    if (ev) {
+        g_ev_count++;
+        WP_LOG("[touch] ev=0x%04x mode=%d\n", (unsigned)ev, (int)g_mode);
+    }
 
     if (g_mode == MODE_LIBRARY) { library_gesture(ev, now); return; }
     if (g_mode == MODE_MAP)     { map_gesture(ev, now);     return; }
@@ -7684,38 +8648,45 @@ void setup() {
                 "by tilemaker from OSM data:\n\n"
                 "  OpenStreetMap -> .osm.pbf -> tilemaker -> MVT -> WaypointOS\n\n"
                 "Structure:\n"
-                "  /WATCH/WayPoint/<MapName>/{z}/{x}/{y}.pbf   (or .mvt)\n"
+                "  /WATCH/WayPoint/<MapName>.wpb               (a map PACK: one file)\n"
+                "  /WATCH/WayPoint/<MapName>/{z}/{x}/{y}.pbf   (loose tiles, or .mvt)\n"
                 "  /WATCH/WayPoint/<MapName>/metadata.json     (optional)\n"
                 "  /WATCH/WayPoint/saved/                      (per-map saves)\n"
                 "  /WATCH/WayPoint/breadcrumbs.csv\n"
                 "  /WATCH/WayPoint/bearings.txt\n"
                 "  /WATCH/WayPoint/loc.txt        (single line: LAT,LON for sun calc)\n\n"
+                "A .wpb pack is one file holding every tile of a map plus its\n"
+                "metadata and thumbnail: faster to copy, and it appears in the\n"
+                "library as one card. A pack that this build cannot read is still\n"
+                "listed, marked unreadable, rather than silently ignored.\n\n"
                 "metadata.json (all fields optional):\n"
                 "  { \"name\":\"Byford\", \"description\":\"...\",\n"
                 "    \"bounds\":\"minLon,minLat,maxLon,maxLat\",\n"
                 "    \"minzoom\":10, \"maxzoom\":17 }\n\n"
                 "Controls - gestures first (see WaypointOS.ino header):\n"
-                "  library: swipe < > browse, tap the card to open,\n"
-                "           swipe ^ for details, swipe v to put them away\n"
+                "  library: swipe < > browse, tap the card or OPEN MAP to open,\n"
+                "           tap the chips to jump, swipe ^ for details,\n"
+                "           swipe v from the TOP EDGE to leave for LauncherOS,\n"
+                "           or tap EXIT in the corner\n"
                 "  map:     drag pans (it coasts on after a flick), double tap\n"
                 "           zooms in where you tapped, 2-finger tap zooms out,\n"
                 "           2-finger drag pinches about your fingers, tap picks\n"
                 "           a POI, hold opens Tools, a flick from the bottom\n"
-                "           strip opens Tools, one from the top goes back\n"
+                "           strip opens Tools, one from the top goes back,\n"
+                "           tap the status pill to re-centre\n"
                 "  menus:   tap a row, swipe v back a level, swipe < > between\n"
                 "           the screens that belong together\n"
-                "  BOOT tap        - library: next map / map: zoom in\n"
-                "  BOOT 2x tap     - library: prev / map: zoom out\n"
-                "  BOOT hold 0.5s  - library: open / map: recentre\n"
-                "  BOOT hold 1.5s  - back one level (sub -> map -> lib -> launcher)\n"
-                "  BOOT hold 4s    - direct return to LauncherOS from anywhere\n"
+                "  hold the side button for 1.2 s at any time to leave for\n"
+                "  LauncherOS (the same exit BookOS has, and the only control\n"
+                "  that does not depend on the screen answering)\n"
 
             );
             rf.close();
         }
     }
 
-    time_restore_from_launcher();
+    time_restore_from_nvs();
+    WP_LOG("[boot] clock %s\n", g_tp_valid ? "live" : "not set yet");
     read_loc();
     imu_init();
 
@@ -7734,12 +8705,19 @@ void setup() {
     String last_map  = p.getString("last_map", "");
     p.end();
 
-    splash_show();
+    // The splash is a real screen with a real progress bar, and every stage of
+    // the boot reports into it: reading packs off a card is the one slow part of
+    // startup, and a bar that actually moves is the difference between "booting"
+    // and "hung".
+    splash_begin();
+    WP_LOG("[boot] splash up\n");
+    splash_stage("settings", 15);
 
     // Open the built-in bundle once. A bundle that is missing, truncated or from
     // another version fails here and leaves the library exactly as it was.
 #ifdef WP_HAS_BUNDLE
-    g_bundle_ok = wp_bundle_open(&g_bundle, WP_MAPS_BUNDLE, WP_MAPS_BUNDLE_BYTES);
+    g_bundle_ok = wp_bundle_open(&g_bundle, WP_MAPS_BUNDLE, WP_MAPS_BUNDLE_BYTES,
+                                 WP_MAPS_BUNDLE_BYTES);
     if (g_bundle_ok)
         MVT_LOG("[BUNDLE] %d built-in maps, %u tiles, %u bytes\n",
                 wp_bundle_map_count(&g_bundle), (unsigned)g_bundle.tiles,
@@ -7747,8 +8725,16 @@ void setup() {
     else
         MVT_LOG("[BUNDLE] wp_maps_bundle.h is present but not a WPB1 bundle\n");
 #endif
+#ifdef WP_HAS_BUNDLE
+    WP_LOG("[boot] built-in bundle %s\n", g_bundle_ok ? "ok" : "failed");
+#else
+    WP_LOG("[boot] built-in bundle: none in this build\n");
+#endif
+    splash_stage("reading the card", 55);
 
     library_scan();
+    WP_LOG("[boot] library: %d map(s)\n", (int)g_map_count_lib);
+    splash_stage("building the library", 85);
 
     // pre-select last opened
     if (last_map.length()) {
@@ -7758,9 +8744,27 @@ void setup() {
     }
 
     build_blank();
-    lv_scr_load(scr_blank);
+    build_library();
     g_mode = MODE_LIBRARY;
     g_lib_redraw = true;
+    library_refresh();          // fill the card before anything is shown
+    lv_scr_load(scr_library);
+    splash_stage("ready", 100);
+    // Paint the library before the splash goes away, so the hand-off is a cut
+    // between two finished frames instead of a black flicker between them.
+    lv_refr_now(NULL);
+    if (scr_splash) { lv_obj_del(scr_splash); scr_splash = nullptr; }
+
+    // If the touch controller never answered, say so ON the screen rather than
+    // presenting a library that silently ignores every finger. That was the
+    // "frozen after the splash" report: a live app, a dead panel.
+    if (!g_touch_ok && lib_toast) {
+        lv_label_set_text(lib_toast, "Touch did not start.\n"
+                                     "Hold the side button to leave.");
+        lv_obj_clear_flag(lib_toast, LV_OBJ_FLAG_HIDDEN);
+        lib_toast_until = millis() + 8000;
+    }
+    WP_LOG("[boot] ready -- touch %s\n", g_touch_ok ? "ok" : "DEAD");
 
     // Kick display brightness to full and seed the idle timer so we don't
     // instantly dim while the user is still looking at the splash/library.
@@ -7774,7 +8778,14 @@ void loop() {
     lv_timer_handler();
     uint32_t now = millis();
 
-    handle_boot_button(now);
+    // BookOS parity: the side button is the way out that does not depend on the
+    // screen answering at all.
+    wp_exit_button_poll();
+
+    // Touch only. The BOOT button used to be a second, invisible set of
+    // controls - next map, open, zoom, back - which meant the screen was only
+    // half usable without finding it. Everything it did now has a tap, a swipe
+    // or a hold on the screen itself.
     handle_map_touch(now);
 
     // Sensors: 12 Hz
@@ -7837,13 +8848,17 @@ void loop() {
     static uint32_t dev_t = 0;
     if (g_mode == MODE_DEV && now - dev_t > 500) { dev_t = now; dev_refresh(); }
 
-    // Raw-gfx frames (map & library)
+    // Raw-gfx frames: the map only. Every other screen - the library included -
+    // is LVGL and repaints itself, so there is nothing to push here for it.
     // Frame-rate throttle: cap draw_map_frame() at ~30 fps so many small pan
     // events between frames coalesce into a single redraw. The gesture handler
     // keeps g_cam_x/y up to date every touch tick, so the *camera* never lags
     // -- only the render is capped, which is what actually costs time & battery.
     #define WP_MIN_FRAME_MS  33         // ~30 fps
-    if (g_mode == MODE_LIBRARY) library_draw();
+    if (g_mode == MODE_LIBRARY) {
+        library_tick(now);
+        if (g_lib_redraw) library_refresh();
+    }
     else if (g_mode == MODE_MAP) {
         static uint32_t last_frame = 0;
         // Motion first, pixels second: coasting, a camera move in flight and the
@@ -7866,6 +8881,19 @@ void loop() {
     // fade the AMOLED down to ~15% brightness. Wake on any activity.
     wp_idle_dim_tick(now);
     wp_brightness_tick(now);
+
+    // One line a second on the USB port. If the watch ever freezes again, the
+    // last [beat] says which screen it was on, whether the panel is answering,
+    // how many gestures have arrived and how much RAM is left -- instead of a
+    // dark screen and a silent monitor.
+    static uint32_t beat_t = 0;
+    if (now - beat_t >= 1000) {
+        beat_t = now;
+        WP_LOG("[beat] %lus mode=%d touch=%s ev=%lu heap=%u psram=%u\n",
+               (unsigned long)(now / 1000), (int)g_mode,
+               g_touch_ok ? "ok" : "DEAD", (unsigned long)g_ev_count,
+               (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+    }
 
     delay(4);
 }
