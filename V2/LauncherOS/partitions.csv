@@ -1,10 +1,17 @@
 # Name,   Type, SubType,  Offset,    Size,      Flags
-# 16 MB flash layout for DualCore Watch
-# factory  = permanent launcher (never overwritten after first USB flash)
-# ota_0    = scratchpad slot, holds whatever app the user picked from SD
-# otadata  = 8 KB region that tells the bootloader which slot to run
+# 16 MB flash layout for DualCore Watch (v1.2 - voice in the launcher)
+#
+# factory  5 MB  launcher + ESP-SR (measured 3.60 MB with 29 command phrases)
+# ota_0    4 MB  scratch slot for the .bin picked from SD (max app ~2.42 MB)
+# model  3.9 MB  ESP-SR MultiNet models - label MUST stay "model"
+# storage 3.1 MB  spare SPIFFS (the launcher does not use it)
+#
+# Total: 0x10000 + 5M + 4M + 3.9M + 3.1M = 16 MB exactly.
+# Flashing this table invalidates the current ota_0 app; the bootloader falls
+# back to factory, and setup() re-anchors the launcher as the boot partition.
 nvs,      data, nvs,      0x9000,    0x5000,
 otadata,  data, ota,      0xe000,    0x2000,
-factory,  app,  factory,  0x10000,   0x300000,
-ota_0,    app,  ota_0,    0x310000,  0x600000,
-storage,  data, spiffs,   0x910000,  0x6F0000,
+factory,  app,  factory,  0x10000,   0x500000,
+ota_0,    app,  ota_0,    0x510000,  0x400000,
+model,    data, spiffs,   0x910000,  0x3E0000,
+storage,  data, spiffs,   0xCF0000,  0x310000,

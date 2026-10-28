@@ -1,0 +1,15 @@
+# Board options for the voice launcher.
+#
+# Arduino IDE 2 and arduino-cli both read this file: opening the sketch
+# selects this exact FQBN, so the Tools menu no longer has to be set by hand.
+#
+# PartitionScheme=dualfive  ->  Tools > Partition Scheme
+#                              "DualCore 5MB APP / 3.9MB MODEL (16MB)"
+#   5 MB factory slot        (launcher is ~3.86 MB)
+#   4 MB ota_0 slot          (app picked from the SD card)
+#   3.9 MB "model" partition at 0x910000 - srmodels.bin is written there
+#   automatically by the upload.extra_flags of that scheme
+#
+# EraseFlash=none keeps NVS + saved settings between uploads.
+default_fqbn: esp32:esp32:esp32s3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=cdc,MSCOnBoot=default,DFUOnBoot=default,UploadMode=default,CPUFreq=240,FlashMode=qio120,FlashSize=16M,PartitionScheme=dualfive,DebugLevel=none,PSRAM=opi,LoopCore=1,EventsCore=1,EraseFlash=none,JTAGAdapter=default,ZigbeeMode=default
+default_port: COM4

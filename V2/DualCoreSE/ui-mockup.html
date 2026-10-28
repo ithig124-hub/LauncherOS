@@ -1,0 +1,2537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DualCore SE — UI mockup</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{
+    background:
+      radial-gradient(900px 520px at 12% -8%, #1a1f2e 0%, transparent 60%),
+      radial-gradient(700px 500px at 100% 0%, #16121a 0%, transparent 55%),
+      #07080c;
+    color:#e8eaf0;
+    font-family:"Segoe UI",system-ui,-apple-system,"Helvetica Neue",Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+    min-height:100vh;
+  }
+  .page{max-width:1240px;margin:0 auto;padding:38px 26px 70px}
+  .masthead{display:flex;justify-content:space-between;align-items:flex-end;gap:30px;flex-wrap:wrap;margin-bottom:30px}
+  .kicker{font-size:10px;letter-spacing:.3em;text-transform:uppercase;color:#8b90a3}
+  h1{font-size:31px;line-height:1.15;margin:10px 0 10px;letter-spacing:-.015em;font-weight:600}
+  .lede{margin:0;color:#9aa0b3;font-size:14px;max-width:560px;line-height:1.55}
+  .build{text-align:right;font-size:11px;color:#7d8296;line-height:1.9}
+  .build b{color:#d9b25c;font-weight:600;letter-spacing:.08em}
+  .layout{display:grid;grid-template-columns:434px minmax(0,1fr);gap:52px;align-items:start}
+  .stage-wrap{position:relative;width:100%;max-width:434px;min-width:0;height:526px;overflow:hidden}
+  .stage{position:absolute;top:0;left:0;width:434px;height:526px;transform-origin:top left}
+
+  /* ---------------- device shell ---------------- */
+  .device{
+    position:absolute;inset:0;padding:12px;border-radius:46px;
+    background:linear-gradient(155deg,#23262f 0%,#0c0d12 46%,#191b22 100%);
+    box-shadow:0 40px 80px -34px #000, 0 2px 0 rgba(255,255,255,.06) inset, 0 0 0 1px #2b2e38;
+  }
+  .device::after{content:"";position:absolute;right:-5px;top:186px;width:8px;height:66px;border-radius:6px;
+    background:linear-gradient(180deg,#3b3e49,#14161b);box-shadow:0 0 0 1px #0b0c10}
+  #screen{position:relative;width:410px;height:502px;border-radius:36px;overflow:hidden;background:#04050a;isolation:isolate}
+  .toast{
+    position:absolute;left:50%;bottom:26px;transform:translate(-50%,10px);z-index:60;
+    max-width:330px;padding:9px 14px;border-radius:10px;background:#11131a;color:#e8eaf0;
+    border:1px solid #262a35;font-size:12px;line-height:1.35;text-align:center;
+    opacity:0;pointer-events:none;transition:opacity .18s ease, transform .18s ease;
+    box-shadow:0 12px 30px -12px #000;
+  }
+  .toast.on{opacity:1;transform:translate(-50%,0)}
+  .under{display:flex;gap:8px;margin-top:18px;flex-wrap:wrap}
+  .under button{
+    background:#0e1016;color:#b9bdcc;border:1px solid #22262f;border-radius:9px;
+    padding:8px 11px;font:inherit;font-size:11px;letter-spacing:.04em;cursor:pointer
+  }
+  .under button:hover{border-color:#3a404f;color:#fff}
+
+  /* ---------------- screen framework ---------------- */
+  .scr{
+    display:flex;flex-direction:column;height:100%;
+    color:var(--fg);background:var(--bg);font-size:14px;position:relative;
+    animation:scr-in .18s ease-out;
+  }
+  @keyframes scr-in{from{opacity:.55}to{opacity:1}}
+  .scr.noir{--bg:#050608;--panel:#0e1116;--fg:#e8edf2;--dim:#6c7684;--accent:#6e9bd1;--line:rgba(255,255,255,.07);--danger:#d9433f}
+  .scr.crown{--bg:#0b0a07;--panel:#15130e;--fg:#f2ead8;--dim:#8a7a5e;--accent:#c9a44c;--line:rgba(201,164,76,.18);--danger:#b4453f}
+  .scr.night{--bg:#050407;--panel:#120a10;--fg:#e6dce2;--dim:#77636e;--accent:#b32a3c;--line:rgba(255,255,255,.07);--danger:#d9433f}
+  .scr.night.crimson{--bg:#0a0305;--panel:#1b070c;--fg:#ebd9dc;--dim:#8c5a63;--accent:#c8324a;--line:rgba(200,50,74,.22)}
+  .scr.chooser{--bg:#04050a;--panel:#0c0f16;--fg:#f0f3f7;--dim:#6b7280;--accent:#d9b25c;--line:rgba(255,255,255,.08);--danger:#d9433f}
+
+  .hdr{
+    flex:0 0 58px;height:58px;background:var(--panel);padding:9px 14px 0 16px;
+    display:flex;align-items:flex-start;justify-content:space-between;gap:8px;
+    border-bottom:1px solid var(--accent);user-select:none;
+  }
+  .hdr .title{font-size:20px;font-weight:600;letter-spacing:-.01em;line-height:1.1}
+  .hdr .sub{font-size:10px;letter-spacing:.12em;color:var(--dim);margin-top:5px;display:flex;gap:8px}
+  .qhint{opacity:.75;font-size:9px;letter-spacing:.06em}
+  .hdr-r{display:flex;align-items:center;gap:9px;padding-top:8px}
+  .conn{font-size:9px;letter-spacing:.12em;color:var(--dim)}
+  .batt{font-size:14px;font-variant-numeric:tabular-nums}
+  .exit{
+    background:transparent;border:0;color:var(--dim);font:inherit;font-size:10px;letter-spacing:.1em;
+    padding:6px 2px 6px 8px;cursor:pointer
+  }
+  .exit:hover{color:var(--fg)}
+  .body{flex:1;min-height:0;padding:10px 13px;display:flex;flex-direction:column;gap:8px;overflow:hidden}
+  .body.scroll{overflow-y:auto;scrollbar-width:none}
+  .body.scroll::-webkit-scrollbar{display:none}
+  .tabbar{flex:0 0 66px;height:66px;background:var(--panel);display:flex;border-top:1px solid var(--line)}
+  .tab{
+    flex:1;background:none;border:0;color:var(--dim);font:inherit;font-size:11px;letter-spacing:.14em;
+    cursor:pointer;position:relative
+  }
+  .tab.on{color:var(--accent)}
+  .tab.on::before{content:"";position:absolute;top:0;left:50%;transform:translateX(-50%);width:42px;height:3px;background:var(--accent);border-radius:2px}
+  .tab:hover{color:var(--fg)}
+
+  .clock{font-size:48px;font-weight:600;line-height:1;letter-spacing:-.025em;font-variant-numeric:tabular-nums}
+  .date{font-size:15px;color:var(--dim);margin-top:8px;letter-spacing:.01em}
+  .label{font-size:9px;letter-spacing:.18em;color:var(--dim);text-transform:uppercase}
+  .small{font-size:11px}
+  .dim{color:var(--dim)}
+  .accent{color:var(--accent)}
+  .danger{color:var(--danger)}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .row.tight{gap:6px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:9px 12px}
+  .card.flat{border-radius:11px}
+  .hr{height:1px;background:var(--line);margin:2px 0}
+
+  .btn{
+    background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:10px;
+    padding:8px 12px;font:inherit;font-size:12px;letter-spacing:.02em;cursor:pointer;
+    transition:border-color .15s ease, background .15s ease, color .15s ease;
+  }
+  .btn:hover{border-color:var(--accent)}
+  .btn:active{transform:translateY(1px)}
+  .btn.primary{background:var(--accent);border-color:transparent;color:#0a0b0f;font-weight:600}
+  .btn.bare{background:transparent}
+  .btn.sm{padding:5px 8px;font-size:10px;border-radius:7px;letter-spacing:.04em}
+  .btn.wide{width:100%}
+  .btn.danger{color:var(--danger)}
+
+  .tiles{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:auto}
+  .tile{
+    background:var(--panel);border:1px solid var(--line);border-radius:11px;padding:9px 12px;
+    text-align:left;color:var(--fg);font:inherit;cursor:pointer;min-height:66px;
+    display:flex;flex-direction:column;justify-content:center;gap:4px
+  }
+  .tile:hover{border-color:var(--accent)}
+  .tile .tt{font-size:16px;font-weight:600}
+  .tile .ts{font-size:10px;letter-spacing:.08em;color:var(--dim)}
+
+  .agenda{display:flex;flex-direction:column;gap:4px;padding:8px 12px 9px}
+  .agenda-row{display:flex;justify-content:space-between;align-items:baseline;font-size:12.5px;gap:8px}
+  .agenda-row span:last-child{font-variant-numeric:tabular-nums;font-size:11px}
+
+  .notif{
+    display:grid;grid-template-columns:1fr auto;gap:2px 8px;align-items:center;
+    background:var(--panel);border:1px solid var(--line);border-left:2px solid var(--line);
+    border-radius:10px;padding:8px 10px;cursor:pointer;position:relative
+  }
+  .notif.unread{border-left-color:var(--accent)}
+  .notif:hover{border-color:var(--accent)}
+  .notif .nt{font-size:14px;font-weight:600;padding-right:20px}
+  .notif.unread .nt{color:var(--fg)}
+  .notif .nb{font-size:11px;color:var(--dim);grid-column:1/2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .notif .nw{font-size:10px;color:var(--dim);font-variant-numeric:tabular-nums}
+  .notif .na{font-size:9px;letter-spacing:.1em;color:var(--dim);grid-column:1/2}
+  .notif .nx{grid-row:1/4;grid-column:2/3;align-self:center;background:transparent;border:0;color:var(--dim);cursor:pointer;font-size:14px;padding:4px 2px}
+  .notif .nx:hover{color:var(--danger)}
+
+  .focus-time{font-size:46px;font-weight:600;line-height:1;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+  .presets{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+  .presets .btn{font-size:10px;padding:6px 0;text-align:center}
+
+  .wclock{display:flex;flex-direction:column;gap:5px}
+  .wclock .row{font-size:12px}
+  .wclock .row b{font-weight:500}
+
+  /* ---------------- chooser ---------------- */
+  .chdr{flex:0 0 92px;position:relative;padding:14px 18px 0;display:flex;justify-content:space-between}
+  .chdr .brand{font-size:27px;font-weight:600;letter-spacing:-.02em}
+  .chdr .k{font-size:9px;letter-spacing:.32em;color:var(--accent);margin-top:6px}
+  .chdr .meta{text-align:right;font-size:11px;color:var(--dim);line-height:1.7}
+  .statline{font-size:9px;letter-spacing:.12em;color:var(--dim);padding:0 20px;margin-top:8px}
+  .cbody{flex:1;padding:12px 18px 0;display:flex;flex-direction:column;gap:9px}
+  .os-card{
+    position:relative;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:14px 16px;display:flex;align-items:center;justify-content:space-between;cursor:pointer;
+    overflow:hidden;text-align:left;color:inherit;font:inherit
+  }
+  .os-card::before{content:"";position:absolute;left:0;top:14px;bottom:14px;width:3px;border-radius:2px;background:var(--c)}
+  .os-card:hover{border-color:var(--c)}
+  .os-card .on{font-size:21px;font-weight:600;letter-spacing:-.01em}
+  .os-card .ol1{font-size:9px;letter-spacing:.18em;color:var(--c);margin-top:5px}
+  .os-card .ol2{font-size:10px;color:var(--dim);margin-top:4px}
+  .os-card .or{text-align:right;font-size:9px;letter-spacing:.16em;color:var(--c)}
+  .lastbadge{font-size:8px;letter-spacing:.14em;color:var(--dim);margin-top:5px}
+  .cfoot{padding:0 18px 16px;display:flex;gap:9px}
+  .cfoot .btn{flex:1;padding:11px 0;font-size:10px;letter-spacing:.08em}
+  .chint{padding:0 20px 14px;font-size:9px;color:var(--dim);letter-spacing:.04em}
+
+  /* ---------------- dial ---------------- */
+  .face{
+    position:relative;border-radius:22px;border:2px solid var(--accent);background:var(--facebg,#0b0a07);
+    padding:10px 12px;display:flex;flex-direction:column;align-items:center;
+  }
+  .face .fname{position:absolute;left:14px;top:10px;font-size:10px;letter-spacing:.16em;color:var(--accent)}
+  .face .fprof{position:absolute;left:14px;top:26px;font-size:8px;letter-spacing:.16em;color:var(--dim)}
+  .face .fstyle{position:absolute;right:12px;top:10px;font-size:8px;letter-spacing:.14em;color:var(--dim)}
+  .dial{position:relative;width:244px;height:244px;border-radius:50%;border:1px solid var(--line);flex:0 0 auto}
+  .dial.bare{border-color:transparent}
+  .tick{position:absolute;left:calc(50% - 1px);top:7px;width:2px;height:8px;background:var(--fg);opacity:.55;transform-origin:50% 115px;border-radius:1px}
+  .tick.major{width:3px;height:12px;opacity:.9;left:calc(50% - 1.5px);top:5px;transform-origin:50% 117px}
+  .num{position:absolute;transform:translate(-50%,-50%);font-size:12px;color:var(--fg);letter-spacing:.02em}
+  .hand{position:absolute;left:calc(50% - 1.5px);bottom:50%;width:3px;border-radius:3px;background:var(--fg);transform-origin:50% 100%}
+  .hand.h{width:6px;height:62px;left:calc(50% - 3px);background:var(--fg)}
+  .hand.m{width:4px;height:88px;left:calc(50% - 2px)}
+  .hand.s{width:2px;height:100px;background:var(--accent)}
+  .pin{position:absolute;left:50%;top:50%;width:12px;height:12px;border-radius:50%;background:var(--accent);transform:translate(-50%,-50%)}
+  .face .fdate{font-size:10px;color:var(--dim);letter-spacing:.1em;margin-top:4px}
+
+  /* ---------- SOVEREIGN: fluted bezel + champagne dial, digital heart ------ */
+  .sov{position:relative;width:100%;height:266px;display:flex;align-items:center;justify-content:center;margin-top:2px}
+  .sov-bezel{
+    position:relative;width:262px;height:262px;border-radius:50%;padding:9px;
+    background:repeating-conic-gradient(from 0deg,#e6c982 0deg 1.7deg,#8a6d34 1.7deg 3.4deg);
+    box-shadow:0 0 0 1px #6b5526, inset 0 0 16px rgba(0,0,0,.55), 0 8px 26px -12px #000;
+  }
+  .sov-dial{
+    position:relative;width:244px;height:244px;border-radius:50%;overflow:hidden;
+    background:
+      repeating-conic-gradient(from 0deg, rgba(216,185,106,.18) 0deg .7deg, rgba(216,185,106,0) .7deg 5deg),
+      radial-gradient(circle at 50% 36%, #3d2e14 0%, #261c0d 58%, #150e05 100%);
+    border:1px solid rgba(216,185,106,.45);
+  }
+  .sov-day{
+    position:absolute;top:12px;left:50%;transform:translateX(-50%);z-index:3;
+    background:#f3e9d2;color:#171006;font-size:11px;letter-spacing:.16em;
+    padding:2px 11px;border-radius:3px;border:1px solid rgba(216,185,106,.8);font-weight:600;
+  }
+  .sov-brand{
+    position:absolute;top:41px;left:50%;transform:translateX(-50%);z-index:3;
+    font-size:7px;letter-spacing:.44em;color:var(--sov,#d8b96a);
+  }
+  .sov-time{
+    position:absolute;top:57px;left:0;right:0;z-index:3;text-align:center;
+    font-size:40px;font-weight:600;line-height:1;letter-spacing:.01em;
+    font-variant-numeric:tabular-nums;color:#f2dca6;
+    text-shadow:0 1px 0 rgba(0,0,0,.55), 0 0 18px rgba(216,185,106,.12);
+  }
+  .sov-model{
+    position:absolute;top:105px;left:50%;transform:translateX(-50%);z-index:3;
+    font-size:7px;letter-spacing:.36em;color:var(--sov,#d8b96a);
+  }
+  .sov-cert{
+    position:absolute;top:119px;left:50%;transform:translateX(-50%);z-index:3;
+    font-size:5.5px;letter-spacing:.3em;color:#8a7442;
+  }
+  .sov-date{
+    position:absolute;right:24px;top:50%;transform:translateY(-50%);z-index:3;
+    width:36px;height:25px;background:#f3e9d2;color:#171006;border-radius:3px;
+    display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;
+    border:1px solid rgba(216,185,106,.85);
+  }
+  .sov-cyclops{
+    position:absolute;right:12px;top:50%;transform:translateY(-50%);z-index:2;
+    width:60px;height:46px;border-radius:50%;border:1px solid rgba(216,185,106,.5);
+    background:radial-gradient(ellipse at 40% 30%, rgba(255,255,255,.06), transparent 70%);
+  }
+  .sov-mark{
+    position:absolute;width:2px;height:9px;border-radius:1px;background:var(--sov,#d8b96a);
+    box-shadow:0 0 0 1px rgba(0,0,0,.3)
+  }
+  .sov-roman{position:absolute;font-size:9px;color:var(--sov,#d8b96a);letter-spacing:.06em}
+  .sov-glare{
+    position:absolute;inset:0;border-radius:50%;pointer-events:none;
+    background:linear-gradient(128deg, rgba(255,255,255,.10) 0%, rgba(255,255,255,0) 44%);
+  }
+
+  /* ---------- full-bleed face: the watch IS the screen ------------------- */
+  .ffscr{position:relative;overflow:hidden;background:#000}
+  .ffface{position:absolute;inset:0;cursor:pointer}
+  .ffface svg{display:block;width:410px;height:502px}
+  .ffhint{
+    position:absolute;left:0;right:0;bottom:9px;text-align:center;z-index:4;
+    font-size:9px;letter-spacing:.3em;color:var(--accent);pointer-events:none;
+    animation:ffhint 3.2s ease forwards;
+  }
+  @keyframes ffhint{0%,62%{opacity:.9}100%{opacity:0}}
+  .ffhdr{
+    position:absolute;left:0;right:0;top:0;height:58px;z-index:6;
+    background:rgba(21,19,14,.94);padding:9px 14px 0 16px;
+    display:flex;align-items:flex-start;justify-content:space-between;gap:8px;
+    border-bottom:1px solid var(--accent);user-select:none
+  }
+  .fftab{position:absolute;left:0;right:0;bottom:0;height:66px;z-index:6;
+    background:rgba(21,19,14,.94);display:flex;border-top:1px solid var(--line)}
+  .ffbadge{position:absolute;left:50%;transform:translateX(-50%);top:74px;z-index:5;
+    font-size:8px;letter-spacing:.26em;color:var(--accent);opacity:.55;pointer-events:none}
+
+  /* the glitch: offset slices + a two-pixel tracking tear, ~300 ms */
+  .sl{position:absolute;height:2px;width:120px;left:0;background:var(--accent);opacity:0;z-index:3;pointer-events:none}
+  .ffface.glitch{animation:tear .32s steps(1) both}
+  .ffface.glitch .sl{opacity:.9}
+  .ffface.glitch .sl:nth-child(2){top:132px;width:186px;transform:translateX(-16px)}
+  .ffface.glitch .sl:nth-child(3){top:196px;width:96px;transform:translateX(26px);background:var(--fg)}
+  .ffface.glitch .sl:nth-child(4){top:238px;width:214px;transform:translateX(-8px)}
+  .ffface.glitch .sl:nth-child(5){top:288px;width:150px;transform:translateX(14px);height:5px}
+  .ffface.glitch .sl:nth-child(6){top:344px;width:120px;transform:translateX(-22px);background:var(--fg)}
+  .ffface.glitch .sl:nth-child(7){top:392px;width:176px;transform:translateX(9px)}
+  @keyframes tear{
+    0%{transform:translateX(0)}18%{transform:translateX(-3px)}
+    36%{transform:translateX(2px)}54%{transform:translateX(-1px)}
+    72%{transform:translateX(3px)}100%{transform:translateX(0)}
+  }
+  @media (prefers-reduced-motion: reduce){ .ffface.glitch{animation:none} }
+
+  .flashview{position:absolute;inset:0;z-index:20;display:flex;align-items:flex-end;justify-content:center;padding-bottom:34px}
+  .flashview span{font-size:8px;letter-spacing:.22em;color:rgba(0,0,0,.55)}
+
+  .stealthview{
+    position:absolute;inset:0;z-index:20;background:#000;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:8px;color:#8e2431
+  }
+  .stealthview .st{font-size:46px;font-variant-numeric:tabular-nums;letter-spacing:.02em;color:#8e2431}
+  .stealthview .sd{font-size:10px;letter-spacing:.14em;color:#3e2a2f}
+  .stealthview .sh{position:absolute;bottom:34px;font-size:8px;letter-spacing:.22em;color:#3a2328}
+
+  .sleeper{position:absolute;inset:0;z-index:20;background:#000;display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:12px}
+  .sleeper .sl{font-size:9px;letter-spacing:.32em;color:#3a3d47}
+  .sleeper .sw{margin-top:14px;background:#0e1016;border:1px solid #22262f;color:#8f94a8;
+    padding:9px 15px;border-radius:8px;font:inherit;font-size:10px;letter-spacing:.1em;cursor:pointer}
+  .sleeper .sn{font-size:9px;color:#2c2f38;letter-spacing:.06em;max-width:290px;text-align:center;line-height:1.6}
+  .bigtime{font-size:44px;font-weight:600;line-height:1;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+  .moonwrap{display:flex;flex-direction:column;align-items:center;gap:6px;margin-top:8px}
+  .moon{position:relative;width:104px;height:104px;border-radius:50%;background:#efe6d2;overflow:hidden;box-shadow:0 0 34px rgba(239,230,210,.12)}
+  .moon i{position:absolute;inset:0;border-radius:50%;display:block;background:var(--facebg,#120c16)}
+  .mpname{font-size:9px;letter-spacing:.2em;color:var(--accent)}
+
+  .comps{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+  .comp{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:7px 9px}
+  .comp .cl{font-size:8px;letter-spacing:.16em;color:var(--dim)}
+  .comp .cv{font-size:14px;margin-top:5px;font-weight:500}
+  .comp .cv.sm{font-size:10px;letter-spacing:.06em}
+
+  .swatches{display:flex;gap:8px;flex-wrap:wrap}
+  .sw{width:38px;height:38px;border-radius:50%;border:2px solid transparent;cursor:pointer;padding:0}
+  .sw.on{box-shadow:0 0 0 2px var(--fg)}
+  .sw.sq{border-radius:10px}
+  .toggle{
+    display:flex;justify-content:space-between;align-items:center;width:100%;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:9px 12px;
+    color:var(--fg);font:inherit;font-size:11px;letter-spacing:.06em;cursor:pointer
+  }
+  .toggle:hover{border-color:var(--accent)}
+  .toggle b{color:var(--accent);font-weight:500;letter-spacing:.1em;font-size:10px}
+  .toggle.off b{color:var(--dim)}
+
+  .evrow{display:flex;align-items:center;gap:8px;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+  .evrow .et{flex:1;font-size:13px}
+  .evrow .ea{font-size:10px;color:var(--dim);margin-top:3px}
+  .evrow .ec{font-size:10px;color:var(--accent);font-variant-numeric:tabular-nums}
+  .evrow .ex{background:transparent;border:0;color:var(--dim);cursor:pointer;font-size:14px;padding:2px 4px}
+  .evrow .ex:hover{color:var(--danger)}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+
+  .statgrid{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;font-size:10px;color:var(--dim)}
+  .statgrid b{display:block;color:var(--fg);font-size:12px;font-weight:500;margin-top:2px}
+
+  /* ---------------- overlays ---------------- */
+  .overlay{position:absolute;inset:0;z-index:20;display:flex;flex-direction:column;background:#000;color:var(--fg)}
+  .overlay.sheet{background:rgba(0,0,0,.6);justify-content:flex-end}
+  .sheet-inner{background:var(--panel);border-radius:18px 18px 0 0;border-top:1px solid var(--line);padding:16px 16px 18px;display:flex;flex-direction:column;gap:8px}
+  .sheet-inner .label{margin-bottom:2px}
+  .modal{position:absolute;inset:0;z-index:20;background:var(--bg);display:flex;flex-direction:column;padding:14px 16px}
+  .modal .mh{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);padding-bottom:10px;margin-bottom:12px}
+  .modal .mh .mt{font-size:20px;color:var(--accent);font-weight:600}
+  .modal .close{background:var(--panel);border:1px solid var(--line);color:var(--dim);border-radius:14px;padding:6px 12px;font:inherit;font-size:9px;letter-spacing:.1em;cursor:pointer}
+
+  .ringview{align-items:center;justify-content:center;gap:0;background:#000}
+  .ringcircle{width:212px;height:212px;border-radius:50%;border:2px solid var(--accent);display:flex;flex-direction:column;align-items:center;justify-content:center;margin-top:52px;box-shadow:0 0 70px -10px rgba(217,178,92,.25)}
+  .ringview .rtime{font-size:50px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+  .ringview .rlab{font-size:11px;letter-spacing:.24em;color:var(--accent);margin-top:8px}
+  .ringview .rsub{font-size:10px;color:var(--dim);margin-top:4px;letter-spacing:.08em}
+  .ringbtns{display:flex;gap:10px;margin-top:30px}
+  .ringbtns .btn{width:148px;padding:14px 0;font-size:11px;letter-spacing:.1em}
+  .ringnote{font-size:9px;color:var(--dim);margin-top:22px;text-align:center;max-width:300px;line-height:1.5}
+
+  .breathe{align-items:center;justify-content:flex-start;background:#050407;padding-top:44px}
+  .breathe .bh{font-size:17px;letter-spacing:.2em;color:var(--accent)}
+  .breathe .bs{font-size:8px;letter-spacing:.2em;color:#77636e;margin-top:8px}
+  .bring{width:110px;height:110px;border-radius:50%;border:2px solid #c8324a;margin-top:120px;transition:width .12s linear,height .12s linear;box-shadow:0 0 40px -8px rgba(200,50,74,.5)}
+  .bphase{font-size:20px;letter-spacing:.14em;margin-top:130px;color:#ebd9dc}
+  .bcount{font-size:34px;color:#c8324a;margin-top:10px;font-variant-numeric:tabular-nums}
+  .breathe .btn{position:absolute;bottom:44px;left:50%;transform:translateX(-50%);width:160px;padding:12px 0;background:#1b070c;border-color:#3a141c;color:#ebd9dc}
+
+  .offview{background:#000;align-items:center;justify-content:center;gap:10px;color:#3d3f47}
+  .offview .ot{font-size:34px;font-variant-numeric:tabular-nums;letter-spacing:.04em}
+  .offview .oh{font-size:8px;letter-spacing:.24em}
+
+  .modal.dev{overflow-y:auto;scrollbar-width:none}
+  .modal.dev::-webkit-scrollbar{display:none}
+  .diag .statline{margin:0 0 8px;padding:0}
+  .diag .dgrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .diag .dcell{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+  .diag .dcell span{display:block;font-size:8px;letter-spacing:.16em;color:var(--dim)}
+  .diag .dcell b{display:block;font-size:13px;font-weight:500;margin-top:4px}
+
+  .notifview .napp{font-size:10px;letter-spacing:.18em;color:var(--accent)}
+  .notifview .nti{font-size:24px;font-weight:600;margin:10px 0 8px;line-height:1.2}
+  .notifview .nbd{font-size:14px;line-height:1.55;color:var(--fg)}
+  .notifview .nme{font-size:10px;color:var(--dim);margin-top:14px;letter-spacing:.08em}
+
+  /* ---------------- side panel ---------------- */
+  .panel{display:flex;flex-direction:column;gap:16px;min-width:0}
+  .pcard{background:#0c0e14;border:1px solid #1a1d25;border-radius:16px;padding:18px 20px}
+  .pcard h2{margin:0 0 12px;font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:#8f94a8;font-weight:600}
+  .chips{display:flex;flex-wrap:wrap;gap:7px}
+  .chip{
+    background:#11141b;border:1px solid #242832;color:#c3c7d4;border-radius:8px;
+    padding:7px 10px;font:inherit;font-size:11px;cursor:pointer;letter-spacing:.02em
+  }
+  .chip:hover{border-color:#d9b25c;color:#fff}
+  .group{margin-bottom:12px}
+  .group:last-child{margin-bottom:0}
+  .group .gname{font-size:9px;letter-spacing:.18em;color:#676d80;margin-bottom:7px}
+  ul.news{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:10px}
+  ul.news li{position:relative;padding-left:20px;font-size:12.5px;line-height:1.5;color:#b9bece}
+  ul.news li b{color:#eef0f7;font-weight:600}
+  ul.news li::before{content:"";position:absolute;left:2px;top:7px;width:7px;height:7px;border-radius:2px;background:#d9b25c;opacity:.85}
+  ul.news li.n::before{background:#b32a3c}
+  ul.news li.c::before{background:#c9a44c}
+  ul.news li.i::before{background:#6e9bd1}
+  .hints{display:flex;flex-direction:column;gap:9px;font-size:12px;color:#a7adc0;line-height:1.5}
+  .hints kbd{background:#161a23;border:1px solid #2a2f3b;border-bottom-width:2px;border-radius:5px;padding:1px 6px;font:inherit;font-size:10px;color:#d7dbe6}
+  .foot{font-size:10.5px;color:#666c7f;line-height:1.7}
+  .foot b{color:#9aa0b3;font-weight:600}
+
+  /* ---------------- per-OS boot sequences (mirrors firmware 14.9) ---------- */
+  .scr.boot{align-items:center;justify-content:flex-start;padding-top:118px;cursor:pointer}
+  .scr.boot .mark{font-size:10px;letter-spacing:.36em;color:var(--dim)}
+  .scr.boot .word{font-size:44px;font-weight:600;letter-spacing:.2em;text-indent:.2em;line-height:1;margin-top:10px}
+  .scr.boot .tag{font-size:10px;letter-spacing:.3em;color:var(--accent);margin-top:14px;text-indent:.3em}
+  .scr.boot .rule{width:60px;height:1px;background:var(--accent);margin-top:20px;opacity:.75}
+  .scr.boot .art{height:132px;display:flex;align-items:center;justify-content:center;margin-top:16px}
+  .scr.boot .stage{position:absolute;left:0;right:0;top:392px;text-align:center;font-size:12px;color:var(--dim)}
+  .scr.boot .bar{position:absolute;left:50%;transform:translateX(-50%);top:418px;width:240px;height:3px;background:#1a1d22}
+  .scr.boot .bar i{display:block;height:100%;background:var(--accent);width:0;animation:bootfill 2.05s cubic-bezier(.45,0,.25,1) forwards}
+  .scr.boot .pct{position:absolute;top:428px;left:0;right:0;text-align:center;font-size:10px;color:var(--dim)}
+  .scr.boot .footline{position:absolute;bottom:14px;left:0;right:0;text-align:center;font-size:9px;letter-spacing:.22em;color:var(--dim)}
+  @keyframes bootfill{to{width:100%}}
+  .boot-grow{width:4px;height:1px;background:var(--accent);animation:bootgrow 1.2s ease-in-out forwards}
+  @keyframes bootgrow{to{width:120px}}
+  .boot-arc{width:128px;height:128px;border-radius:50%;border:2px solid #25211a;position:relative}
+  .boot-arc:after{content:"";position:absolute;inset:-2px;border-radius:50%;border:3px solid transparent;
+    border-top-color:var(--accent);border-right-color:var(--accent);animation:bootspin 1.5s linear infinite}
+  @keyframes bootspin{to{transform:rotate(360deg)}}
+  .boot-crown{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);display:flex;align-items:flex-end;gap:5px}
+  .boot-crown i{display:block;width:11px;background:var(--accent)}
+  .boot-crown i:nth-child(1){height:16px}
+  .boot-crown i:nth-child(2){height:26px}
+  .boot-crown i:nth-child(3){height:16px}
+  .boot-scan{width:120px;height:120px;border:1px solid #3a141b;border-radius:6px;position:relative;overflow:hidden}
+  .boot-scan i{position:absolute;left:0;right:0;height:2px;background:var(--accent);opacity:.6;animation:bootscan 1.8s ease-in-out infinite alternate}
+  @keyframes bootscan{from{top:4px}to{top:114px}}
+
+  /* moon: lit disc + offset dark disc, the firmware's terminator (17.6) */
+  .moon{position:relative;width:72px;height:72px;border-radius:50%;flex:0 0 72px;
+    background:#f2ead8;overflow:hidden}
+  .moon i{position:absolute;top:0;width:72px;height:72px;border-radius:50%;background:#0b0a07}
+
+  /* water dots on NoirOS DAY */
+  .dots{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}
+  .dots span{width:14px;height:14px;border-radius:50%;border:1px solid var(--dim);opacity:.5}
+  .dots span.on{background:var(--accent);border-color:var(--accent);opacity:1}
+  .reserve{height:12px;border-radius:6px;background:rgba(255,255,255,.06);overflow:hidden;position:relative;margin-top:10px}
+  .reserve i{display:block;height:100%;background:var(--accent)}
+  .ticks{display:flex;justify-content:space-between;margin-top:5px}
+  .ticks span{width:1px;height:6px;background:var(--dim);opacity:.6}
+
+  @media (max-width:960px){
+    .layout{grid-template-columns:1fr;gap:34px}
+    .masthead{margin-bottom:22px}
+    .stage-wrap{max-width:434px;margin:0 auto}
+    .panel{max-width:none}
+  }
+  @media (max-width:520px){
+    .page{padding:24px 14px 52px}
+    h1{font-size:25px}
+  }
+</style>
+</head>
+<body>
+<div class="page">
+  <header class="masthead">
+    <div>
+      <div class="kicker">DualCore · Special Editions</div>
+      <h1>Three experiences, one firmware</h1>
+      <p class="lede">A clickable mockup of the 410 × 502 AMOLED interface, 1:1 with the LVGL
+        build. Tap the watch — every control, tab and overlay is live.</p>
+    </div>
+    <div class="build">
+      <b>MODULE v1.3.0</b><br />
+      NoirOS · CrownOS · NightOS<br />
+      Waveshare ESP32-S3 · 410 × 502
+    </div>
+  </header>
+
+  <div class="layout">
+    <div>
+      <div class="stage-wrap">
+        <div class="stage">
+          <div class="device">
+            <div id="screen" aria-label="Watch screen mockup"></div>
+            <div id="toast" class="toast"></div>
+          </div>
+        </div>
+      </div>
+      <div class="under">
+        <button data-go="crown-face">Sovereign face</button>
+        <button data-go="quick">Open quick sheet</button>
+        <button data-go="alarms">Alarm editor</button>
+        <button data-go="ring">Preview alarm</button>
+        <button data-go="sleep">Deep sleep</button>
+        <button data-go="system">System</button>
+        <button data-go="wifi">Wi-Fi clock</button>
+      </div>
+    </div>
+
+    <aside class="panel">
+      <section class="pcard">
+        <h2>Screens</h2>
+        <div class="group">
+          <div class="gname">LAUNCHER</div>
+          <div class="chips">
+            <button class="chip" data-go="chooser">Chooser</button>
+            <button class="chip" data-go="diag">Diagnostics</button>
+          </div>
+        </div>
+        <div class="group">
+          <div class="gname">NOIROS</div>
+          <div class="chips">
+            <button class="chip" data-go="noir-home">Home</button>
+            <button class="chip" data-go="noir-inbox">Inbox</button>
+            <button class="chip" data-go="noir-tools">Tools</button>
+            <button class="chip" data-go="detail">Alert detail</button>
+          </div>
+        </div>
+        <div class="group">
+          <div class="gname">CROWNOS</div>
+          <div class="chips">
+            <button class="chip" data-go="crown-face">Face (full screen)</button>
+            <button class="chip" data-act="faceshow" data-arg="5">Moon face</button>
+            <button class="chip" data-act="faceshow" data-arg="4">Roman</button>
+            <button class="chip" data-act="faceshow" data-arg="7">Serpent</button>
+            <button class="chip" data-act="faceshow" data-arg="8">Chrono</button>
+            <button class="chip" data-act="faceshow" data-arg="9">Skeleton</button>
+            <button class="chip" data-act="faceshow" data-arg="10">Dive</button>
+            <button class="chip" data-act="faceshow" data-arg="11">Photo dial</button>
+            <button class="chip" data-go="crown-studio">Watch Studio</button>
+            <button class="chip" data-go="crown-events">Events</button>
+          </div>
+        </div>
+        <div class="group">
+          <div class="gname">NIGHTOS</div>
+          <div class="chips">
+            <button class="chip" data-go="night-home">Home</button>
+            <button class="chip" data-go="night-shadow">Shadow</button>
+            <button class="chip" data-go="night-tools">Utility panel</button>
+            <button class="chip" data-go="breathe">Breathe</button>
+            <button class="chip" data-go="stealth">Stealth</button>
+          </div>
+        </div>
+        <div class="group">
+          <div class="gname">SHARED OVERLAYS</div>
+          <div class="chips">
+            <button class="chip" data-go="quick">Quick sheet</button>
+            <button class="chip" data-go="alarms">Alarms</button>
+            <button class="chip" data-go="ring">Alarm ringing</button>
+            <button class="chip" data-go="off">Display off</button>
+            <button class="chip" data-go="sleep">Deep sleep</button>
+            <button class="chip" data-go="system">System</button>
+            <button class="chip" data-go="wifi">Wi-Fi / clock</button>
+            <button class="chip" data-go="dev">Developer info</button>
+            <button class="chip" data-go="reset">Factory reset</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="pcard">
+        <h2>Added in v1.3.0</h2>
+        <ul class="news">
+          <li class="c"><b>Wi-Fi clock.</b> NTP from loop(), never from a UI event:
+            the same wifi.txt as LauncherOS, single +30 min UTC steps, auto top-up
+            every six hours, radio dropped when done.</li>
+          <li class="c"><b>One accent, three OSes.</b> Champagne, ice, mint, violet,
+            crimson or platinum — or OS DEFAULT, which restores each palette.</li>
+          <li class="i"><b>NoirOS wallpaper.</b> 410×502 RGB565 frames from
+            /WATCH/PHOTOS in PSRAM, with a scrim so the clock stays readable.</li>
+          <li class="i"><b>Developer info.</b> Heap, PSRAM, SD, reset and wake reason,
+            uptime, boot strikes and wallpaper state on one screen.</li>
+          <li class="n"><b>Factory reset.</b> Per experience, or all three — always
+            confirmed, never automatic, and the chooser stays reachable.</li>
+        </ul>
+      </section>
+
+      <section class="pcard">
+        <h2>Added in v1.2.0</h2>
+        <ul class="news">
+          <li class="c"><b>Sovereign face.</b> A fluted bezel, champagne sunburst dial,
+            day aperture and cyclops date — with a digital heart. Original marks only.</li>
+          <li class="i"><b>Deep sleep + light sleep.</b> Panel-off light sleep like
+            LauncherOS; optional idle deep sleep that wakes on BOOT or the next alarm,
+            then reopens the last experience.</li>
+          <li class="i"><b>Alarm weekdays.</b> Each of the three alarms gets a day mask,
+            with at least one day always kept.</li>
+          <li class="i"><b>Weather from the phone.</b> Temp, condition and high/low with a
+            clean “no data” state instead of invented numbers.</li>
+          <li class="i"><b>Runtime estimate.</b> Derived from the battery poll over a
+            10-minute window, shown as approximate.</li>
+          <li class="c"><b>Event alerts.</b> Opt-in 15-minute warning that arrives through
+            the shared inbox, so privacy applies.</li>
+          <li class="n"><b>Stealth display.</b> Time-only, dim crimson, tap to return.</li>
+          <li class="n"><b>Red light.</b> The flashlight cycles white → red → off; red
+            really lights only the red subpixels.</li>
+        </ul>
+        <div class="dim" style="font-size:10px;line-height:1.6;margin-top:12px">
+          Still in: quick sheet, three-event agenda, per-alert dismiss, focus presets,
+          Roman/Moon faces, moon phase, seconds toggle, crimson palette, breathing pacer.
+        </div>
+      </section>
+
+      <section class="pcard">
+        <h2>Try this</h2>
+        <div class="hints">
+          <div>Press and hold the watch's top bar for about half a second — the
+            <b>quick sheet</b> slides up.</div>
+          <div>In NoirOS, tap an inbox row, then <b>DISMISS</b>; or use the small <b>X</b>
+            on any row.</div>
+          <div>Open <b>CrownOS → Studio</b>, pick the <b>LUNE</b> face and watch the moon
+            phase change with the real date.</div>
+          <div>In <b>NightOS → Shadow</b>, switch the palette to <b>CRIMSON</b>: the whole
+            OS retints, including the utility panel.</div>
+          <div>In <b>NightOS → Utility</b>, tap <b>FLASHLIGHT</b> twice for the red light,
+            then <b>STEALTH DISPLAY</b> for the time-only screen.</div>
+          <div>Open the quick sheet and set <b>AUTO SLEEP</b>, then <b>SLEEP NOW</b> to see
+            the wake screen and its alarm timer.</div>
+        </div>
+      </section>
+
+      <section class="pcard">
+        <h2>What this is</h2>
+        <p class="foot">
+          HTML/CSS/JS, 410 × 502 CSS pixels, no external assets. It mirrors the firmware's
+          layout grid: 58 px top bar, 378 px body, 66 px tab bar, 12 px corner radii,
+          Montserrat-like type scale. Typography and anti-aliasing will differ from LVGL
+          on the watch; the geometry and interaction model will not.
+        </p>
+        <p class="foot">
+          <b>Firmware status:</b> the same feature set compiles for the WOS 206A
+          (21 % flash, 31 % static RAM). Phone link, touch feel and power draw still need
+          the physical watch.
+        </p>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ------------------------------------------------------------------ data */
+  const NOIR_TABS = [["HOME", "noir-home"], ["INBOX", "noir-inbox"], ["TOOLS", "noir-tools"], ["DAY", "noir-day"]];
+  const CROWN_TABS = [["FACE", "crown-face"], ["STUDIO", "crown-studio"], ["EVENTS", "crown-events"], ["ALMANAC", "crown-almanac"]];
+  const NIGHT_TABS = [["HOME", "night-home"], ["SHADOW", "night-shadow"], ["TOOLS", "night-tools"], ["OPS", "night-ops"]];
+
+  const OVERLAYS = ["quick", "alarms", "ring", "breathe", "detail", "diag", "off",
+                    "stealth", "flash", "sleep", "system", "wifi", "dev", "reset"];
+
+  // Shared accent override (module: settings.json "theme"). 0 = each OS keeps
+  // its own palette, exactly like the firmware's kAccentColors table.
+  const THEME_ACCENTS = ["", "#d9b25c", "#7fb3e8", "#69c9a8", "#a98be0", "#c8324a", "#d8dee6"];
+  const THEME_NAMES = ["OS DEFAULT", "CHAMPAGNE", "ICE BLUE", "MINT", "VIOLET", "CRIMSON", "PLATINUM"];
+
+  const ACCENTS = ["#c9a44c", "#c8ccd4", "#efe6d2", "#3e5c8a", "#b4453f"];
+  const BGS = ["#0b0a07", "#0a0f18", "#14110d", "#120c16"];
+  const ACCENT_NAMES = ["GOLD", "SILVER", "IVORY", "MIDNIGHT", "CRIMSON"];
+
+  const FACES = [
+    { name: "LAQUEAR", style: "CLASSIC", accent: 0, bg: 0 },
+    { name: "MERIDIAN", style: "CLASSIC", accent: 1, bg: 1 },
+    { name: "MINUIT", style: "MINIMAL", accent: 2, bg: 0 },
+    { name: "VOYAGE", style: "DUAL TIME", accent: 3, bg: 1 },
+    { name: "ROMAIN", style: "ROMAN", accent: 0, bg: 2 },
+    { name: "LUNE", style: "MOON", accent: 2, bg: 3 },
+    { name: "SOVEREIGN", style: "SOVEREIGN", accent: 0, bg: 0 },
+    { name: "SERPENT", style: "SERPENT", accent: 0, bg: 0 },
+    { name: "CHRONO", style: "CHRONO", accent: 1, bg: 2 },
+    { name: "SKELETON", style: "SKELETON", accent: 4, bg: 0 },
+    { name: "DIVE", style: "DIVE", accent: 3, bg: 0 },
+    { name: "PHOTO", style: "PHOTO", accent: 2, bg: 0 }
+  ];
+  const WEATHER = { valid: true, temp: 18, cond: "CLOUDY", hi: 20, lo: 11 };
+  const BATTERY = { pct: 82, est: "~6.1h" };
+  const OCCASIONS = ["FORMAL", "CELEBRATION", "EVERYDAY", "TRAVEL"];
+  const OCC_FACE = { FORMAL: 0, CELEBRATION: 1, EVERYDAY: 2, TRAVEL: 3 };
+  const OCC_POWER = { FORMAL: "ECO", CELEBRATION: "BALANCED", EVERYDAY: "BALANCED", TRAVEL: "ECO" };
+
+  const PRIVACY = ["FULL PREVIEW", "SENDER ONLY", "HIDDEN"];
+  const POWER = ["PERFORMANCE", "BALANCED", "ECO", "SURVIVAL"];
+  const QUIET = ["OFF", "SENDER ONLY", "HIDDEN"];
+  const CITIES = [["LONDON", 0], ["NEW YORK", -300], ["TOKYO", 540]];
+
+  const MOON_NAMES = ["NEW", "WAX CRESCENT", "FIRST QTR", "WAX GIBBOUS",
+                      "FULL", "WAN GIBBOUS", "LAST QTR", "WAN CRESCENT"];
+
+  const boot = Date.now();
+
+  let notifs = [
+    { app: "Messages", sender: "Alex", title: "Running five late", body: "Grab the side entrance, I saved you a seat.", when: "18:42", read: false },
+    { app: "Gmail", sender: "Ms. Okafor", title: "Coursework extension", body: "Submit the practical by Friday, no penalty.", when: "18:10", read: false },
+    { app: "Spotify", sender: "", title: "Weekly discovery", body: "12 new tracks picked for your evening.", when: "17:55", read: true },
+    { app: "Calendar", sender: "", title: "Chem revision", body: "Starts in 40 minutes — Lab 2.", when: "17:30", read: true }
+  ];
+
+  let events = [
+    { t: "CHEM REVISION", at: boot + 40 * 60000 },
+    { t: "FOOTBALL", at: boot + 3 * 3600000 },
+    { t: "DINNER", at: boot + 26 * 3600000 }
+  ];
+
+  const S = {
+    base: "chooser",
+    overlay: null,
+    lastOS: "NoirOS",
+    t24: true,
+    privacy: 0,
+    power: 1,
+    bright: 180,
+    diagOpen: false,
+    detail: 0,
+    noirClock: "digital",
+    crown: { face: 7, accent: 0, bg: 0, compl: 1, anim: 1, secs: 1, alerts: 0, glitch: 1, profile: "EVERYDAY" },
+    crownChrome: false,
+    glitchOn: false,
+    glitchAt: Date.now(),
+    night: { shadow: false, palette: "night", bright: 70, sched: true, start: 22, end: 6, days: [0, 1, 2, 3, 4, 5, 6], quiet: 1, flash: 0 },
+    sleepAuto: 5,
+    alarms: [
+      { h: 7, m: 0, on: false, days: [0, 1, 2, 3, 4, 5, 6] },
+      { h: 12, m: 30, on: false, days: [0, 1, 2, 3, 4, 5, 6] },
+      { h: 19, m: 0, on: true, days: [0, 1, 2, 3, 4, 5, 6] }
+    ],
+    focus: { min: 25, left: 25 * 60, run: false, endAt: 0, sessions: 3 },
+    sw: { ms: 0, run: false, t0: 0 },
+    breatheT0: 0,
+    savedFaces: 0,
+    day: { water: 5, focus: 45, notif: 12 },
+    trip: { armed: false, sens: 1, alerts: 0 },
+    bootTick: null,
+    bootGo: null,
+    sys: {
+      theme: 0, autoNtp: 1, wall: 0, photos: 2,
+      net: "ready (2 networks)", sync: false, everOk: true,
+      wake: "BOOT button", offsetMin: 60, confirm: -1, bootmode: 1
+    }
+  };
+
+  /* --------------------------------------------------------------- helpers */
+  const pad2 = n => String(n).padStart(2, "0");
+
+  function fmtTime(d, secs) {
+    let h = d.getHours();
+    const m = pad2(d.getMinutes());
+    if (S.t24) return secs ? `${pad2(h)}:${m}:${pad2(d.getSeconds())}` : `${pad2(h)}:${m}`;
+    const sfx = h >= 12 ? "PM" : "AM";
+    h = h % 12 || 12;
+    return secs ? `${h}:${m}:${pad2(d.getSeconds())} ${sfx}` : `${h}:${m} ${sfx}`;
+  }
+  function fmtDate(d) {
+    const D = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
+    const M = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
+    return `${D[d.getDay()]} ${d.getDate()} ${M[d.getMonth()]} ${d.getFullYear()}`;
+  }
+  function durShort(sec) {
+    sec = Math.max(0, Math.round(sec));
+    const d = Math.floor(sec / 86400);
+    const h = Math.floor((sec % 86400) / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    if (d > 0) return `${d}d ${pad2(h)}h`;
+    if (h > 0) return `${pad2(h)}h ${pad2(m)}m`;
+    return `${pad2(m)}m ${pad2(sec % 60)}s`;
+  }
+  function mmss(sec) {
+    sec = Math.max(0, Math.round(sec));
+    return `${pad2(Math.floor(sec / 60))}:${pad2(sec % 60)}`;
+  }
+  function tz(offMin) {
+    const d = new Date(Date.now() + offMin * 60000);
+    return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}`;
+  }
+  function moonFrac() {
+    const syn = 29.530588853;
+    let p = ((Date.now() - 947182440000) / 86400000) % syn;
+    if (p < 0) p += syn;
+    return p / syn;
+  }
+  function moonName(p) {
+    return MOON_NAMES[Math.floor(p * 8 + 0.5) % 8];
+  }
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  }
+
+  /* ------------------------------------------------------------ chrome bits */
+  function osHeader(title, sub) {
+    return `<div class="hdr" data-quick="1">
+      <div>
+        <div class="title">${title}</div>
+        <div class="sub">${sub}<span class="qhint">QUICK ▾</span></div>
+      </div>
+      <div class="hdr-r">
+        <span class="conn">LINK</span>
+        <span class="batt">82%</span>
+        <button class="exit" data-go="chooser">EXIT</button>
+      </div>
+    </div>`;
+  }
+
+  function tabbar(tabs, active) {
+    return `<div class="tabbar">${tabs.map(([label, go]) =>
+      `<button class="tab ${go === active ? "on" : ""}" data-go="${go}">${label}</button>`).join("")}</div>`;
+  }
+
+  function shell(os, title, sub, tabs, active, body, scroll, style) {
+    const th = THEME_ACCENTS[S.sys.theme];
+    const st = [th ? `--accent:${th}` : "", style || ""].filter(Boolean).join(";");
+    return `<div class="scr ${os}" ${st ? `style="${st}"` : ""}>
+      ${osHeader(title, sub)}
+      <div class="body ${scroll ? "scroll" : ""}">${body}</div>
+      ${tabbar(tabs, active)}
+    </div>`;
+  }
+
+  function toggleRow(label, on, act, arg) {
+    return `<button class="toggle ${on ? "" : "off"}" data-act="${act}" ${arg !== undefined ? `data-arg="${arg}"` : ""}>
+      <span>${label}</span><b>${on ? "ON" : "OFF"}</b></button>`;
+  }
+
+  /* --------------------------------------------------------------- chooser */
+  function chooser() {
+    const cards = [
+      { name: "NoirOS", l1: "EVERYDAY MINIMAL", l2: "inbox / focus / world clock", c: "#6e9bd1", go: "boot-noir" },
+      { name: "CrownOS", l1: "LUXURY FACES", l2: "studio / occasions / events", c: "#c9a44c", go: "boot-crown" },
+      { name: "NightOS", l1: "NINJA UTILITY", l2: "shadow / quiet / schedule", c: "#b32a3c", go: "boot-night" }
+    ];
+    const nextAlarm = nextAlarmStr();
+    return `<div class="scr chooser">
+      <div class="chdr">
+        <div>
+          <div class="brand">DUALCORE</div>
+          <div class="k">SPECIAL EDITIONS</div>
+        </div>
+        <div class="meta">82%<br><span data-date>${fmtDate(new Date())}</span></div>
+      </div>
+      <div class="statline">${notifs.filter(n => !n.read).length} UNREAD &nbsp;/&nbsp;
+        ${nextAlarm ? "ALARM " + nextAlarm : "NO ALARM"} &nbsp;/&nbsp; LINK UP</div>
+      <div class="cbody">
+        ${cards.map(c => `<button class="os-card" style="--c:${c.c}" data-go="${c.go}">
+          <span>
+            <span class="on" style="display:block">${c.name}</span>
+            <span class="ol1" style="display:block">${c.l1}</span>
+            <span class="ol2" style="display:block">${c.l2}</span>
+          </span>
+          <span class="or">LAUNCH
+            ${S.lastOS === c.name ? `<span class="lastbadge" style="display:block">LAST</span>` : ""}
+          </span>
+        </button>`).join("")}
+      </div>
+      <div class="cfoot">
+        <button class="btn" data-act="launcher">TO LAUNCHER</button>
+        <button class="btn" data-go="diag">DIAGNOSTICS</button>
+      </div>
+      <div class="chint">HOLD BOOT 1.5s = LAUNCHEROS</div>
+    </div>`;
+  }
+
+  function nextAlarmStr() {
+    const on = S.alarms.filter(a => a.on);
+    if (!on.length) return "";
+    return on.map(a => `${pad2(a.h)}:${pad2(a.m)}`)[0];
+  }
+
+  /* ---------------------------------------------------------------- NoirOS */
+  function noirHome() {
+    // A real wallpaper is a PSRAM bitmap on the watch; the mockup stands in
+    // with a dark gradient so the layout and the scrim can be judged.
+    const wallStyle = S.sys.wall
+      ? "background-image:linear-gradient(180deg,rgba(0,0,0,.45),rgba(0,0,0,.7)),linear-gradient(135deg,#22333f,#0a1118 45%,#3c2e1b);background-size:cover"
+      : "";
+    const clock = S.noirClock === "analog"
+      ? `<div class="row" style="align-items:flex-start">
+           ${dial({ numerals: true, secs: true })}
+           <div style="text-align:right;padding-top:8px">
+             <div class="date" data-date>${fmtDate(new Date())}</div>
+             <div class="label" style="margin-top:12px">CLOCK</div>
+             <button class="btn sm" style="margin-top:6px" data-act="noirclock">ANALOGUE</button>
+           </div>
+         </div>`
+      : `<div>
+           <div class="clock" data-clock>${fmtTime(new Date())}</div>
+           <div class="date" data-date>${fmtDate(new Date())}</div>
+         </div>`;
+
+    return shell("noir", "NoirOS", "EVERYDAY / FOCUS", NOIR_TABS, "noir-home", `
+      <div class="row" style="align-items:flex-start">
+        ${clock}
+        ${S.noirClock === "digital"
+          ? `<button class="btn sm" data-act="noirclock">ANALOGUE</button>` : ""}
+      </div>
+      <div class="row">
+        <span class="accent small">${BATTERY.pct}% BATTERY · ${BATTERY.est}</span>
+        <span class="dim small">${WEATHER.valid ? WEATHER.temp + "C " + WEATHER.cond : "NO WEATHER"}</span>
+      </div>
+      <div class="card agenda">
+        <div class="label">NEXT EVENTS</div>
+        ${events.slice(0, 3).map(e => `<div class="agenda-row">
+          <span>${e.t}</span><span class="accent" data-at="${e.at}">${durShort((e.at - Date.now()) / 1000)}</span>
+        </div>`).join("")}
+      </div>
+      <div class="tiles">
+        <button class="tile" data-go="noir-inbox">
+          <span class="tt">INBOX</span>
+          <span class="ts">${notifs.filter(n => !n.read).length} UNREAD</span>
+        </button>
+        <button class="tile" data-go="noir-tools">
+          <span class="tt">FOCUS</span><span class="ts">${S.focus.min} MIN</span>
+        </button>
+        <button class="tile" data-go="noir-tools">
+          <span class="tt">WORLD</span><span class="ts">${CITIES.length} CITIES</span>
+        </button>
+        <button class="tile" data-go="noir-tools">
+          <span class="tt">MUSIC</span><span class="ts">PAUSED</span>
+        </button>
+      </div>
+    `, true, wallStyle);
+  }
+
+  function noirInbox() {
+    const unread = notifs.filter(n => !n.read).length;
+    return shell("noir", "NoirOS", "EVERYDAY / FOCUS", NOIR_TABS, "noir-inbox", `
+      <div class="row">
+        <span class="label">${unread} UNREAD / ${notifs.length}</span>
+        <span class="row tight">
+          <button class="btn sm" data-act="readall">READ ALL</button>
+          <button class="btn sm" data-act="clearread">CLEAR READ</button>
+        </span>
+      </div>
+      ${notifs.length === 0 ? `
+        <div style="margin-top:26px">
+          <div style="font-size:20px;font-weight:600">INBOX EMPTY</div>
+          <div class="dim" style="font-size:12px;line-height:1.6;margin-top:10px">
+            Notifications arrive from the phone link and stay here across experience switches.</div>
+          <button class="btn" style="margin-top:18px" data-act="simulate">SIMULATE ALERT</button>
+        </div>` : notifs.map((n, i) => `
+        <div class="notif ${n.read ? "" : "unread"}" data-act="open" data-arg="${i}">
+          <span class="nt">${esc(n.title)}</span>
+          <span class="nx" data-act="dismiss" data-arg="${i}" role="button" aria-label="Dismiss">X</span>
+          <span class="nb">${esc(n.body)}</span>
+          <span class="nw">${n.when}</span>
+          <span class="na">${esc(n.app)}</span>
+        </div>`).join("")}
+      ${notifs.length ? `<div class="dim" style="font-size:9px;letter-spacing:.04em">
+        X dismisses one alert; opening it marks it read.</div>` : ""}
+    `, true);
+  }
+
+  function noirTools() {
+    return shell("noir", "NoirOS", "EVERYDAY / FOCUS", NOIR_TABS, "noir-tools", `
+      <div class="card">
+        <div class="row"><span class="label">PHONE MEDIA</span><span class="accent small">PAUSED</span></div>
+        <div style="font-size:15px;margin-top:7px">Midnight Drive</div>
+        <div class="dim" style="font-size:10px;margin-top:2px">DualCore FM</div>
+        <div class="row tight" style="margin-top:10px">
+          <button class="btn sm" data-act="media">PREV</button>
+          <button class="btn sm primary" style="flex:1" data-act="media">PLAY</button>
+          <button class="btn sm" data-act="media">NEXT</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="row"><span class="label">WEATHER</span>
+          <span class="dim" style="font-size:9px">from phone</span></div>
+        ${WEATHER.valid ? `<div class="row" style="align-items:baseline;margin-top:6px">
+          <span style="font-size:26px;line-height:1">${WEATHER.temp}C</span>
+          <span class="accent" style="font-size:12px">${WEATHER.cond}</span>
+          <span class="dim" style="font-size:10px">H${WEATHER.hi} L${WEATHER.lo}</span>
+        </div>` : `<div class="dim" style="font-size:11px;margin-top:8px">No weather data yet.</div>`}
+      </div>
+      <div class="card">
+        <div class="row"><span class="label">FOCUS</span>
+          <span class="dim" style="font-size:10px">${S.focus.sessions} SESSIONS</span></div>
+        <div class="focus-time" data-timer style="margin-top:6px">${mmss(S.focus.left)}</div>
+        <div class="row tight" style="margin-top:9px">
+          <button class="btn sm" data-act="focus-minus">-5</button>
+          <button class="btn sm" data-act="focus-plus">+5</button>
+          <button class="btn sm primary" style="flex:1" data-act="focus-toggle">${S.focus.run ? "PAUSE" : "START"}</button>
+          <button class="btn sm" data-act="focus-reset">RESET</button>
+        </div>
+        <div class="presets" style="margin-top:8px">
+          ${[5, 15, 25, 45].map(m => `<button class="btn" data-act="preset" data-arg="${m}">${m} MIN</button>`).join("")}
+        </div>
+        <div class="hr" style="margin:10px 0 8px"></div>
+        <div class="row">
+          <span class="label">STOPWATCH</span>
+          <span style="font-size:14px;font-variant-numeric:tabular-nums" data-sw>00:00.0</span>
+          <span class="row tight">
+            <button class="btn sm" data-act="sw-toggle">${S.sw.run ? "STOP" : "GO"}</button>
+            <button class="btn sm" data-act="sw-reset">RESET</button>
+          </span>
+        </div>
+      </div>
+      <div class="card wclock">
+        <div class="row"><span class="label">WORLD CLOCK</span><span class="dim" style="font-size:9px">fixed UTC offset</span></div>
+        ${CITIES.map(([n, o]) => `<div class="row"><b>${n}</b><span class="accent">${tz(o)}</span></div>`).join("")}
+      </div>
+      <div class="card">
+        <div class="label" style="margin-bottom:7px">QUICK SETTINGS</div>
+        <button class="toggle" data-act="t24"><span>CLOCK</span><b>${S.t24 ? "24 HOUR" : "12 HOUR"}</b></button>
+        <button class="toggle" style="margin-top:6px" data-act="privacy"><span>PRIVACY</span><b>${PRIVACY[S.privacy]}</b></button>
+        <button class="toggle" style="margin-top:6px" data-act="power"><span>POWER</span><b>${POWER[S.power]}</b></button>
+        <button class="toggle" style="margin-top:6px" data-go="alarms"><span>ALARMS</span><b>${nextAlarmStr() ? "NEXT " + nextAlarmStr() : "NONE SET"}</b></button>
+      </div>
+    `, true);
+  }
+
+  /* --------------------------------------------------------------- CrownOS
+     The FACE page is the whole watch.  No header, no tab bar, no card: the
+     dial is drawn edge to edge at 410 x 502 as SVG, tap brings the chrome
+     back over it, and a horizontal swipe pages to Studio / Events / Almanac.
+     The styles track the firmware's FACE_STYLES list one for one. */
+  const FF = { cx: 205, cy: 250, R: 190, D: 174 };
+  const f1 = n => (Math.round(n * 10) / 10).toString();
+  function polar(cx, cy, r, deg) {
+    const a = (deg - 90) * Math.PI / 180;
+    return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
+  }
+  const svgLine = (x1, y1, x2, y2, col, w, cap = "round") =>
+    `<line x1="${f1(x1)}" y1="${f1(y1)}" x2="${f1(x2)}" y2="${f1(y2)}" stroke="${col}" stroke-width="${w}" stroke-linecap="${cap}"/>`;
+  const svgCircle = (cx, cy, r, fill, stroke, w) =>
+    `<circle cx="${cx}" cy="${cy}" r="${r}" fill="${fill || "none"}"${stroke ? ` stroke="${stroke}" stroke-width="${w || 1}"` : ""}/>`;
+  const svgText = (x, y, s, size, col, ls, weight, attrs = "") =>
+    `<text x="${x}" y="${y}" text-anchor="middle" font-size="${size}" fill="${col}"` +
+    `${ls ? ` letter-spacing="${ls}"` : ""} font-weight="${weight || 500}"${attrs}>${s}</text>`;
+
+  function svgMarkers(cx, cy, r, len, w, col, quartersOnly) {
+    let o = "";
+    for (let i = 0; i < 12; i++) {
+      if (quartersOnly && i % 3) continue;
+      const L = i % 3 === 0 ? len : Math.round(len * 0.66);
+      const [x1, y1] = polar(cx, cy, r - L, i * 30);
+      const [x2, y2] = polar(cx, cy, r, i * 30);
+      o += svgLine(x1, y1, x2, y2, col, i % 3 === 0 ? w : Math.max(2, w - 2));
+    }
+    return o;
+  }
+  function svgMinutes(cx, cy, r, col) {
+    let o = "";
+    for (let i = 0; i < 60; i++) {
+      const L = i % 5 === 0 ? 11 : 5;
+      const [x1, y1] = polar(cx, cy, r - L, i * 6);
+      const [x2, y2] = polar(cx, cy, r, i * 6);
+      o += svgLine(x1, y1, x2, y2, col, 1, "butt");
+    }
+    return o;
+  }
+  function svgHands(cx, cy, r, fg, secCol, showSec) {
+    const now = new Date();
+    const H = now.getHours() % 12, M = now.getMinutes(), Sec = now.getSeconds();
+    const rot = (a, inner) =>
+      `<g id="${inner}" transform="rotate(${a} ${cx} ${cy})">`;
+    return `
+      <g id="hh" transform="rotate(${H * 30 + M * 0.5} ${cx} ${cy})">
+        <line x1="${cx}" y1="${cy + 14}" x2="${cx}" y2="${cy - r * 0.52}" stroke="${fg}" stroke-width="7" stroke-linecap="round"/>
+      </g>
+      <g id="mh" transform="rotate(${M * 6 + Sec * 0.1} ${cx} ${cy})">
+        <line x1="${cx}" y1="${cy + 18}" x2="${cx}" y2="${cy - r * 0.76}" stroke="${fg}" stroke-width="5" stroke-linecap="round"/>
+      </g>
+      ${showSec ? `<g id="sh" transform="rotate(${Sec * 6} ${cx} ${cy})">
+        <line x1="${cx}" y1="${cy + 26}" x2="${cx}" y2="${cy - r * 0.86}" stroke="${secCol}" stroke-width="2" stroke-linecap="round"/>
+      </g>` : ""}
+      ${svgCircle(cx, cy, 7, secCol)}${svgCircle(cx, cy, 3, "#0b0a07")}`;
+  }
+  function svgGuilloche(cx, cy, r, col) {
+    let o = "";
+    for (let k = 1; k <= 4; k++) o += svgCircle(cx, cy, (r * k) / 5, "none", col, 1);
+    for (let i = 0; i < 72; i++) {
+      const [x1, y1] = polar(cx, cy, 26, i * 5);
+      const [x2, y2] = polar(cx, cy, r - 10, i * 5);
+      o += svgLine(x1, y1, x2, y2, col, 1, "butt");
+    }
+    return o;
+  }
+  function svgSerpent(cx, cy, gold, shade) {
+    let o = "";
+    const n = 40;
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1);
+      const ang = t * 4.6 * 2 * Math.PI + 0.6;
+      const rad = 34 + t * 116;
+      const sz = 17 - t * 8;
+      o += svgCircle(cx + Math.sin(ang) * rad, cy - Math.cos(ang) * rad, sz / 2,
+        i % 2 ? gold : shade);
+    }
+    const ang = 4.6 * 2 * Math.PI + 0.6;
+    const hx = cx + Math.sin(ang) * 150, hy = cy - Math.cos(ang) * 150;
+    o += `<ellipse cx="${f1(hx)}" cy="${f1(hy)}" rx="13" ry="10" fill="${gold}"/>`;
+    o += svgLine(hx - 3, hy - 12, hx - 5, hy - 22, gold, 4);
+    o += svgLine(hx + 4, hy - 12, hx + 7, hy - 24, gold, 4);
+    o += svgCircle(hx - 4, hy - 2, 2.5, "#1a1206");
+    for (let i = 0; i < 3; i++)
+      o += svgLine(cx - 60 + i * 8, cy + 40, cx - 130 + i * 20, cy + 96 - i * 10, gold, 3);
+    return o;
+  }
+  function svgGear(cx, cy, r, metal, dark, teeth, jewel) {
+    let o = svgCircle(cx, cy, r, dark) + svgCircle(cx, cy, r, "none", metal, 2);
+    for (let i = 0; i < teeth; i++) {
+      const [x, y] = polar(cx, cy, r + 3, (360 / teeth) * i);
+      o += `<rect x="${f1(x - 2)}" y="${f1(y - 2)}" width="4" height="4" fill="${metal}"/>`;
+    }
+    for (let i = 0; i < 3; i++) {
+      const [x1, y1] = polar(cx, cy, r - 6, i * 120 + 90);
+      const [x2, y2] = polar(cx, cy, r - 6, i * 120 + 270);
+      o += svgLine(x1, y1, x2, y2, metal, 3);
+    }
+    o += svgCircle(cx, cy, r / 4, "none", metal, 2) + svgCircle(cx, cy, 5, jewel);
+    return o;
+  }
+  function svgSubdial(cx, cy, r, ring, fg, cap, val) {
+    let o = svgCircle(cx, cy, r, "none", ring, 2);
+    for (let i = 0; i < 12; i++) {
+      const [x, y] = polar(cx, cy, r - 7, i * 30);
+      o += svgCircle(x, y, i % 3 === 0 ? 1.6 : 1, fg);
+    }
+    o += svgText(cx, cy - 2, cap, 8, fg, 1.4);
+    o += svgText(cx, cy + 18, val, 12, fg, 0, 600);
+    return o;
+  }
+  function svgTachy(cx, cy, r, col) {
+    const v = ["400", "300", "240", "200", "160", "140", "120", "100", "80", "70", "65", "60"];
+    return v.map((n, i) => {
+      const [x, y] = polar(cx, cy, r, i * 30);
+      return svgText(x, y + 3, n, 9, col, 0);
+    }).join("");
+  }
+
+  // One function, one switch: the same shape as crown_paint() in the firmware.
+  function faceSVG(face, accent, bg) {
+    const { cx, cy, R, D } = FF;
+    const style = face.style;
+    const secs = !!S.crown.secs;
+    const now = new Date();
+    const time = fmtTime(now);
+    const date = fmtDate(now);
+    let o = "";
+
+    const caseRing = (col, w) => svgCircle(cx, cy, R, "none", col, w);
+    const dialPlate = (col) => svgCircle(cx, cy, D, col) + svgCircle(cx, cy, D, "none", accent, 2);
+    const fluted = () =>
+      `<circle cx="${cx}" cy="${cy}" r="${R - 7}" fill="none" stroke="${accent}" stroke-width="13"
+         stroke-dasharray="2 6.6" opacity=".92"/>`;
+
+    if (style === "MINIMAL") {
+      o += svgCircle(cx, cy, D - 4, "none", accent, 2);
+      o += svgCircle(cx, cy, D - 34, "none", "#2a2a2a", 1);
+      o += svgText(cx, cy + 4, `<tspan data-clock>${time}</tspan>`, 54, "#f2ead8", 2, 600);
+      o += svgText(cx, cy + 46, `<tspan data-date>${date}</tspan>`, 13, "#8a7a5e", 1);
+      o += svgText(cx, cy + 86, "DUALCORE  QUARTZ", 9, accent, 4);
+      o += svgText(cx, 88, "MINUIT", 15, "#8a7a5e", 5);
+    } else if (style === "MOON") {
+      o += caseRing(accent, 3) + dialPlate(bg) + svgMinutes(cx, cy, D - 10, "#6a5b3e");
+      const p = moonFrac();
+      const lit = p < 0.5 ? p : 1 - p;
+      const off = Math.round(4 * 86 * lit) * (p < 0.5 ? -1 : 1);
+      o += `<defs><clipPath id="mc"><circle cx="${cx}" cy="${cy - 46}" r="86"/></clipPath></defs>`;
+      o += svgCircle(cx, cy - 46, 86, "#efe6d2");
+      o += `<circle cx="${cx + off}" cy="${cy - 46}" r="86" fill="${bg}" clip-path="url(#mc)"/>`;
+      o += svgText(cx, cy + 68, moonName(p), 10, accent, 3);
+      o += svgText(cx, cy + 124, `<tspan data-clock>${time}</tspan>`, 42, "#f2ead8", 1, 600);
+      o += svgText(cx, cy + 164, `<tspan data-date>${date}</tspan>`, 11, "#8a7a5e", 1);
+      o += svgText(cx, 92, "LUNE", 15, accent, 5);
+    } else if (style === "SOVEREIGN") {
+      o += caseRing(accent, 3) + fluted();
+      o += svgCircle(cx, cy, D, "#1e1709") + svgGuilloche(cx, cy, D - 14, "#4b3b19");
+      o += svgMarkers(cx, cy, D - 24, 20, 6, accent);
+      o += `<rect x="${cx - 44}" y="${cy - 148}" width="88" height="28" rx="4" fill="#f3e9d2" stroke="${accent}"/>`;
+      o += svgText(cx, cy - 128, new Date().toLocaleDateString("en-GB", { weekday: "short" }).toUpperCase(),
+        12, "#171006", 1.5, 700, ' data-sovday="1"');
+      o += svgText(cx, cy - 100, "DUALCORE", 9, accent, 5);
+      o += svgText(cx, cy - 44, `<tspan data-clock>${time}</tspan>`, 50, "#f2dca6", 1, 600);
+      o += svgText(cx, cy + 10, "SOVEREIGN", 11, accent, 4);
+      o += svgText(cx, cy + 28, "CHRONOMETER", 8, "#8a7442", 2);
+      o += `<rect x="${cx + 96}" y="${cy - 16}" width="62" height="32" rx="3" fill="#f3e9d2" stroke="${accent}"/>`;
+      o += svgText(cx + 127, cy + 6, pad2(now.getDate()), 15, "#171006", 0, 700, ' data-sovdate="1"');
+      o += svgCircle(cx + 127, cy, 25, "none", accent, 1);
+      o += svgText(cx, cy + 120, "VI", 10, accent, 1);
+      o += svgText(cx - 136, cy + 4, "IX", 10, accent, 1);
+    } else if (style === "SERPENT") {
+      o += caseRing(accent, 3) + fluted();
+      o += svgCircle(cx, cy, D, "#0a0806") + svgGuilloche(cx, cy, D - 12, "#3a2c12");
+      o += svgSerpent(cx, cy, "#d8b45a", "#9c7a2c");
+      o += svgMarkers(cx, cy, D - 26, 18, 5, accent);
+      o += svgText(cx, cy - 132, "DUALCORE", 9, accent, 5);
+      o += `<rect x="${cx - 104}" y="${cy - 34}" width="208" height="68" rx="12" fill="#070604" opacity=".88"/>`;
+      o += svgText(cx, cy + 12, `<tspan data-clock>${time}</tspan>`, 46, "#f6e9c8", 1, 600);
+      o += svgText(cx, cy + 66, "SERPENT", 11, accent, 4);
+      o += svgText(cx, cy + 142, `<tspan data-date>${date}</tspan>`, 11, "#b9a472", 1);
+    } else if (style === "CHRONO") {
+      o += caseRing("#b9bcc2", 4) + svgCircle(cx, cy, D, "#f1efe9");
+      o += svgTachy(cx, cy, D - 14, "#2a2a2a") + svgMinutes(cx, cy, D - 30, "#1c1c1c");
+      o += svgMarkers(cx, cy, D - 40, 20, 6, "#101010");
+      o += svgSubdial(cx - 92, cy - 24, 44, "#2a2a2a", "#1a1a1a", "CHRONO", "60");
+      o += svgSubdial(cx + 92, cy - 24, 44, "#2a2a2a", "#1a1a1a", "MIN", "30");
+      o += svgSubdial(cx, cy + 104, 44, "#2a2a2a", "#1a1a1a", "SEC", pad2(now.getSeconds()));
+      o += svgHands(cx, cy, 132, "#111111", "#c8323c", secs);
+      o += svgText(cx, cy - 128, "DUALCORE", 15, "#111111", 4);
+      o += svgText(cx, cy - 108, "CHRONOGRAPH  AUTOMATIC", 8, "#4a4a4a", 2);
+      o += svgText(cx, cy + 162, `<tspan data-date>${date}</tspan>`, 11, "#2a2a2a", 1);
+    } else if (style === "SKELETON") {
+      o += caseRing("#5a5f66", 3) + svgCircle(cx, cy, D, "#131418");
+      [[-120, -150], [118, -110], [-70, -110], [96, -190]].forEach(([dx, y], i) => {
+        o += svgLine(cx + dx, cy + y, cx + dx / 3, cy + 160 - (i % 2) * 50, "#3a3e45", 16);
+      });
+      o += svgGear(cx - 96, cy - 86, 48, "#8d939c", "#1b1d22", 22, "#9b2c4a");
+      o += svgGear(cx + 104, cy - 62, 34, "#8d939c", "#1b1d22", 16, "#2c5a9b");
+      o += svgGear(cx + 58, cy + 108, 58, "#b0b6be", "#1b1d22", 26, "#9b2c4a");
+      o += svgGear(cx - 84, cy + 96, 26, "#8d939c", "#1b1d22", 14, "#2c9b7a");
+      o += `<rect x="${cx - 96}" y="${cy - 40}" width="192" height="76" rx="14" fill="#000" opacity=".82"/>`;
+      o += svgText(cx, cy + 12, `<tspan data-clock>${time}</tspan>`, 46, "#f2f4f7", 1, 600);
+      o += svgText(cx, cy - 140, "DUALCORE", 9, accent, 5);
+      o += svgText(cx, cy + 58, "SQUELETTE", 8, "#8d939c", 3);
+      o += svgText(cx, cy + 152, `<tspan data-date>${date}</tspan>`, 11, "#8d939c", 1);
+    } else if (style === "DIVE") {
+      o += svgCircle(cx, cy, R + 4, "none", "#22262a", 8);
+      for (let i = 0; i < 60; i++) {
+        const maj = i % 5 === 0;
+        const [x1, y1] = polar(cx, cy, R - 12, i * 6);
+        const [x2, y2] = polar(cx, cy, R - 2, i * 6);
+        o += svgLine(x1, y1, x2, y2, maj ? "#e8eef2" : "#6e767c", maj ? 3 : 1, "butt");
+      }
+      o += svgCircle(cx, cy, D, "#090b0d") + svgCircle(cx, cy, 5, "#d8b45a");
+      o += svgMinutes(cx, cy, D - 10, "#4a5054");
+      o += svgMarkers(cx, cy, D - 26, 26, 8, "#e8eef2");
+      o += svgHands(cx, cy, 146, "#f2f5f7", "#c8323c", true);
+      o += `<rect x="${cx + 92}" y="${cy - 15}" width="74" height="30" rx="3" fill="#f2f5f7"/>`;
+      o += svgText(cx + 112, cy + 6, new Date().toLocaleDateString("en-GB", { weekday: "short" }).toUpperCase(), 9, "#08090b", 1, 600);
+      o += svgText(cx + 148, cy + 6, pad2(now.getDate()), 14, "#08090b", 0, 700, ' data-sovdate="1"');
+      o += svgText(cx, cy - 126, "DUALCORE", 15, "#c8323c", 4);
+      o += svgText(cx, cy - 106, "DIVER  200 m", 9, "#e8eef2", 3);
+      o += svgText(cx, cy + 138, `<tspan data-date>${date}</tspan>`, 11, "#9aa3a9", 1);
+    } else if (style === "PHOTO") {
+      o += `<defs><linearGradient id="pg" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#3c4048"/><stop offset=".55" stop-color="#191c22"/>
+        <stop offset="1" stop-color="#0a0b0e"/></linearGradient></defs>`;
+      o += `<rect width="410" height="502" fill="url(#pg)"/>`;
+      o += svgText(cx, 190, "PHOTO DIAL", 17, "#e8eef2", 6);
+      o += svgText(cx, 214, "drop dial.raw in assets/faces", 9, "#9aa3a9", 1.4);
+      o += `<rect y="386" width="410" height="116" fill="#000" opacity=".6"/>`;
+      o += svgText(cx, 448, `<tspan data-clock>${time}</tspan>`, 48, "#ffffff", 1, 600);
+      o += svgText(cx, 476, `<tspan data-date>${date}</tspan>`, 11, "#d8dee6", 1);
+    } else {
+      // CLASSIC / DUAL TIME / ROMAN
+      o += caseRing(accent, 3) + dialPlate(bg) + svgMinutes(cx, cy, D - 8, accent);
+      if (style === "ROMAN") {
+        ["XII", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI"].forEach((n, i) => {
+          const [x, y] = polar(cx, cy, D - 26, i * 30);
+          o += svgText(x, y + 4, n, 11, "#f2ead8", 1);
+        });
+      } else {
+        o += svgMarkers(cx, cy, D - 22, 16, 5, accent);
+      }
+      o += svgHands(cx, cy, 148, "#f2ead8", accent, secs);
+      if (style !== "ROMAN") {
+        [12, 3, 6, 9].forEach((n, i) => {
+          const [x, y] = polar(cx, cy, D - 52, i * 90);
+          o += svgText(x, y + 6, n, 16, "#f2ead8", 1);
+        });
+      }
+      o += svgText(cx, cy + 72, `<tspan data-date>${date}</tspan>`, 11, "#8a7a5e", 1);
+      o += svgText(cx, cy - 148, "DUALCORE", 15, accent, 5);
+      o += svgText(cx, cy - 128, style, 8, "#8a7a5e", 3);
+    }
+
+    return `<svg viewBox="0 0 410 502" xmlns="http://www.w3.org/2000/svg">
+      <rect width="410" height="502" fill="#000"/>${o}</svg>`;
+  }
+
+  function crownChrome(face, accent) {
+    return `
+      <div class="ffhdr">
+        <div>
+          <div class="title">CrownOS</div>
+          <div class="sub">${face.name}<span class="qhint">${S.crown.profile}</span></div>
+        </div>
+        <div class="hdr-r">
+          <span class="conn">LINK</span><span class="batt">82%</span>
+          <button class="exit" data-act="crownchrome">HIDE</button>
+          <button class="exit" data-go="chooser">✕</button>
+        </div>
+      </div>
+      <div class="fftab">
+        ${CROWN_TABS.map(([label, target]) => `<button class="tab ${target === "crown-face" ? "on" : ""}"
+          data-go="${target}">${label}</button>`).join("")}
+      </div>`;
+  }
+
+  function crownFace() {
+    const face = FACES[S.crown.face] || FACES[0];
+    const accent = ACCENTS[S.crown.accent];
+    const bg = BGS[S.crown.bg];
+    return `<div class="scr crown ffscr" style="--bg:${bg};--accent:${accent}">
+      <div class="ffface${S.glitchOn ? " glitch" : ""}">
+        ${faceSVG(face, accent, bg)}
+        <i class="sl"></i><i class="sl"></i><i class="sl"></i>
+        <i class="sl"></i><i class="sl"></i><i class="sl"></i>
+      </div>
+      ${S.crownChrome ? crownChrome(face, accent)
+        : `<div class="ffhint">TAP · SWIPE</div>
+           <div class="ffbadge">${face.name} · ${face.style}</div>`}
+    </div>`;
+  }
+
+  function crownStudio() {
+    const face = FACES[S.crown.face];
+    return shell("crown", "CrownOS", "FACES / OCCASIONS", CROWN_TABS, "crown-studio", `
+      <button class="btn wide" data-go="crown-face" style="color:${ACCENTS[S.crown.accent]};border-color:${ACCENTS[S.crown.accent]}">
+        ↑  OPEN THE WATCH FACE</button>
+      <div class="dim" style="font-size:9px">The face is the whole screen. Tap it for the chrome, swipe it to move between pages.</div>
+      <div class="row"><span class="label">SAVED FACES</span><span class="dim" style="font-size:9px">${FACES.length} / 16</span></div>
+      ${FACES.map((f, i) => `<div class="evrow" style="cursor:pointer;${i === S.crown.face ? "border-color:" + ACCENTS[S.crown.accent] : ""}" data-act="face" data-arg="${i}">
+        <div style="flex:1">
+          <div class="et" style="${i === S.crown.face ? "color:" + ACCENTS[S.crown.accent] : ""}">${f.name}</div>
+          <div class="ea">${f.style}${f.user ? " · USER" : " · PRESET"}</div>
+        </div>
+        ${i === S.crown.face ? `<span style="font-size:8px;letter-spacing:.16em;color:${ACCENTS[S.crown.accent]}">ACTIVE</span>` : ""}
+      </div>`).join("")}
+      <div class="label" style="margin-top:4px">ACCENT</div>
+      <div class="swatches">
+        ${ACCENTS.map((c, i) => `<button class="sw ${i === S.crown.accent ? "on" : ""}" style="background:${c}" data-act="accent" data-arg="${i}" aria-label="${ACCENT_NAMES[i]}"></button>`).join("")}
+      </div>
+      <div class="label">BACKGROUND</div>
+      <div class="swatches">
+        ${BGS.map((c, i) => `<button class="sw sq ${i === S.crown.bg ? "on" : ""}" style="background:${c}" data-act="bg" data-arg="${i}"></button>`).join("")}
+      </div>
+      ${toggleRow("COMPLICATIONS", !!S.crown.compl, "toggle", "compl")}
+      ${toggleRow("SIGNATURE ANIMATION", !!S.crown.anim, "toggle", "anim")}
+      ${toggleRow("SECONDS HAND", !!S.crown.secs, "toggle", "secs")}
+      ${toggleRow("EVENT ALERTS 15 MIN", !!S.crown.alerts, "toggle", "alerts")}
+      <button class="toggle" data-act="glitch"><span>DIAL GLITCH</span><b>${["OFF", "RARE", "OFTEN"][S.crown.glitch]}</b></button>
+      <div class="label" style="margin-top:2px">OCCASION</div>
+      <div class="grid2">
+        ${OCCASIONS.map(o => `<button class="btn ${o === S.crown.profile ? "primary" : ""}" data-act="occasion" data-arg="${o}">${o}</button>`).join("")}
+      </div>
+      <div class="grid2" style="margin-top:2px">
+        <button class="btn" data-act="saveas">SAVE AS NEW</button>
+        <button class="btn ${face.user ? "" : "bare dim"}" data-act="overwrite">${face.user ? "OVERWRITE" : "PRESET LOCKED"}</button>
+      </div>
+    `, true);
+  }
+
+  function crownEvents() {
+    return shell("crown", "CrownOS", "FACES / OCCASIONS", CROWN_TABS, "crown-events", `
+      <div class="row">
+        <span class="label">EVENT COUNTDOWNS</span>
+        <button class="btn sm" data-act="evclear">CLEAR</button>
+      </div>
+      ${events.length ? events.map((e, i) => `
+        <div class="evrow">
+          <div style="flex:1">
+            <div class="et">${e.t}</div>
+            <div class="ea">${new Date(e.at).toLocaleString(undefined, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}</div>
+          </div>
+          <div class="ec" data-at="${e.at}">${durShort((e.at - Date.now()) / 1000)}</div>
+          <button class="ex" data-act="evdel" data-arg="${i}" aria-label="Delete event">X</button>
+        </div>`).join("") : `<div class="card"><div class="dim" style="font-size:12px">No events yet. Add a preset below; countdowns use the shared clock.</div></div>`}
+      <div class="label" style="margin-top:4px">ADD PRESET (bounded to 8)</div>
+      <div class="grid2">
+        <button class="btn" data-act="evadd" data-arg="2h">DINNER +2H</button>
+        <button class="btn" data-act="evadd" data-arg="1d">MEETING +1D</button>
+        <button class="btn" data-act="evadd" data-arg="3d">FLIGHT +3D</button>
+        <button class="btn" data-act="evadd" data-arg="7d">PARTY +7D</button>
+      </div>
+      <div class="dim" style="font-size:9px;line-height:1.5;margin-top:2px">
+        Every row can be removed with X — no reset needed.</div>
+    `, true);
+  }
+
+  /* --------------------------------------------------------------- NightOS */
+  function nightCls() {
+    return "night" + (S.night.palette === "crimson" ? " crimson" : "");
+  }
+  function nightHome() {
+    return `<div class="scr ${nightCls()}">
+      ${osHeader("NightOS", "SHADOW / UTILITY")}
+      <div class="body">
+        <div class="clock" data-clock>${fmtTime(new Date())}</div>
+        <div class="date" data-date>${fmtDate(new Date())}</div>
+        <div class="row">
+          <span class="accent small">82% BATTERY</span>
+          <span class="dim small">${S.night.shadow ? "SHADOW ON" : "SHADOW OFF"}</span>
+        </div>
+        <div class="card">
+          <div class="row">
+            <div>
+              <div class="label">SHADOW MODE</div>
+              <div style="font-size:12px;margin-top:6px">${S.night.shadow ? "quiet / reduced light / no decoration" : "normal night operation"}</div>
+            </div>
+            <button class="btn ${S.night.shadow ? "primary" : ""}" data-act="shadow">${S.night.shadow ? "ON" : "OFF"}</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="row">
+            <div>
+              <div class="label">${S.focus.run ? "TIMER RUNNING" : "NEXT"}</div>
+              <div style="font-size:${S.focus.run ? "24px" : "12px"};margin-top:6px;font-variant-numeric:tabular-nums;${!S.focus.run && nextAlarmStr() ? "color:var(--accent)" : ""}"
+                   ${S.focus.run ? "data-timer" : ""}>${S.focus.run ? mmss(S.focus.left) : (nextAlarmStr() ? "Alarm " + nextAlarmStr() : "Nothing scheduled")}</div>
+            </div>
+            <div style="text-align:right">
+              <div class="label">SCHEDULE</div>
+              <div class="accent" style="font-size:12px;margin-top:6px">${S.night.sched ? `${pad2(S.night.start)}:00 - ${pad2(S.night.end)}:00` : "OFF"}</div>
+            </div>
+          </div>
+        </div>
+        <button class="toggle" data-act="quiet"><span>QUIET ALERTS</span><b>${QUIET[S.night.quiet]}</b></button>
+        <div class="dim" style="font-size:10px;line-height:1.5">
+          ${S.night.shadow ? "Essential alerts only; sender previews." : "Full previews follow the shared privacy setting."}
+        </div>
+      </div>
+      <div class="tabbar">${NIGHT_TABS.map(([l, go]) =>
+        `<button class="tab ${go === "night-home" ? "on" : ""}" data-go="${go}">${l}</button>`).join("")}</div>
+    </div>`;
+  }
+
+  function nightShadow() {
+    return `<div class="scr ${nightCls()}">
+      ${osHeader("NightOS", "SHADOW / UTILITY")}
+      <div class="body scroll">
+        <button class="btn ${S.night.shadow ? "primary" : ""}" style="padding:14px 0" data-act="shadow">
+          SHADOW MODE: ${S.night.shadow ? "ON" : "OFF"}</button>
+        <button class="toggle" data-act="quiet"><span>QUIET ALERTS</span><b>${QUIET[S.night.quiet]}</b></button>
+        <div class="label" style="margin-top:2px">NIGHT BRIGHTNESS</div>
+        <div class="row tight">
+          <button class="btn" data-act="bright" data-arg="-20">-</button>
+          <div class="card" style="flex:1;text-align:center;font-size:13px">${S.night.bright} / 255</div>
+          <button class="btn" data-act="bright" data-arg="20">+</button>
+        </div>
+        ${toggleRow("PALETTE: " + (S.night.palette === "crimson" ? "CRIMSON" : "NIGHT"), true, "palette")}
+        ${toggleRow("SCHEDULE", S.night.sched, "sched")}
+        <div class="row">
+          <span style="font-size:12px">ACTIVATE ${pad2(S.night.start)}:00</span>
+          <span class="row tight">
+            <button class="btn sm" data-act="hour" data-arg="start-">- 1 H</button>
+            <button class="btn sm" data-act="hour" data-arg="start+">+ 1 H</button>
+          </span>
+        </div>
+        <div class="row">
+          <span style="font-size:12px">EXIT ${pad2(S.night.end)}:00</span>
+          <span class="row tight">
+            <button class="btn sm" data-act="hour" data-arg="end-">- 1 H</button>
+            <button class="btn sm" data-act="hour" data-arg="end+">+ 1 H</button>
+          </span>
+        </div>
+        <div class="label">DAYS</div>
+        <div class="row tight">
+          ${["S", "M", "T", "W", "T", "F", "S"].map((d, i) =>
+            `<button class="btn sm ${S.night.days.includes(i) ? "primary" : ""}" style="flex:1;padding:9px 0"
+              data-act="day" data-arg="${i}">${d}</button>`).join("")}
+        </div>
+        <div class="dim" style="font-size:9px;line-height:1.6;margin-top:4px">
+          The schedule uses the shared clock. It cannot activate while the watch is powered
+          off, and this module does not deep-sleep, so timers and the link stay alive.
+        </div>
+      </div>
+      <div class="tabbar">${NIGHT_TABS.map(([l, go]) =>
+        `<button class="tab ${go === "night-shadow" ? "on" : ""}" data-go="${go}">${l}</button>`).join("")}</div>
+    </div>`;
+  }
+
+  function nightTools() {
+    const alarm = nextAlarmStr();
+    return `<div class="scr ${nightCls()}">
+      ${osHeader("NightOS", "SHADOW / UTILITY")}
+      <div class="body scroll">
+        <button class="btn" style="padding:13px 0;${S.overlay === "flash" && S.night.flash === 1 ? "background:#fff;color:#120a10;border-color:transparent" : S.overlay === "flash" && S.night.flash === 2 ? "background:#9a0010;color:#ffe0e4;border-color:transparent" : ""}"
+          data-act="flash">${S.overlay === "flash" ? (S.night.flash === 2 ? "FLASHLIGHT: RED / TAP" : "FLASHLIGHT: WHITE / TAP") : "FLASHLIGHT (WHITE > RED)"}</button>
+        <button class="btn" style="padding:12px 0" data-go="alarms">WAKE ALARM: ${alarm || "NONE"}</button>
+        <button class="btn" style="padding:12px 0" data-go="breathe">BREATHE&nbsp;&nbsp; 4 - 7 - 8</button>
+        <button class="btn" style="padding:12px 0" data-act="stealth">STEALTH DISPLAY</button>
+        <button class="toggle" data-act="power"><span>POWER PROFILE</span><b>${POWER[S.power]}</b></button>
+        <div class="card">
+          <div class="row"><span class="label">STOPWATCH</span>
+            <span style="font-size:20px;font-variant-numeric:tabular-nums" data-sw>00:00.0</span></div>
+          <div class="row tight" style="margin-top:8px">
+            <button class="btn sm" data-act="sw-toggle">${S.sw.run ? "STOP" : "START"}</button>
+            <button class="btn sm" data-act="sw-reset">RESET</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="row"><span class="label">COUNTDOWN</span>
+            <span style="font-size:20px;font-variant-numeric:tabular-nums" data-timer>${mmss(S.focus.left)}</span></div>
+          <div class="row tight" style="margin-top:8px">
+            <button class="btn sm" data-act="preset" data-arg="5">5 MIN</button>
+            <button class="btn sm" data-act="preset" data-arg="25">FOCUS</button>
+            <button class="btn sm" data-act="focus-toggle" style="flex:1">${S.focus.run ? "PAUSE" : "START"}</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="row"><span class="label">IMU / ORIENTATION</span>
+            <span class="dim" style="font-size:8px">QMI8658</span></div>
+          <div style="font-size:12px;margin-top:7px;line-height:1.7;font-variant-numeric:tabular-nums">
+            A &nbsp;+0.02 &nbsp;-0.14 &nbsp;+0.99<br>
+            G &nbsp;-1.2 &nbsp;+0.4 &nbsp;+2.1
+          </div>
+          <div class="dim" style="font-size:9px;margin-top:6px">No magnetometer: heading not available.</div>
+          <button class="btn sm" style="margin-top:8px" data-act="imu">READ IMU</button>
+        </div>
+        <div class="card">
+          <div class="row"><span class="label">PHONE LINK</span><span class="accent small">CONNECTED</span></div>
+          <div style="font-size:12px;margin-top:7px">Midnight Drive</div>
+          <div class="dim" style="font-size:10px;margin-top:2px">DualCore FM</div>
+          <div class="row tight" style="margin-top:9px">
+            <button class="btn sm" data-act="media">PREV</button>
+            <button class="btn sm primary" style="flex:1" data-act="media">PLAY</button>
+            <button class="btn sm" data-act="media">NEXT</button>
+          </div>
+        </div>
+        <button class="btn" style="padding:12px 0" data-go="chooser">EXIT TO CHOOSER</button>
+      </div>
+      <div class="tabbar">${NIGHT_TABS.map(([l, go]) =>
+        `<button class="tab ${go === "night-tools" ? "on" : ""}" data-go="${go}">${l}</button>`).join("")}</div>
+    </div>`;
+  }
+
+  /* --------------------------------------------------------------- dialing */
+  // The small in-card dial used by NoirOS's analogue layout.  The CrownOS face
+  // no longer uses these -- it draws its own SVG at full size -- but they are
+  // still the shared CSS dial.
+  function ticks() {
+    let out = "";
+    for (let i = 0; i < 12; i++)
+      out += `<span class="tick ${i % 3 === 0 ? "major" : ""}" style="transform:rotate(${i * 30}deg)"></span>`;
+    return out;
+  }
+  function numbers() {
+    return [12, 3, 6, 9].map((n, i) => {
+      const a = (i * 90 - 90) * Math.PI / 180, r = 92;
+      return `<span class="num" style="left:calc(50% + ${(Math.cos(a) * r).toFixed(1)}px);top:calc(50% + ${(Math.sin(a) * r).toFixed(1)}px)">${n}</span>`;
+    }).join("");
+  }
+
+  function dial(opts) {
+    return `<div class="dial">
+      ${ticks("CLASSIC")}
+      ${numbers()}
+      <div class="hand h" id="hourHand"></div>
+      <div class="hand m" id="minHand"></div>
+      ${opts && opts.secs === false ? "" : `<div class="hand s" id="secHand"></div>`}
+      <div class="pin"></div>
+    </div>`;
+  }
+
+  function updateHands() {
+    const d = new Date();
+    const sec = d.getSeconds(), min = d.getMinutes(), hr = d.getHours() % 12;
+    const hh = document.getElementById("hourHand");
+    const mh = document.getElementById("minHand");
+    const sh = document.getElementById("secHand");
+    if (hh) hh.style.transform = `rotate(${hr * 30 + min * 0.5}deg)`;
+    if (mh) mh.style.transform = `rotate(${min * 6 + sec * 0.1}deg)`;
+    if (sh) sh.style.transform = `rotate(${sec * 6}deg)`;
+    // SVG hands rotate about the dial centre, not a CSS transform-origin.
+    const sv = (id, a) => {
+      const el = document.getElementById(id);
+      if (el) el.setAttribute("transform", `rotate(${a} 205 250)`);
+    };
+    sv("hh", hr * 30 + min * 0.5);
+    sv("mh", min * 6 + sec * 0.1);
+    sv("sh", sec * 6);
+  }
+
+  /* --------------------------------------------------------------- overlays */
+  function quickSheet() {
+    return `<div class="overlay sheet" data-act="closeoverlay">
+      <div class="sheet-inner">
+        <div class="row" style="margin-bottom:4px">
+          <span style="font-size:17px;color:var(--accent);font-weight:600">QUICK</span>
+          <span class="dim" style="font-size:9px;letter-spacing:.12em">SHARED BY ALL THREE</span>
+        </div>
+        <div class="label">BRIGHTNESS</div>
+        <div class="row tight">
+          <button class="btn" data-act="qb" data-arg="-15">-</button>
+          <div class="card" style="flex:1;text-align:center;font-size:12px">${S.bright} / 255</div>
+          <button class="btn" data-act="qb" data-arg="15">+</button>
+        </div>
+        <button class="toggle" data-act="qpower"><span>POWER</span><b>${POWER[S.power]}</b></button>
+        <button class="toggle" data-act="qprivacy"><span>PRIVACY</span><b>${PRIVACY[S.privacy]}</b></button>
+        <button class="toggle" data-act="qalarms"><span>ALARMS</span><b>${nextAlarmStr() ? "NEXT " + nextAlarmStr() : "NONE SET"}</b></button>
+        <button class="toggle" data-act="qsleep"><span>AUTO SLEEP</span><b>${S.sleepAuto ? S.sleepAuto + " MIN" : "OFF"}</b></button>
+        <button class="btn" style="padding:12px 0" data-act="deepsleep">SLEEP NOW</button>
+        <button class="btn" style="padding:12px 0" data-act="screenoff">SCREEN OFF</button>
+        <button class="btn" style="padding:12px 0;color:var(--accent)" data-act="system">SYSTEM / WI-FI / THEME / RESET</button>
+        <div class="dim" style="font-size:9px;text-align:center;letter-spacing:.03em">
+          Long-press any experience's top bar to reopen this sheet.</div>
+      </div>
+    </div>`;
+  }
+
+  /* ---- system: Wi-Fi clock, shared theme, wallpaper, dev info, reset ----- */
+  function systemSheet() {
+    const s = S.sys;
+    const wall = s.wall === 0 ? `OFF (${s.photos} photos)` : `${s.wall} / ${s.photos}`;
+    return `<div class="modal">
+      <div class="mh"><span class="mt">SYSTEM</span>
+        <button class="close" data-act="closeoverlay">CLOSE</button></div>
+      <button class="toggle" data-act="wifi"><span>WI-FI / CLOCK</span><b>${s.sync ? "SYNCING" : s.net}</b></button>
+      <button class="toggle" data-act="theme"><span>THEME ACCENT</span><b>${THEME_NAMES[s.theme]}</b></button>
+      <button class="toggle" data-act="wall"><span>NOIR WALLPAPER</span><b>${wall}</b></button>
+      <button class="toggle" data-act="bootmode"><span>BOOT SEQUENCE</span><b>${["OFF", "FULL", "QUICK"][s.bootmode]}</b></button>
+      <button class="toggle" data-act="dev"><span>DEVELOPER INFO</span><b>v1.5.0</b></button>
+      <button class="btn" style="color:var(--danger);border-color:var(--danger);padding:11px 0"
+        data-act="reset">FACTORY RESET</button>
+      <div class="dim" style="font-size:9px;letter-spacing:.06em;margin-top:2px">
+        AUTO NTP ${s.autoNtp ? "ON · every 6 h" : "OFF"} · DEEP SLEEP ${S.sleepAuto ? S.sleepAuto + " MIN" : "OFF"}
+      </div>
+      <button class="btn" style="margin-top:6px" data-act="quick">BACK TO QUICK SHEET</button>
+      <div class="dim" style="font-size:9px;line-height:1.6;margin-top:10px">
+        Wallpapers are 410×502 RGB565 frames in /WATCH/PHOTOS, held in PSRAM, released when set to OFF.
+        One accent can retint all three experiences; OS DEFAULT returns each to its own palette.</div>
+    </div>`;
+  }
+
+  function wifiSheet() {
+    const s = S.sys;
+    const off = s.offsetMin;
+    const sign = off < 0 ? "-" : "+";
+    const hh = Math.floor(Math.abs(off) / 60), mm = Math.abs(off) % 60;
+    const nets = ["HomeNetwork", "School-5G"];
+    return `<div class="modal">
+      <div class="mh"><span class="mt">WI-FI / CLOCK</span>
+        <button class="close" data-act="closeoverlay">CLOSE</button></div>
+      <div class="card" style="margin-bottom:10px">
+        <div class="label">STATUS</div>
+        <div style="font-size:13px;color:${s.everOk ? "var(--accent)" : "var(--fg)"}">
+          ${s.sync ? "syncing — radio up, UI still live" : s.net}</div>
+      </div>
+      <div class="row" style="align-items:center">
+        <span style="font-size:14px">UTC ${sign}${hh}:${pad2(mm)}</span>
+        <span class="row tight">
+          <button class="btn sm" data-act="offset" data-arg="-30">-30</button>
+          <button class="btn sm" data-act="offset" data-arg="30">+30</button>
+          <button class="btn sm primary" data-act="netsync">SYNC NOW</button>
+        </span>
+      </div>
+      <button class="toggle" data-act="autontp"><span>AUTO NTP</span><b>${s.autoNtp ? "ON (6 H)" : "OFF"}</b></button>
+      <div class="label" style="margin-top:8px">${nets.length} NETWORKS IN wifi.txt</div>
+      ${nets.map(n => `<div style="font-size:11px;color:var(--fg);padding:2px 2px">${n}</div>`).join("")}
+      <div class="dim" style="font-size:9px;line-height:1.7;margin-top:10px">
+        Credentials: /WATCH/SHARED/wifi.txt, or the LauncherOS file /WATCH/wifi/config.txt.<br>
+        WIFI1_SSID=MyNetwork · WIFI1_PASS=secret · GMT_OFFSET=1<br>
+        NTP runs from the main loop only, drops the radio when done, and never interrupts a live phone link.
+      </div>
+    </div>`;
+  }
+
+  function devSheet() {
+    const s = S.sys;
+    return `<div class="modal diag dev">
+      <div class="mh"><span class="mt">DEVELOPER INFO</span>
+        <button class="close" data-act="closeoverlay">CLOSE</button></div>
+      <div class="label">DUALCORE SPECIAL EDITIONS</div>
+      <div class="statline" style="margin:6px 0 10px">v1.5.0 · manifest api 1 · BLE off · SensorLib off</div>
+      <div class="dgrid">
+        <div class="dcell"><span>CTRL HEAP</span><b>127 KB · 96 min</b></div>
+        <div class="dcell"><span>PSRAM</span><b>5.6 / 8 MB</b></div>
+        <div class="dcell"><span>SD CARD</span><b>mounted · 30464 MB</b></div>
+        <div class="dcell"><span>RESET / WAKE</span><b>software · ${s.wake}</b></div>
+        <div class="dcell"><span>UPTIME</span><b>0h 12m</b></div>
+        <div class="dcell"><span>BOOT STRIKES</span><b>0 / 3</b></div>
+        <div class="dcell"><span>INBOX</span><b>${notifs.length} · ${notifs.filter(n => !n.read).length} unread</b></div>
+        <div class="dcell"><span>ALARMS</span><b>${S.alarms.filter(a => a.on).length} on / 3</b></div>
+        <div class="dcell"><span>POWER</span><b>${POWER[S.power]} · ${S.bright}</b></div>
+        <div class="dcell"><span>ACCENT</span><b>${THEME_NAMES[s.theme]}</b></div>
+        <div class="dcell"><span>WALLPAPER</span><b>${s.wall ? s.wall + " / " + s.photos : "off"}</b></div>
+        <div class="dcell"><span>CLOCK</span><b>${s.everOk ? "NTP" : "NVS / RTC"}</b></div>
+      </div>
+      <div class="label" style="margin-top:12px">SLEEP</div>
+      <div style="font-size:10px;line-height:1.6;margin-top:4px">
+        panel off → light sleep, 250 ms touch poll, BOOT wakes instantly<br>
+        idle ${S.sleepAuto ? S.sleepAuto + " min" : "never"} → deep sleep, BOOT or the next alarm wakes it<br>
+        wake reopens ${S.lastOS}; timers and the inbox come from disk.</div>
+    </div>`;
+  }
+
+  function resetSheet() {
+    const c = S.sys.confirm;
+    if (c >= 0) {
+      const what = c === 3 ? "ALL three experience folders and the shared inbox, timers and settings"
+                           : (["NoirOS", "CrownOS", "NightOS"][c] + "'s config, data, assets, cache and logs");
+      return `<div class="modal">
+        <div class="mh"><span class="mt">CONFIRM RESET</span>
+          <button class="close" data-act="resetask" data-arg="-1">BACK</button></div>
+        <div style="font-size:13px;line-height:1.6">Erase ${what}?
+          ${c === 3 ? "Watch faces, events, focus history and the inbox go with it." : "The other experiences are untouched."}
+          This cannot be undone.</div>
+        <button class="btn" style="margin-top:22px" data-act="resetask" data-arg="-1">CANCEL</button>
+        <button class="btn" style="margin-top:8px;background:var(--danger);border-color:transparent;color:#fff"
+          data-act="resetdo" data-arg="${c}">ERASE</button>
+        <div class="dim" style="font-size:9px;margin-top:12px;line-height:1.6">
+          The firmware is not touched and the chooser stays reachable.</div>
+      </div>`;
+    }
+    return `<div class="modal">
+      <div class="mh"><span class="mt">FACTORY RESET</span>
+        <button class="close" data-act="closeoverlay">CLOSE</button></div>
+      <div class="dim" style="font-size:10px;margin-bottom:12px">
+        Configuration only — logs and the firmware stay put, manifests are recreated with defaults.</div>
+      ${["NoirOS", "CrownOS", "NightOS"].map((n, i) =>
+        `<button class="btn" style="margin-bottom:8px;padding:12px 0" data-act="resetask" data-arg="${i}">RESET ${n.toUpperCase()}</button>`).join("")}
+      <button class="btn" style="padding:12px 0;color:var(--danger);border-color:var(--danger)"
+        data-act="resetask" data-arg="3">ERASE EVERYTHING (ALL THREE)</button>
+      <div class="dim" style="font-size:9px;margin-top:12px;line-height:1.6">
+        /WATCH/NoirOS, /WATCH/CrownOS, /WATCH/NightOS and /WATCH/SHARED are the only folders this module writes.</div>
+    </div>`;
+  }
+
+  function alarmEditor() {
+    return `<div class="modal">
+      <div class="mh"><span class="mt">ALARMS</span>
+        <button class="close" data-act="closeoverlay">CLOSE</button></div>
+      <div class="dim" style="font-size:10px;margin-bottom:10px">
+        Three daily alarms, shared by every experience. Snooze is 5 minutes.</div>
+      ${S.alarms.map((a, i) => `<div class="card" style="margin-bottom:8px;padding:9px 10px">
+        <div style="display:flex;align-items:center;gap:6px">
+          <div style="width:66px">
+            <div style="font-size:20px;font-variant-numeric:tabular-nums;${a.on ? "" : "color:var(--dim)"};">${pad2(a.h)}:${pad2(a.m)}</div>
+            <div class="label" style="margin-top:2px">${a.on ? (a.days.length === 7 ? "DAILY" : "CUSTOM") : "OFF"}</div>
+          </div>
+          <button class="btn sm ${a.on ? "primary" : ""}" data-act="alon" data-arg="${i}">${a.on ? "ON" : "OFF"}</button>
+          <button class="btn sm" data-act="alh" data-arg="${i}:-1">H-</button>
+          <button class="btn sm" data-act="alh" data-arg="${i}:1">H+</button>
+          <button class="btn sm" data-act="alm" data-arg="${i}:-5">M-</button>
+          <button class="btn sm" data-act="alm" data-arg="${i}:5">M+</button>
+        </div>
+        <div style="display:flex;gap:4px;margin-top:8px">
+          ${["S", "M", "T", "W", "T", "F", "S"].map((d, j) =>
+            `<button class="btn sm ${a.days.includes(j) ? "primary" : ""}" style="flex:1;padding:5px 0;font-size:9px"
+              data-act="alday" data-arg="${i}:${j}">${d}</button>`).join("")}
+        </div>
+      </div>`).join("")}
+      <button class="btn" style="margin-top:4px" data-go="ring">PREVIEW ALARM SCREEN</button>
+      <div class="dim" style="font-size:9px;line-height:1.6;margin-top:12px">
+        Steps are 1 hour / 5 minutes. Alarms ring only on the selected days, ring in every
+        experience and survive a reset; a powered-off watch cannot ring.</div>
+    </div>`;
+  }
+
+  function ringScreen() {
+    return `<div class="overlay ringview">
+      <div class="ringcircle">
+        <div class="rtime" data-clock>${fmtTime(new Date())}</div>
+        <div class="rlab">ALARM</div>
+        <div class="rsub">daily wake</div>
+      </div>
+      <div class="ringbtns">
+        <button class="btn" data-act="snooze">SNOOZE 5</button>
+        <button class="btn primary" data-act="dismissalarm">DISMISS</button>
+      </div>
+      <div class="ringnote">Alarms need the module running; power-off cancels them.
+        Snooze re-arms five minutes out.</div>
+    </div>`;
+  }
+
+  function breatheScreen() {
+    return `<div class="overlay breathe">
+      <div class="bh">4 - 7 - 8</div>
+      <div class="bs">BREATHE WITH THE RING</div>
+      <div class="bring" id="breatheRing"></div>
+      <div class="bphase" id="breathePhase">INHALE</div>
+      <div class="bcount" id="breatheCount">4</div>
+      <button class="btn" data-act="closebreathe">STOP</button>
+    </div>`;
+  }
+
+  function flashScreen() {
+    const red = S.night.flash === 2;
+    return `<div class="flashview" data-act="flashoff" style="background:${red ? "#9a0010" : "#ffffff"}">
+      <span style="color:${red ? "rgba(255,225,228,.72)" : "rgba(0,0,0,.5)"};">TAP TO STOP · ${red ? "RED" : "WHITE"}</span>
+    </div>`;
+  }
+
+  function stealthScreen() {
+    return `<div class="stealthview" data-act="stealthoff">
+      <div class="st" data-clock>${fmtTime(new Date())}</div>
+      <div class="sd" data-date>${fmtDate(new Date())}</div>
+      <div class="sh">STEALTH / TAP TO WAKE</div>
+    </div>`;
+  }
+
+  function sleepScreen() {
+    const a = nextAlarmStr();
+    return `<div class="sleeper">
+      <div class="sl">DEEP SLEEP</div>
+      <button class="sw" data-act="wake">WAKE (BOOT)</button>
+      <div class="sn">${a ? "Alarm timer armed for " + a + "." : "No alarm armed; only BOOT wakes it."}
+        Wake reopens ${S.lastOS} and restores the inbox.</div>
+    </div>`;
+  }
+
+  function diagScreen() {
+    return `<div class="modal diag">
+      <div class="mh"><span class="mt">DIAGNOSTICS</span>
+        <button class="close" data-act="closeoverlay">CLOSE</button></div>
+      <div class="label">DUALCORE SPECIAL EDITIONS</div>
+      <div class="statline" style="margin-top:6px">module 1.3.0 &nbsp; manifest api 1</div>
+      <div class="dgrid" style="margin-top:12px">
+        <div class="dcell"><span>POWER</span><b>${POWER[S.power]}</b></div>
+        <div class="dcell"><span>BRIGHTNESS</span><b>${S.bright} / 255</b></div>
+        <div class="dcell"><span>BATTERY</span><b>${BATTERY.pct}% · 3.94 V · ${BATTERY.est}</b></div>
+        <div class="dcell"><span>HEAP</span><b>143 KB</b></div>
+        <div class="dcell"><span>PSRAM</span><b>5.6 MB</b></div>
+        <div class="dcell"><span>RESET</span><b>SOFTWARE</b></div>
+        <div class="dcell"><span>INBOX</span><b>${notifs.length} · ${notifs.filter(n => !n.read).length} unread</b></div>
+        <div class="dcell"><span>LINK</span><b>UP</b></div>
+      </div>
+      <div class="label" style="margin-top:14px">SCHEDULE</div>
+      <div style="font-size:11px;margin-top:4px">${S.night.sched ? `${pad2(S.night.start)}:00 to ${pad2(S.night.end)}:00` : "off"}</div>
+      <div class="label" style="margin-top:12px">SLEEP</div>
+      <div style="font-size:11px;margin-top:4px">auto ${S.sleepAuto ? S.sleepAuto + " min" : "off"} · wake BOOT + timer</div>
+      <div class="label" style="margin-top:12px">WEATHER</div>
+      <div style="font-size:11px;margin-top:4px">${WEATHER.valid ? `${WEATHER.temp}C ${WEATHER.cond} · H${WEATHER.hi} L${WEATHER.lo}` : "no data from phone"}</div>
+      <button class="btn" style="margin-top:16px" data-act="snapshot">WRITE SNAPSHOT</button>
+      <div class="dim" style="font-size:9px;margin-top:12px">Notification contents are never written to logs.</div>
+    </div>`;
+  }
+
+  function detailScreen() {
+    const n = notifs[S.detail] || notifs[0];
+    if (!n) return "";
+    return `<div class="modal notifview">
+      <div class="mh"><span class="mt">NOTIFICATION</span>
+        <button class="close" data-act="closeoverlay">CLOSE</button></div>
+      <div class="napp">${esc(n.app)}</div>
+      <div class="nti">${esc(n.title)}</div>
+      <div class="nbd">${esc(n.body)}</div>
+      <div class="nme">${n.when}${n.sender ? " · from " + esc(n.sender) : ""}</div>
+      <button class="btn" style="margin-top:22px;color:var(--danger);border-color:var(--danger)"
+        data-act="dismissdetail">DISMISS</button>
+    </div>`;
+  }
+
+  function offScreen() {
+    return `<div class="overlay offview" data-act="wake">
+      <div class="ot" data-clock>${fmtTime(new Date())}</div>
+      <div class="oh">DISPLAY OFF — TAP TO WAKE</div>
+    </div>`;
+  }
+
+  /* ------------------------------------------------------------- rendering */
+  const SCREENS = {
+    chooser,
+    "noir-home": noirHome,
+    "noir-inbox": noirInbox,
+    "noir-tools": noirTools,
+    "crown-face": () => crownFace(),
+    "crown-studio": crownStudio,
+    "crown-events": crownEvents,
+    "night-home": nightHome,
+    "night-shadow": nightShadow,
+    "night-tools": nightTools,
+    "noir-day": noirDay,
+    "crown-almanac": crownAlmanac,
+    "night-ops": nightOps,
+    "boot-noir": () => bootScreen("boot-noir"),
+    "boot-crown": () => bootScreen("boot-crown"),
+    "boot-night": () => bootScreen("boot-night")
+  };
+
+  function render() {
+    const base = (SCREENS[S.base] || chooser)();
+    let overlay = "";
+    if (S.overlay === "quick") overlay = quickSheet();
+    else if (S.overlay === "alarms") overlay = alarmEditor();
+    else if (S.overlay === "ring") overlay = ringScreen();
+    else if (S.overlay === "breathe") overlay = breatheScreen();
+    else if (S.overlay === "diag") overlay = diagScreen();
+    else if (S.overlay === "detail") overlay = detailScreen();
+    else if (S.overlay === "off") overlay = offScreen();
+    else if (S.overlay === "stealth") overlay = stealthScreen();
+    else if (S.overlay === "flash") overlay = flashScreen();
+    else if (S.overlay === "sleep") overlay = sleepScreen();
+    else if (S.overlay === "system") overlay = systemSheet();
+    else if (S.overlay === "wifi") overlay = wifiSheet();
+    else if (S.overlay === "dev") overlay = devSheet();
+    else if (S.overlay === "reset") overlay = resetSheet();
+
+    document.getElementById("screen").innerHTML = base + overlay;
+    const th = THEME_ACCENTS[S.sys.theme];
+    const host = document.getElementById("screen");
+    if (th) host.style.setProperty("--accent", th);
+    else host.style.removeProperty("--accent");
+    if (BOOT[S.base]) startBoot(S.base, S.sys.bootmode === 2);
+    updateHands();
+    if (S.overlay === "breathe") {
+      S.breatheT0 = Date.now();
+      tickBreathe();
+    }
+  }
+
+  function go(screen) {
+    clearTimeout(S.bootGo);
+    clearInterval(S.bootTick);
+    // BOOT SEQUENCE OFF skips the film entirely, exactly like the firmware,
+    // which builds the target tree directly instead of showing a boot screen.
+    if (BOOT[screen] && S.sys.bootmode === 0) screen = BOOT[screen].target;
+    if (OVERLAYS.includes(screen)) {
+      if (screen === "detail" && !notifs.length) return;
+      S.overlay = screen;
+    } else {
+      if (SCREENS[screen]) {
+        S.base = screen;
+        const os = screen.startsWith("noir") ? "NoirOS"
+          : screen.startsWith("crown") ? "CrownOS"
+          : screen.startsWith("night") ? "NightOS" : S.lastOS;
+        if (os !== "NoirOS" && screen !== "chooser") S.lastOS = os;
+      }
+      S.overlay = null;
+    }
+    render();
+  }
+
+  /* ------------------------------------------- boot sequences (firmware 14.9) */
+  const BOOT = {
+    "boot-noir": {
+      target: "noir-home", mark: "OS  01", title: "NOIR", tag: "EVERYDAY / MINIMAL",
+      bg: "#04050a", accent: "#6e9bd1", dim: "#5c6672", fg: "#e8edf2",
+      art: `<div class="boot-grow"></div>`,
+      stages: ["mount /WATCH/NoirOS", "settings + smart tiles", "shared inbox", "building surface"]
+    },
+    "boot-crown": {
+      target: "crown-face", mark: "OS  02", title: "CROWN", tag: "MAISON DUALCORE",
+      bg: "#0b0a07", accent: "#c9a44c", dim: "#8a7a5e", fg: "#f2ead8",
+      art: `<div class="boot-arc"><div class="boot-crown"><i></i><i></i><i></i></div></div>`,
+      stages: ["mount /WATCH/CrownOS", "face library", "occasion profile", "case + dial"]
+    },
+    "boot-night": {
+      target: "night-home", mark: "OS  03", title: "NIGHT", tag: "SHADOW / UTILITY",
+      bg: "#0a0305", accent: "#c8324a", dim: "#8c5a63", fg: "#ebd9dc",
+      art: `<div class="boot-scan"><i></i></div>`,
+      stages: ["mount /WATCH/NightOS", "shadow profile", "quiet policy", "night surface"]
+    }
+  };
+
+  function bootScreen(key) {
+    const b = BOOT[key];
+    return `<div class="scr boot" data-act="bootskip"
+      style="--bg:${b.bg};--accent:${b.accent};--dim:${b.dim};--fg:${b.fg}">
+      <div class="mark">${b.mark}</div>
+      <div class="word">${b.title}</div>
+      <div class="tag">${b.tag}</div>
+      <div class="rule"></div>
+      <div class="art">${b.art}</div>
+      <div class="stage">${b.stages[0]}</div>
+      <div class="bar"><i></i></div>
+      <div class="pct">0%</div>
+      <div class="footline">DUALCORE SPECIAL EDITIONS · v1.5.0</div>
+    </div>`;
+  }
+
+  // The firmware drives this with an lv_timer; the mockup uses setInterval and
+  // the same 40 ms cadence so the timing you see in the browser is the timing
+  // on the watch.  A tap skips straight to the target screen.  QUICK (+11 per
+  // tick) is what a deep-sleep wake uses whatever the setting says.
+  function startBoot(key, fast) {
+    const b = BOOT[key];
+    if (!b) return;
+    clearTimeout(S.bootGo);
+    clearInterval(S.bootTick);
+    const dur = fast ? 380 : 2050;
+    const t0 = Date.now();
+    const bar = document.querySelector(".scr.boot .bar i");
+    if (bar) bar.style.animationDuration = dur + "ms";
+    S.bootTick = setInterval(() => {
+      const p = Math.min(1, (Date.now() - t0) / dur);
+      const st = document.querySelector(".scr.boot .stage");
+      const pc = document.querySelector(".scr.boot .pct");
+      if (st) st.textContent = b.stages[Math.min(b.stages.length - 1, Math.floor(p * b.stages.length))];
+      if (pc) pc.textContent = Math.round(p * 100) + "%";
+    }, 40);
+    S.bootGo = setTimeout(() => { clearInterval(S.bootTick); go(b.target); }, dur + 50);
+  }
+
+  /* --------------------------------------------- NoirOS DAY (firmware 16.4) */
+  function noirDay() {
+    const water = S.day.water;
+    const rows = [
+      ["SCREEN ON", "2h 24m"],
+      ["FOCUS", S.day.focus + " min"],
+      ["NOTIFICATIONS", String(notifs.length + S.day.notif)],
+      ["BATTERY", BATTERY.pct + "%  from 96%"]
+    ];
+    return shell("noir", "NoirOS", "EVERYDAY / FOCUS", NOIR_TABS, "noir-day", `
+      <div class="row"><span class="label">TODAY</span>
+        <span class="dim small" data-date>${fmtDate(new Date())}</span></div>
+      <div class="card">
+        <div class="row"><span class="label">WATER</span>
+          <span class="accent small">${water} / 12</span></div>
+        <div class="dots">${Array.from({ length: 12 }, (_, i) =>
+          `<span class="${i < water ? "on" : ""}"></span>`).join("")}</div>
+        <div class="row tight" style="margin-top:10px">
+          <button class="btn sm" data-act="water" data-arg="-1">- 1</button>
+          <button class="btn sm primary" style="flex:1" data-act="water" data-arg="1">+ 1 GLASS</button>
+          <button class="btn sm" data-act="water" data-arg="reset">RESET</button>
+        </div>
+        <div class="dim" style="font-size:9px;margin-top:8px">Counted per day; resets at local midnight.</div>
+      </div>
+      <div class="card">
+        <div class="label">TODAY IN NUMBERS</div>
+        ${rows.map(([k, v]) => `<div class="row" style="margin-top:8px">
+          <span class="dim small">${k}</span><span style="font-size:13px">${v}</span></div>`).join("")}
+      </div>
+      <div class="row tight">
+        <button class="btn sm" data-go="diag">DIAGNOSTICS</button>
+        <button class="btn sm" data-go="noir-tools">FOCUS TOOLS</button>
+      </div>
+      <div class="dim" style="font-size:9px;line-height:1.6">Every number here is measured, not
+        estimated from appearance. Counters persist per day and roll over at midnight.</div>
+    `, true);
+  }
+
+  /* ------------------------------------------ CrownOS ALMANAC (firmware 17.6) */
+  function crownAlmanac() {
+    const p = moonFrac();
+    const illum = Math.round((1 - Math.cos(2 * Math.PI * p)) * 50);
+    const toFull = Math.round((p < .5 ? .5 - p : 1.5 - p) * 29.530588853);
+    const toNew = Math.round((1 - p) * 29.530588853);
+    const d = new Date();
+    const yday = Math.floor((d - new Date(d.getFullYear(), 0, 1)) / 86400000) + 1;
+    const leap = (d.getFullYear() % 4 === 0 && (d.getFullYear() % 100 !== 0 || d.getFullYear() % 400 === 0));
+    const total = leap ? 366 : 365;
+    const monday0 = (d.getDay() + 6) % 7;
+    let week = Math.floor((yday - monday0 + 10) / 7);
+    week = Math.max(1, Math.min(53, week));
+    const DAYS = ["SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"];
+    const MONS = ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY",
+      "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"];
+    const next = events.filter(e => e.at > Date.now()).sort((a, b) => a.at - b.at)[0];
+    // Same construction as the firmware's moon_draw(): a lit disc with a dark
+    // disc of equal radius slid across it, 4*r*t to the side.
+    const waxing = p < .5;
+    const tt = waxing ? p : 1 - p;
+    const moonOff = Math.max(1, Math.round(4 * 36 * tt));
+    return shell("crown", "CrownOS", "FACES / OCCASIONS", CROWN_TABS, "crown-almanac", `
+      <div class="card">
+        <div class="row"><span class="label">MOON</span>
+          <span class="dim" style="font-size:9px">synodic approximation</span></div>
+        <div class="row" style="align-items:center;margin-top:8px">
+          <div class="moon"><i style="left:${waxing ? -moonOff : moonOff}px"></i></div>
+          <div>
+            <div class="accent" style="font-size:19px">${moonName(p)}</div>
+            <div style="font-size:12px;margin-top:4px">${illum}% illuminated</div>
+            <div class="dim" style="font-size:10px;margin-top:2px">full in ${toFull} d · new in ${toNew} d</div>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="label">PERPETUAL CALENDAR</div>
+        <div style="font-size:15px;margin-top:7px">${DAYS[d.getDay()]}</div>
+        <div class="accent" style="font-size:15px;margin-top:2px">
+          ${pad2(d.getDate())} ${MONS[d.getMonth()]} ${d.getFullYear()}</div>
+        <div class="dim" style="font-size:10px;margin-top:6px">
+          week ${pad2(week)} · day ${yday} / ${total} · ${total - yday} left · ${leap ? "leap year" : "common year"}</div>
+      </div>
+      <div class="card">
+        <div class="row"><span class="label">POWER RESERVE</span>
+          <span class="accent" style="font-size:18px">${BATTERY.pct}%</span></div>
+        <div class="reserve"><i style="width:${BATTERY.pct}%"></i></div>
+        <div class="ticks">${Array.from({ length: 11 }, () => "<span></span>").join("")}</div>
+        <div style="font-size:11px;margin-top:8px">estimated runtime ${BATTERY.est} · profile BALANCED</div>
+        <div class="dim" style="font-size:9px;margin-top:3px">history fills in at one sample per five minutes</div>
+      </div>
+      <div class="card">
+        <div class="label">NEXT ENGAGEMENT</div>
+        ${next ? `<div class="row" style="margin-top:6px"><span style="font-size:14px">${next.t}</span>
+          <span class="accent small">${durShort((next.at - Date.now()) / 1000)}</span></div>` :
+          `<div class="dim" style="font-size:12px;margin-top:6px">Nothing scheduled.</div>`}
+      </div>
+    `, true);
+  }
+
+  /* ----------------------------------------------- NightOS OPS (firmware 18.7) */
+  function nightOps() {
+    return `<div class="scr ${nightCls()}">
+      ${osHeader("NightOS", "SHADOW / UTILITY")}
+      <div class="body scroll">
+        <div class="card">
+          <div class="row"><span class="label">TRIPWIRE</span>
+            <span class="${S.trip.armed ? "accent" : "dim"} small">${S.trip.armed ? "ARMED" : "DISARMED"}</span></div>
+          <div style="font-size:12px;margin-top:7px">${S.trip.armed
+            ? "Any movement raises a full-screen alert." : "Arm to watch for movement."}</div>
+          <div class="row tight" style="margin-top:10px">
+            <button class="btn ${S.trip.armed ? "primary" : ""}" style="flex:1" data-act="trip">
+              ${S.trip.armed ? "DISARM" : "ARM TRIPWIRE"}</button>
+            <button class="btn sm" data-act="tripsens">SENS ${["LOW", "MED", "HIGH"][S.trip.sens]}</button>
+          </div>
+          <div class="dim" style="font-size:9px;margin-top:8px">
+            Runs at 10 Hz only while armed; never persisted across reboot.</div>
+        </div>
+        <button class="btn" style="padding:13px 0" data-act="godark">GO DARK — PANEL OFF, BOOT WAKES</button>
+        <div class="card">
+          <div class="label">NIGHT LOG</div>
+          ${[["IN SHADOW", "3h 12m"], ["SCREEN ON", "2h 24m"], ["NOTIFICATIONS", String(notifs.length)]]
+            .map(([k, v]) => `<div class="row" style="margin-top:8px">
+              <span class="dim small">${k}</span><span style="font-size:13px">${v}</span></div>`).join("")}
+          <div class="dim" style="font-size:9px;margin-top:8px">2 shadow switches this session</div>
+        </div>
+        <div class="dim" style="font-size:9px;line-height:1.6">
+          Tripwire needs the QMI8658. Without the driver the card states that plainly instead of
+          pretending the watch can detect motion.</div>
+      </div>
+      ${tabbar(NIGHT_TABS, "night-ops")}
+    </div>`;
+  }
+
+  /* --------------------------------------------------------------- actions */
+  function toast(msg) {
+    const t = document.getElementById("toast");
+    t.textContent = msg;
+    t.classList.add("on");
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => t.classList.remove("on"), 2100);
+  }
+
+  function act(name, arg) {
+    switch (name) {
+      case "bootskip": {
+        const b = BOOT[S.base];
+        if (b) { clearTimeout(S.bootGo); clearInterval(S.bootTick); go(b.target); }
+        break;
+      }
+      case "water": {
+        const d = arg === "reset" ? -99 : +arg;
+        S.day.water = Math.max(0, Math.min(12, S.day.water + d));
+        render(); break;
+      }
+      case "trip":
+        S.trip.armed = !S.trip.armed;
+        toast(S.trip.armed ? "Tripwire armed" : "Tripwire disarmed");
+        render(); break;
+      case "tripsens": S.trip.sens = (S.trip.sens + 1) % 3; render(); break;
+      case "godark": S.overlay = "off"; render(); break;
+      case "bootmode":
+        S.sys.bootmode = S.sys.bootmode === 1 ? 2 : S.sys.bootmode === 2 ? 0 : 1;
+        toast("Boot sequence: " + ["OFF", "FULL", "QUICK"][S.sys.bootmode]);
+        render(); break;
+      case "launcher": toast("Would return to LauncherOS (factory anchor + restart)"); break;
+      case "noirclock":
+        S.noirClock = S.noirClock === "digital" ? "analog" : "digital"; render(); break;
+      case "open": S.detail = +arg; S.overlay = "detail"; notifs[+arg].read = true; render(); break;
+      case "dismiss": notifs.splice(+arg, 1); render(); break;
+      case "dismissdetail":
+        notifs.splice(S.detail, 1); S.overlay = null; S.base = "noir-inbox"; render(); break;
+      case "readall": notifs.forEach(n => n.read = true); render(); break;
+      case "clearread": notifs = notifs.filter(n => !n.read); render(); break;
+      case "simulate":
+        notifs.unshift({ app: "Demo", sender: "Test", title: "Injected notification",
+          body: "Simulated alert. Phone link not required.", when: fmtTime(new Date()), read: false });
+        render(); break;
+      case "media": toast("Media command sent over the phone link"); break;
+
+      case "focus-toggle":
+        if (S.focus.run) {
+          S.focus.left = Math.max(0, Math.round((S.focus.endAt - Date.now()) / 1000));
+          S.focus.run = false;
+        } else {
+          if (S.focus.left <= 0) S.focus.left = S.focus.min * 60;
+          S.focus.endAt = Date.now() + S.focus.left * 1000;
+          S.focus.run = true;
+        }
+        render(); break;
+      case "focus-reset":
+        S.focus.run = false; S.focus.left = S.focus.min * 60; render(); break;
+      case "focus-plus":
+      case "focus-minus": {
+        const d = name === "focus-plus" ? 5 : -5;
+        S.focus.min = Math.min(90, Math.max(5, S.focus.min + d));
+        if (!S.focus.run) S.focus.left = S.focus.min * 60;
+        render(); break;
+      }
+      case "preset":
+        S.focus.min = +arg;
+        S.focus.left = +arg * 60;
+        S.focus.run = true;
+        S.focus.endAt = Date.now() + S.focus.left * 1000;
+        toast(`Focus started — ${arg} minutes`);
+        render(); break;
+
+      case "sw-toggle":
+        if (S.sw.run) { S.sw.ms += Date.now() - S.sw.t0; S.sw.run = false; }
+        else { S.sw.t0 = Date.now(); S.sw.run = true; }
+        render(); break;
+      case "sw-reset": S.sw.run = false; S.sw.ms = 0; render(); break;
+
+      case "t24": S.t24 = !S.t24; render(); break;
+      case "privacy": S.privacy = (S.privacy + 1) % 3; render(); break;
+      case "power":
+        S.power = (S.power + 1) % 4;
+        if (S.power === 3) toast("Survival: clock and battery only");
+        render(); break;
+
+      case "crownchrome":
+        S.crownChrome = !S.crownChrome; render(); break;
+      case "crownstep": {
+        const order = ["crown-face", "crown-studio", "crown-events", "crown-almanac"];
+        const i = order.indexOf(S.base);
+        const next = order[(i + (+arg) + 4) % 4];
+        S.crownChrome = false;
+        go(next); break;
+      }
+      case "glitch":
+        S.crown.glitch = (S.crown.glitch + 1) % 3; render(); break;
+      case "faceshow":
+        S.crown.face = +arg;
+        S.crown.accent = FACES[+arg].accent;
+        S.crown.bg = FACES[+arg].bg;
+        S.base = "crown-face";
+        S.overlay = null;
+        render(); break;
+      case "face":
+        S.crown.face = +arg;
+        S.crown.accent = FACES[+arg].accent;
+        S.crown.bg = FACES[+arg].bg;
+        render(); break;
+      case "accent": S.crown.accent = +arg; render(); break;
+      case "bg": S.crown.bg = +arg; render(); break;
+      case "toggle": S.crown[arg] = S.crown[arg] ? 0 : 1; render(); break;
+      case "studiohint":
+        S.base = "crown-studio"; S.overlay = null; render(); break;
+      case "occasion":
+        S.crown.profile = arg;
+        S.crown.face = OCC_FACE[arg];
+        S.crown.accent = FACES[S.crown.face].accent;
+        S.crown.bg = FACES[S.crown.face].bg;
+        S.power = POWER.indexOf(OCC_POWER[arg]);
+        render(); break;
+      case "saveas":
+        if (FACES.length >= 12) { toast("Face limit reached (12)"); break; }
+        S.savedFaces++;
+        FACES.push({ name: "CUSTOM " + S.savedFaces, style: FACES[S.crown.face].style,
+          accent: S.crown.accent, bg: S.crown.bg, user: true });
+        S.crown.face = FACES.length - 1;
+        toast("Saved as " + FACES[S.crown.face].name);
+        render(); break;
+      case "overwrite":
+        if (!FACES[S.crown.face].user) { toast("Preset faces are locked — save a copy"); break; }
+        FACES[S.crown.face].accent = S.crown.accent;
+        FACES[S.crown.face].bg = S.crown.bg;
+        toast("Face updated"); render(); break;
+
+      case "evadd": {
+        if (events.length >= 8) { toast("Event limit reached (8)"); break; }
+        const add = { "2h": 2 * 3600000, "1d": 86400000, "3d": 3 * 86400000, "7d": 7 * 86400000 }[arg];
+        const titles = { "2h": "DINNER", "1d": "MEETING", "3d": "FLIGHT", "7d": "PARTY" };
+        events.push({ t: titles[arg], at: Date.now() + add });
+        events.sort((a, b) => a.at - b.at);
+        render(); break;
+      }
+      case "evdel": events.splice(+arg, 1); render(); break;
+      case "evclear": events = []; render(); break;
+
+      case "shadow":
+        S.night.shadow = !S.night.shadow;
+        toast(S.night.shadow ? "Shadow Mode on — dim, quiet, no decoration" : "Shadow Mode off");
+        render(); break;
+      case "palette":
+        S.night.palette = S.night.palette === "crimson" ? "night" : "crimson";
+        render(); break;
+      case "quiet": S.night.quiet = (S.night.quiet + 1) % 3; render(); break;
+      case "bright":
+        S.night.bright = Math.min(255, Math.max(30, S.night.bright + (+arg)));
+        render(); break;
+      case "sched": S.night.sched = !S.night.sched; render(); break;
+      case "hour": {
+        const [which, dir] = arg.split(/(?=[+-])/);
+        const key = which === "start" ? "start" : "end";
+        S.night[key] = (S.night[key] + (dir === "+" ? 1 : 23)) % 24;
+        render(); break;
+      }
+      case "day": {
+        const i = +arg;
+        if (S.night.days.includes(i)) S.night.days = S.night.days.filter(d => d !== i);
+        else S.night.days.push(i);
+        render(); break;
+      }
+      case "flash":
+        S.night.flash = S.night.flash === 1 ? 2 : 1;
+        S.overlay = "flash";
+        render(); break;
+      case "flashoff":
+        S.overlay = null;            // the next tap offers the other torch
+        render(); break;
+      case "stealth": S.overlay = "stealth"; render(); break;
+      case "stealthoff": S.overlay = null; render(); break;
+      case "qsleep": {
+        const opts = [0, 1, 5, 15, 30];
+        const i = opts.indexOf(S.sleepAuto);
+        S.sleepAuto = opts[(i + 1) % opts.length];
+        render(); break;
+      }
+      case "deepsleep": S.overlay = "sleep"; render(); break;
+      case "imu": toast("One IMU read — no compass on this board"); break;
+
+      case "qb":
+        S.bright = Math.min(255, Math.max(20, S.bright + (+arg)));
+        render(); break;
+      case "qpower": S.power = (S.power + 1) % 4; render(); break;
+      case "qprivacy": S.privacy = (S.privacy + 1) % 3; render(); break;
+      case "qalarms": S.overlay = "alarms"; render(); break;
+      case "screenoff": S.overlay = "off"; render(); break;
+      case "wake": S.overlay = null; render(); break;
+
+      case "alon": S.alarms[+arg].on = !S.alarms[+arg].on; render(); break;
+      case "alh": {
+        const [i, d] = arg.split(":");
+        S.alarms[+i].h = (S.alarms[+i].h + (+d) + 24) % 24; render(); break;
+      }
+      case "alm": {
+        const [i, d] = arg.split(":");
+        S.alarms[+i].m = (S.alarms[+i].m + (+d) + 60) % 60; render(); break;
+      }
+      case "alday": {
+        const [i, d] = arg.split(":");
+        const a = S.alarms[+i], day = +d;
+        if (a.days.includes(day)) {
+          if (a.days.length === 1) { toast("An alarm needs at least one day"); break; }
+          a.days = a.days.filter(x => x !== day);
+        } else {
+          a.days.push(day);
+          a.days.sort();
+        }
+        render(); break;
+      }
+      case "snooze": S.overlay = null; toast("Snoozed — rings again in 5 minutes"); render(); break;
+      case "dismissalarm": S.overlay = null; toast("Alarm dismissed"); render(); break;
+      case "closebreathe": S.overlay = null; render(); break;
+      case "snapshot": toast("Snapshot appended to logs/power.log"); break;
+
+      case "system": S.overlay = "system"; S.sys.confirm = -1; render(); break;
+      case "quick": S.overlay = "quick"; S.sys.confirm = -1; render(); break;
+      case "wifi": S.overlay = "wifi"; render(); break;
+      case "dev": S.overlay = "dev"; render(); break;
+      case "reset": S.overlay = "reset"; S.sys.confirm = -1; render(); break;
+      case "resetask": S.sys.confirm = +arg; render(); break;
+      case "resetdo": {
+        const n = +arg;
+        S.sys.confirm = -1;
+        if (n === 3) {
+          notifs = [];
+          S.alarms.forEach(a => { a.on = false; });
+          S.crown.face = 6; S.sys.theme = 0; S.sys.wall = 0;
+          toast("All settings erased — defaults reloaded");
+        } else {
+          toast(["NoirOS", "CrownOS", "NightOS"][n] + " reset to defaults");
+        }
+        S.overlay = null;
+        render(); break;
+      }
+      case "theme":
+        S.sys.theme = (S.sys.theme + 1) % THEME_NAMES.length;
+        toast("Accent: " + THEME_NAMES[S.sys.theme]);
+        render(); break;
+      case "wall":
+        S.sys.wall = (S.sys.wall + 1) % (S.sys.photos + 1);
+        toast(S.sys.wall === 0 ? "Wallpaper off — PSRAM frame released"
+                               : "Wallpaper " + S.sys.wall + " of " + S.sys.photos);
+        render(); break;
+      case "autontp": S.sys.autoNtp = S.sys.autoNtp ? 0 : 1; render(); break;
+      case "offset": {
+        const d = +arg;
+        S.sys.offsetMin = Math.max(-840, Math.min(840, S.sys.offsetMin + d));
+        toast("UTC offset " + (S.sys.offsetMin < 0 ? "-" : "+") +
+          Math.floor(Math.abs(S.sys.offsetMin) / 60) + ":" + pad2(Math.abs(S.sys.offsetMin) % 60));
+        render(); break;
+      }
+      case "netsync":
+        S.sys.sync = true;
+        S.sys.net = "connecting...";
+        render();
+        setTimeout(() => {
+          S.sys.sync = false;
+          S.sys.everOk = true;
+          S.sys.net = "synced over Wi-Fi";
+          if (S.overlay === "wifi") render();
+          toast("Clock synced — radio dropped");
+        }, 2200);
+        break;
+
+      case "closeoverlay": S.overlay = null; S.sys.confirm = -1; render(); break;
+      default: break;
+    }
+  }
+
+  /* ------------------------------------------------------------- breathing */
+  function tickBreathe() {
+    const ring = document.getElementById("breatheRing");
+    if (!ring) return;
+    const el = Date.now() - S.breatheT0;
+    let phase, p, rem;
+    if (el < 4000) { phase = 0; p = el / 4000; rem = Math.ceil((4000 - el) / 1000); }
+    else if (el < 11000) { phase = 1; p = 1; rem = Math.ceil((11000 - el) / 1000); }
+    else if (el < 19000) { phase = 2; p = 1 - (el - 11000) / 8000; rem = Math.ceil((19000 - el) / 1000); }
+    else { S.breatheT0 = Date.now(); phase = 0; p = 0; rem = 4; }
+
+    const size = 104 + 112 * p;
+    ring.style.width = size + "px";
+    ring.style.height = size + "px";
+    const ph = document.getElementById("breathePhase");
+    const ct = document.getElementById("breatheCount");
+    if (ph) ph.textContent = ["INHALE", "HOLD", "EXHALE"][phase];
+    if (ct) ct.textContent = rem;
+  }
+
+  /* ------------------------------------------------------------------ tick */
+  function tick() {
+    const d = new Date();
+    document.querySelectorAll("[data-clock]").forEach(el => { el.textContent = fmtTime(d); });
+    document.querySelectorAll("[data-date]").forEach(el => { el.textContent = fmtDate(d); });
+    const dayN = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"][d.getDay()];
+    document.querySelectorAll("[data-sovday]").forEach(el => { el.textContent = dayN; });
+    document.querySelectorAll("[data-sovdate]").forEach(el => { el.textContent = pad2(d.getDate()); });
+    updateHands();
+
+    if (S.focus.run) {
+      const left = Math.max(0, Math.round((S.focus.endAt - Date.now()) / 1000));
+      if (left === 0) {
+        S.focus.run = false;
+        S.focus.sessions++;
+        S.focus.left = 0;
+        render();
+        toast("Focus complete — " + S.focus.sessions + " sessions");
+      } else {
+        S.focus.left = left;
+      }
+    }
+    document.querySelectorAll("[data-timer]").forEach(el => { el.textContent = mmss(S.focus.left); });
+
+    let ms = S.sw.ms;
+    if (S.sw.run) ms += Date.now() - S.sw.t0;
+    const swTxt = mmss(Math.floor(ms / 1000)) + "." + Math.floor((ms % 1000) / 100);
+    document.querySelectorAll("[data-sw]").forEach(el => { el.textContent = swTxt; });
+
+    document.querySelectorAll("[data-at]").forEach(el => {
+      const left = (Number(el.dataset.at) - Date.now()) / 1000;
+      el.textContent = left > 0 ? durShort(left) : "PASSED";
+    });
+
+    if (S.overlay === "breathe") tickBreathe();
+  }
+
+  /* ------------------------------------------------------------------ init */
+  const screen = document.getElementById("screen");
+
+  screen.addEventListener("click", e => {
+    const el = e.target.closest("[data-go],[data-act]");
+    if (!el) return;
+    if (el.dataset.go) { go(el.dataset.go); return; }
+    act(el.dataset.act, el.dataset.arg);
+  });
+
+  let press = null;
+  screen.addEventListener("pointerdown", e => {
+    if (!e.target.closest("[data-quick]")) return;
+    clearTimeout(press);
+    press = setTimeout(() => {
+      if (!S.overlay) { S.overlay = "quick"; render(); }
+    }, 480);
+  });
+  ["pointerup", "pointercancel", "pointerleave"].forEach(ev =>
+    screen.addEventListener(ev, () => clearTimeout(press)));
+
+  document.querySelectorAll(".under [data-go]").forEach(b => {
+    b.addEventListener("click", () => go(b.dataset.go));
+  });
+
+  document.addEventListener("click", e => {
+    const chip = e.target.closest(".chip");
+    if (!chip) return;
+    if (chip.dataset.go) { go(chip.dataset.go); return; }
+    if (chip.dataset.act) act(chip.dataset.act, chip.dataset.arg);
+  });
+
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape" && S.overlay) { S.overlay = null; render(); }
+  });
+
+  function fit() {
+    const wrap = document.querySelector(".stage-wrap");
+    const stage = document.querySelector(".stage");
+    if (!wrap || !stage) return;
+    const s = Math.min(1, wrap.clientWidth / 434);
+    stage.style.transform = `scale(${s})`;
+    wrap.style.height = (526 * s) + "px";
+  }
+  window.addEventListener("resize", fit);
+
+  render();
+  fit();
+  setInterval(tick, 200);
+
+  /* ------------------------------------------- full-screen face interactions
+     Tap the dial for the chrome, swipe it to page -- the same two gestures the
+     firmware implements from press/release deltas. */
+  (function faceGestures() {
+    const host = document.getElementById("screen");
+    let x0 = 0, y0 = 0, t0 = 0;
+    host.addEventListener("pointerdown", e => {
+      x0 = e.clientX; y0 = e.clientY; t0 = Date.now();
+    });
+    host.addEventListener("pointerup", e => {
+      if (S.base !== "crown-face" || S.overlay) return;
+      const dx = e.clientX - x0, dy = e.clientY - y0, dt = Date.now() - t0;
+      if (Math.abs(dx) < 26 && Math.abs(dy) < 26 && dt < 600) {
+        if (e.target.closest("[data-act],[data-go],.tab,.exit")) return;
+        S.crownChrome = !S.crownChrome;
+        render();
+        return;
+      }
+      if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy)) act("crownstep", dx < 0 ? 1 : -1);
+    });
+  })();
+
+  /* The dial glitch: a ~320 ms tear every 12 s (RARE) or 5 s (OFTEN). */
+  setInterval(() => {
+    if (S.base !== "crown-face" || S.overlay || !S.crown.glitch || !S.crown.anim) return;
+    if (S.power >= 2) return;
+    const span = S.crown.glitch === 2 ? 5000 : 12000;
+    if (Date.now() - S.glitchAt < span) return;
+    S.glitchAt = Date.now();
+    S.glitchOn = true;
+    render();
+    setTimeout(() => { S.glitchOn = false; if (S.base === "crown-face") render(); }, 340);
+  }, 400);
+  tick();
+})();
+</script>
+</body>
+</html>

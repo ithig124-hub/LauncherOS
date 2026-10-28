@@ -2,6 +2,40 @@
 //  LauncherOS.ino   --   DualCore Watch launcher  (LVGL 8.3 / 8.4)
 //  ----------------------------------------------------------------------------
 //  ----------------------------------------------------------------------------
+//  v1.2-XANDER -- PUSH-TO-TALK (one press, executes by itself).
+//      * press BOOT anywhere in the launcher -> the mic opens and ESP_SR
+//        MultiNet listens in COMMAND mode (no wake word needed)
+//      * the match runs on its own: immediately after a "HEARD:" flash, or
+//        when the ~6 s window closes if it heard nothing
+//      * a second press only shortens the wait; the 6 s cap guarantees a
+//        session can never hold the mic
+//      * needs the 'model' partition in partitions.csv and srmodels.bin
+//        flashed at 0x910000; without it voice disables itself and the
+//        rest of the launcher is unaffected
+//  ----------------------------------------------------------------------------
+//  v1.1-XANDER -- VOICE-READY COMMAND LAYER (this pass).
+//      * Xander's console now ACTS on its commands.  Every intent in the
+//        voice spec (clock, brightness, radios, battery, memory, flash, SD,
+//        system, restart/shutdown) calls a real launcher function instead
+//        of printing a canned sentence.
+//      * All ten OS .bin names are launchable from voice-shaped phrases:
+//        "open AstroOS", "spotifyos", "go to dual link".  Names resolve
+//        against the SD scan from boot, so an app that is not on the card
+//        gets an honest answer instead of a dead tap or a bad flash.
+//      * Mood handles on top of the names: "it's go time" -> SportOS,
+//        "I'm bored" -> GameOS, "boot some tunes" -> SpotifyOS,
+//        "take me to the stars" -> AstroOS, and ~60 more in kOs.
+//      * kPhrase is written in the shape a recogniser returns (plain words,
+//        no punctuation), so a speech front-end only has to hand over text.
+//      * 12/24-hour clock, brightness and the wake level persist under
+//        "dcw" (t24 / bright).  screen_on() now restores the saved level
+//        instead of snapping back to 140 -- that was a latent bug.
+//
+//      NOTE ON AUDIO: the wake-word model is NOT compiled into the launcher.
+//      The factory slot is 3 MB and the EI WATCH model alone is 2.5 MB, so
+//      the voice front-end stays in the separate Xander sketch (Xander/);
+//      this layer is what that front-end will hand recognised intents to.
+//  ----------------------------------------------------------------------------
 //  v7.1 -- UNIVERSAL CLOCK (shared time contract, see TIME_CONTRACT.md).
 //      * the wall clock lives in ONE place: NVS "rtcsave" (t = epoch,
 //        gmt = offset in SECONDS, seq, man, src).  The SHARED TIME BLOCK
@@ -269,6 +303,13 @@
 #include "lv_conf.h"
 #include "lvgl.h"
 
+// v1.2 push-to-talk. These pull in ESP-IDF headers via sdkconfig, so they go
+// LAST: everything above is already compiled against the Arduino macros it
+// expects, and the IDF includes cannot disturb LVGL/GFX.
+#include "ESP_I2S.h"
+#include "ESP_SR.h"
+#include "esp_heap_caps.h"
+
 // ---- Heap helpers (esp_heap_caps for PSRAM draw-buffer + wallpaper) -------
 // NOTE (LVGL 8.4 conversion): the v9 lv_*_core allocator overrides
 // (lv_malloc_core / lv_realloc_core / lv_free_core / lv_mem_*_core, which
@@ -285,6 +326,14 @@
 
 #define XPOWERS_CHIP_AXP2101
 #include "XPowersLib.h"
+
+// v1.6 wake word.  The Edge Impulse "WATCH" model (installed as
+// WATCH_inferencing 1.0.1) supplies the one thing MultiNet cannot: a reliable
+// "Xander".  Class index is resolved by name at boot, so a re-export with a
+// different class order still works.  No .ino of its own -- it is a library.
+#include <WATCH_inferencing.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
@@ -333,6 +382,39 @@ HWCDC USBSerial;
 // ~25 mA -> ~2-4 mA average.
 #define LIGHT_SLEEP_WHEN_OFF    1
 #define LIGHT_SLEEP_POLL_MS    250
+
+// v1.6 power states.  Declared here -- above the first function definition --
+// because the Arduino builder injects generated prototypes at that point, and
+// any prototype that mentions PmState has to see this enum first.
+enum PmState {
+    PM_ACTIVE = 0,
+    PM_IDLE,
+    PM_NIGHT,
+    PM_CHARGING,
+    PM_LOW_BATT,
+    PM_CRITICAL,
+    PM_SCREEN_OFF,
+    PM_STATE_COUNT
+};
+
+// Profiles live up here for the same reason: pm_prof() returns this type, so
+// its generated prototype has to be able to name it.
+enum PmProfileId { PMP_SAVER = 0, PMP_BALANCED = 1, PMP_PERFORMANCE = 2, PMP_COUNT = 3 };
+struct PmProfileDef {
+    const char *name;
+    uint8_t  idle_bright;
+    uint8_t  night_bright;
+    uint8_t  low_bright;
+    uint16_t idle_after_ms;
+    uint16_t cpu_active_mhz;
+    uint16_t cpu_idle_mhz;
+    uint16_t cpu_off_mhz;
+    bool     wifi_ok;
+    // v1.9: dark-screen time before the SoC parks in deep sleep.  0 = never.
+    // Deep sleep costs a full reboot to answer (see pm_auto_deep), so the
+    // performance profile does not do it.
+    uint32_t deep_after_ms;
+};
 // ============================================================================
 
 // ============================================================================
@@ -421,6 +503,12 @@ static void cards_on_quick_wp_cb(lv_event_t *e);
 static void cards_on_wifi_cb(lv_event_t *e);
 static void cards_on_ble_cb(lv_event_t *e);
 static void cards_on_haptics_cb(lv_event_t *e);
+// v1.6 power manager rows
+static void cards_on_power_profile_cb(lv_event_t *e);
+static void cards_on_timeout_cb(lv_event_t *e);
+static void cards_on_night_cb(lv_event_t *e);
+static void cards_on_night_sched_cb(lv_event_t *e);
+static void cards_on_deep_cb(lv_event_t *e);
 static void cards_open_wallpaper_cb(lv_event_t *e);
 static void cards_open_developer_cb(lv_event_t *e);
 static void cards_factory_reset_cb(lv_event_t *e);
@@ -526,6 +614,19 @@ static uint32_t lastWakeMs  = 0;              // set by screen_on(); enables WAK
 static uint32_t lastSwipeMs = 0;              // set on every successful swipe -- powers CLICK_AFTER_SWIPE_MS guard
 static bool     screenIsOff = false;
 
+// Command hold.  A phrase can start something that outlives a single loop()
+// pass -- copy an app from the card into OTA and reboot, run a WiFi sync,
+// restart -- and the 15 s idle countdown must not fire underneath it.  While a
+// hold is live the countdown is paused (loop() refreshes lastTouchMs), and
+// screen_hold_release() restarts it from zero so the result is never painted
+// onto a panel that went dark half way through.
+static uint32_t g_screenHoldUntil = 0;          // millis deadline, 0 = no hold
+static inline bool screen_held(uint32_t now) {
+    return g_screenHoldUntil && (int32_t)(g_screenHoldUntil - now) > 0;
+}
+static void screen_hold(uint32_t ms)         { g_screenHoldUntil = millis() + ms; }
+static void screen_hold_release()            { g_screenHoldUntil = 0; lastTouchMs = millis(); }
+
 // Forward-declared so load_app_from_sd() (defined earlier in the file) can
 // fade the panel down before esp_restart().
 static void fade_brightness(uint8_t target, uint32_t dur_ms);
@@ -538,6 +639,146 @@ static void anchor_launcher_as_boot();
 // -- can seed its brightness slider from this value without triggering
 // "'g_cur_brightness' was not declared in this scope".
 static uint8_t g_cur_brightness = DEFAULT_BRIGHTNESS;
+
+// v1.1: the level screen_on() restores.  g_cur_brightness tracks the panel
+// LIVE (so it reads 0 while the screen is off) and is therefore unusable as a
+// wake target -- waking would fade up to black.  Persisted under "dcw"/"bright"
+// by the Settings slider and by Xander's brightness commands.
+static uint8_t g_brightness_target = DEFAULT_BRIGHTNESS;
+
+// ============================================================================
+//  v1.6 POWER MANAGER  --  configuration + declarations
+//  ----------------------------------------------------------------------------
+//  One state machine owns every power decision in the launcher: panel
+//  brightness, CPU clock, screen timeout, WiFi permission and the battery
+//  policy.  Nothing else changes the clock or the panel on a schedule, so two
+//  features can never fight over the same hardware knob.
+//
+//  States, highest priority first:
+//      CRITICAL   <= PM_BATT_CRIT_PCT on battery  -> minimum brightness,
+//                                                    WiFi blocked, one warning
+//      LOW_BATT   <= PM_BATT_LOW_PCT  on battery  -> capped brightness,
+//                                                    WiFi blocked, one warning
+//      SCREEN_OFF                                  -> panel dark, light sleep
+//      NIGHT      manual toggle or 22:00-07:00     -> dim profile
+//      CHARGING                                    -> normal profile, no
+//                                                    battery-derived limits
+//      IDLE       no input for a few seconds       -> profile's idle level
+//      ACTIVE                                      -> the user's own level
+//
+//  User activity is `lastTouchMs` and nothing else.  It is stamped by touch
+//  (press and release), the BOOT button, the side PWR button, a recognised
+//  Xander command and every screen_on(), so a redraw, a sensor sample or a
+//  battery poll can never keep the panel awake on its own.
+//
+//  The CPU table deliberately keeps the awake clock at 80 MHz for Balanced
+//  and Power Saver: that is what the firmware already ran at, and raising it
+//  would spend battery to make an interface nobody called slow feel faster.
+//  Only the Performance profile pays for 240/160 MHz.
+// ============================================================================
+
+// ---- power configuration ---------------------------------------------------
+#define PM_BATT_LOW_PCT            20    // % at which LOW_BATT starts
+#define PM_BATT_CRIT_PCT            7    // % at which CRITICAL starts
+#define PM_BATT_OFF_PCT             2    // % at which the watch protects the cell
+#define PM_BATT_HYST                3    // % of hysteresis before a level clears
+#define PM_BATT_OFF_CONFIRMS        2    // consecutive readings needed to sleep
+#define PM_BATT_OFF_SETTLE_MS   60000UL  // ...and they must be this far apart
+#define PM_RAMP_INTERVAL_MS        24    // brightness step period
+#define PM_NOTICE_MS             2600    // how long a power notice stays up
+#define PM_LOG_INTERVAL_MS    600000UL   // diagnostics line every 10 min
+#define PM_ENERGY_DUMP_MS     1800000UL  // measured energy table every 30 min
+#define PM_ENERGY_MAX_DPCT         25    // a bigger % step is a bad read, not drain
+#define PM_NIGHT_START_HOUR        22
+#define PM_NIGHT_END_HOUR           7
+#define PM_QUIET_FACE               1    // hide the wallpaper in the dim states
+#define PM_DARK_SAMPLE_MS      300000UL  // PMIC read while the panel is dark (5 min)
+#define PM_LOW_HOLD_MS           8000    // screen timeout cap at LOW_BATT
+#define PM_CRIT_HOLD_MS          5000    // ...and at CRITICAL
+
+// ---- power states ----------------------------------------------------------
+// (enum PmState lives up in POWER-SAVING TUNABLES -- see the note there.)
+
+// ---- profiles --------------------------------------------------------------
+// (PmProfileId / PmProfileDef are declared in POWER-SAVING TUNABLES; the table
+// itself is safe here because no generated prototype mentions it.)
+//
+// Brightness caps are absolute panel levels (0-255), applied as
+// min(user_target, cap) so a user who dimmed to 60 keeps 60 in every state.
+static const PmProfileDef kPmProfiles[PMP_COUNT] = {
+    // name             idle night low  idle-after  cpu: act  idle  off  wifi  deep-after
+    { "Power Saver",     45,   25,  30,   4000,          80,   80, 80,  false,   600000 },
+    { "Balanced",        70,   35,  40,   5000,          80,   80, 80,  true,    600000 },
+    { "Performance",    100,   50,  50,   8000,         240,  160, 80,  true,         0 },
+};
+
+// ---- runtime status --------------------------------------------------------
+static PmState   g_pmState       = PM_ACTIVE;
+static bool      g_pmReady       = false;
+static uint32_t  g_pmStateSince  = 0;                       // millis of last transition
+static uint32_t  g_pmStateMs[PM_STATE_COUNT] = { 0 };       // dwell time per state
+static uint32_t  g_pmTransitions = 0;
+static uint8_t   g_pmProfileIdx  = PMP_BALANCED;
+static bool      g_pmNightManual = false;                   // settings toggle
+static bool      g_pmNightSched  = true;                    // 22:00-07:00 window
+static uint16_t  g_pmTimeoutMs   = 15000;                   // screen-off countdown
+static uint8_t   g_pmBattLatch   = 0;                       // 0 none, 1 low, 2 critical
+static uint32_t  g_pmBattSampleMs = 0;                      // freshness of g_batt_pct
+static uint8_t   g_pmOffStreak   = 0;                       // PM_BATT_OFF_PCT confirmations
+
+// ---- energy ledger ---------------------------------------------------------
+// Drain is measured, not modelled: the AXP2101 percentage is read at every
+// state transition, so each sample covers exactly ONE state and the mAh can be
+// attributed without guessing.  (Reading on a fixed timer instead would smear
+// ACTIVE and SCREEN_OFF into the same window -- a 145 mA state and a 3 mA one
+// averaged together is worse than no number at all.)
+//
+// No extra I2C traffic while nothing happens: the poll below only runs on a
+// window boundary, and a dark screen produces none until the wake.
+static float    g_pmEnMah[PM_STATE_COUNT];                  // mAh attributed per state
+static uint32_t g_pmEnMeasMs[PM_STATE_COUNT];               // time those mAh were measured over
+static float    g_pmEnTotalMah   = 0.0f;
+static int      g_pmEnLastPct   = -1;                       // -1 = re-baseline next read
+static uint32_t g_pmEnLastMs    = 0;
+static uint32_t g_pmEnSamples   = 0;
+static uint32_t g_pmEnDropped   = 0;
+static uint32_t g_pmEnDumpNext  = 0;
+static uint32_t  g_pmOffFirstMs  = 0;
+static bool      g_pmOffDone     = false;                   // never shut down twice
+static uint32_t  g_pmRampNext    = 0;                       // next brightness step
+static uint32_t  g_pmLogNext     = 0;
+static uint8_t   g_pmPctAtBoot   = 0;
+static uint32_t  g_pmBootMs      = 0;
+static bool      g_pmMicBusy     = false;   // ESP-SR bring-up holds a 240 MHz boost
+static bool      g_pmQuietFace   = false;   // dim state: wallpaper hidden (see refresh_wallpaper)
+static bool      g_pmWpDirty     = false;   // wallpaper changed while the face was quiet
+static bool      g_pmDeepOn      = true;    // settings: allow auto deep sleep
+static bool      g_pmVoiceArmed  = false;   // wake word is listening; set by aon_service()
+
+static const uint16_t kPmTimeouts[] = { 8000, 15000, 30000, 60000 };
+#define PM_TIMEOUT_CHOICES ((int)(sizeof(kPmTimeouts) / sizeof(kPmTimeouts[0])))
+
+// ---- forward declarations (definitions live beside screen_off/deep_sleep) --
+static void        pm_init();
+static void        pm_service(uint32_t now);
+static void        pm_activity(const char *why);
+static void        pm_note_battery(uint32_t now);
+static bool        pm_wifi_allowed();
+static void        pm_restore_cpu();
+static uint32_t    pm_idle_after_ms();
+static void        pm_log(uint32_t now);
+static int         pm_profile_index();
+static int         pm_timeout_index();
+static const char *pm_state_name(PmState s);
+static uint8_t     pm_wake_brightness();
+
+// v1.1: 12/24-hour clock, persisted under "dcw"/"t24".  24-hour stays the
+// default so the face looks exactly as it always has until the user asks.
+static bool    g_time_24h = false;
+
+// v1.1: set once SD_MMC.begin() succeeds, so the Xander status answers can
+// describe the card without re-probing it (a probe on a missing card stalls).
+static bool    g_sd_ok = false;
 
 // State backing for the v7.0 card-based Settings toggles.  Defined here
 // (rather than next to their event callbacks further down) for the same
@@ -1253,7 +1494,25 @@ static lv_obj_t *face_batt_icon=nullptr, *face_batt_fill=nullptr;
 static lv_obj_t *face_batt_bolt=nullptr, *face_batt_lbl=nullptr;
 static lv_obj_t *face_status=nullptr;
 
+// v1.8: what the clock last painted.  The face shows HH:MM, so 59 of every 60
+// one-second ticks would repaint identical pixels -- a label invalidate plus a
+// panel refresh per second, in every screen-on state, for nothing.
+static char    g_faceLastHm[8]  = "";
+static char    g_faceLastDt[32] = "";
+static uint8_t g_faceLastDot    = 0xFF;
+
 static void refresh_wallpaper() {
+    // v1.8: a dim power state (IDLE / NIGHT / LOW_BATT / CRITICAL) shows a
+    // pure-black face instead of the wallpaper.  On an AMOLED every lit pixel
+    // is current, so a photo at the same brightness level costs several times
+    // what the clock alone does -- this is the one place that decides whether
+    // the background is drawn, so the rule lives here rather than in the PM.
+    if (g_pmQuietFace) {
+        if (face_bg_img)  lv_obj_add_flag(face_bg_img, LV_OBJ_FLAG_HIDDEN);
+        if (face_bg_fill) lv_obj_add_flag(face_bg_fill, LV_OBJ_FLAG_HIDDEN);
+        g_pmWpDirty = true;          // paint the new one when the face wakes
+        return;
+    }
     if (!g_photo_count) {
         if (face_bg_img)  lv_obj_add_flag(face_bg_img, LV_OBJ_FLAG_HIDDEN);
         if (face_bg_fill) lv_obj_clear_flag(face_bg_fill, LV_OBJ_FLAG_HIDDEN);
@@ -1280,11 +1539,17 @@ static void update_face_time() {
     char hm[8] = "--:--", dt[32] = "no wifi";
     struct tm tm;
     if (g_ntp_synced && getLocalTime(&tm, 5)) {
-        strftime(hm, sizeof(hm), "%H:%M", &tm);
+        strftime(hm, sizeof(hm), g_time_24h ? "%H:%M" : "%I:%M", &tm);
         strftime(dt, sizeof(dt), "%a  %d %b", &tm);
     } else if (g_wifi_connected) {
         strcpy(dt, "syncing...");
     }
+    uint8_t dotKey = g_ntp_synced ? 1 : (g_wifi_connected ? 2 : 3);
+    if (!strcmp(g_faceLastHm, hm) && !strcmp(g_faceLastDt, dt) &&
+        g_faceLastDot == dotKey) return;          // same pixels: do not repaint
+    strcpy(g_faceLastHm, hm);
+    strcpy(g_faceLastDt, dt);
+    g_faceLastDot = dotKey;
     lv_label_set_text(face_time, hm);
     lv_label_set_text(face_time_shadow, hm);
     lv_label_set_text(face_date, dt);
@@ -1320,6 +1585,7 @@ static void update_face_battery() {
 static void build_screen_face() {
     lv_obj_t *s = lv_obj_create(NULL);
     screens[SCREEN_FACE] = s;
+    g_faceLastHm[0] = 0;              // fresh widgets: force the next tick to paint
     lv_obj_set_style_bg_color(s, lv_color_hex(0x000000), 0);
     lv_obj_set_style_bg_opa(s, LV_OPA_COVER, 0);
     lv_obj_clear_flag(s, LV_OBJ_FLAG_SCROLLABLE);
@@ -1488,14 +1754,135 @@ static String cat_lookup(const String &appname) {
     }
     return String("Other");
 }
+// ---- The one place the app folder is named --------------------------------
+// Every card is formatted by a different computer, and a FAT directory that was
+// created as "BIN" does not always answer to "bin".  The first spelling that
+// really exists wins, and every path below is built from it, so a card can
+// never be half-scanned because one string literal disagreed with the card.
+static String g_apps_dir = "";
+static const char *kAppDirCands[] = {
+    "/WATCH/bin", "/WATCH/BIN", "/WATCH/Bin", "/WATCH/bins",
+    "/WATCH/apps", "/WATCH/Apps", "/WATCH/APPS",
+    // A card that was filled by dragging the repo's own `bin/` folder onto it
+    // ends up with the .bin files one level higher than the launcher used to
+    // look, so /bin and /apps are part of the search now.
+    "/bin", "/BIN", "/Bin", "/apps", "/APPS",
+};
+#define APP_DIR_CANDS ((int)(sizeof(kAppDirCands) / sizeof(kAppDirCands[0])))
+
+static bool app_dir_isdir(const char *path) {
+    File d = SD_MMC.open(path);
+    const bool ok = (d && d.isDirectory());
+    if (d) d.close();
+    return ok;
+}
+
+// How many files in `path` would scan_apps() actually accept?  A card can hold
+// both the right folder and a stale decoy (an empty /WATCH/bin next to the /bin
+// just copied over), and "the folder exists" alone would pick the empty one.
+static int app_dir_bin_count(const char *path) {
+    if (!app_dir_isdir(path)) return 0;
+    File d = SD_MMC.open(path);
+    if (!d) return 0;
+    int n = 0, seen = 0;
+    File f = d.openNextFile();
+    while (f && seen < 64) {
+        if (!f.isDirectory()) {
+            String nm = f.name();
+            int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
+            String lo = nm; lo.toLowerCase();
+            if (lo.endsWith(".bin") && nm.length() > 4 && nm[0] != '.' && f.size() > 0) n++;
+        }
+        seen++;
+        f = d.openNextFile();
+    }
+    d.close();
+    return n;
+}
+
+static String apps_dir() {
+    if (g_apps_dir.length()) return g_apps_dir;
+    // 1. A known spelling that really holds .bin files wins immediately.
+    String empty = "";
+    for (int i = 0; i < APP_DIR_CANDS; i++) {
+        if (!app_dir_isdir(kAppDirCands[i])) continue;
+        if (app_dir_bin_count(kAppDirCands[i]) > 0) {
+            g_apps_dir = kAppDirCands[i];
+            if (g_apps_dir != "/WATCH/bin")
+                USBSerial.printf("[scan] app folder is %s\n", g_apps_dir.c_str());
+            return g_apps_dir;
+        }
+        if (!empty.length()) empty = kAppDirCands[i];
+    }
+    // 2. Unknown spelling: ask /WATCH and then the card root what they hold.  A
+    //    card formatted on a Mac or Windows sometimes carries "BIn" / "bins " /
+    //    "Bin.", and those would otherwise all look like a missing folder.
+    const char *parents[] = { "/WATCH", "/" };
+    for (int p = 0; p < 2; p++) {
+        File d = SD_MMC.open(parents[p]);
+        if (!d || !d.isDirectory()) { if (d) d.close(); continue; }
+        File e = d.openNextFile();
+        while (e) {
+            if (e.isDirectory()) {
+                String n = e.name();
+                int sl = n.lastIndexOf('/'); if (sl >= 0) n = n.substring(sl + 1);
+                String lo = n; lo.toLowerCase(); lo.trim();
+                if (lo == "bin" || lo == "bins" || lo == "apps") {
+                    String path = parents[p];
+                    if (!path.endsWith("/")) path += "/";
+                    path += n;
+                    if (app_dir_bin_count(path.c_str()) > 0) {
+                        g_apps_dir = path;
+                        e.close(); d.close();
+                        USBSerial.printf("[scan] app folder is %s\n", g_apps_dir.c_str());
+                        return g_apps_dir;
+                    }
+                    if (!empty.length()) empty = path;
+                }
+            }
+            e = d.openNextFile();
+        }
+        d.close();
+    }
+    if (empty.length()) {
+        g_apps_dir = empty;
+        USBSerial.printf("[scan] app folder is %s (no .bin inside)\n", g_apps_dir.c_str());
+        return g_apps_dir;
+    }
+    // Not found: report the canonical path but do NOT cache the failure, so a
+    // card inserted later is still probed again.
+    return String(kAppDirCands[0]);
+}
+
+// When the walk finds nothing, print what the card actually holds.  One boot
+// log then answers "which folder are the bins really in?" without guesswork.
+static void scan_log_root() {
+    File r = SD_MMC.open("/");
+    if (!r || !r.isDirectory()) { if (r) r.close(); USBSerial.println("[scan] card root unreadable"); return; }
+    USBSerial.print("[scan] card root holds:");
+    File e = r.openNextFile();
+    int n = 0;
+    while (e && n < 16) {
+        String nm = e.name();
+        int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
+        USBSerial.printf(" %s%s", nm.c_str(), e.isDirectory() ? "/" : "");
+        n++;
+        e = r.openNextFile();
+    }
+    if (!n) USBSerial.print(" (empty)");
+    USBSerial.println();
+    r.close();
+}
+
 static void load_categories_txt() {
     g_cat_count = 0;
     g_cat_file_present = false;
-    if (!SD_MMC.exists("/WATCH/bin/categories.txt")) {
+    const String cat_path = apps_dir() + "/categories.txt";
+    if (!SD_MMC.exists(cat_path)) {
         USBSerial.println("[cat] categories.txt not present -- flat list");
         return;
     }
-    File f = SD_MMC.open("/WATCH/bin/categories.txt", FILE_READ);
+    File f = SD_MMC.open(cat_path, FILE_READ);
     if (!f) return;
     g_cat_file_present = true;
     String line;
@@ -1540,7 +1927,17 @@ static uint32_t apps_signature(File &dir) {
     while (f && n < MAX_APPS) {
         if (!f.isDirectory()) {
             String nm = f.name(); nm.toLowerCase();
-            if (nm.endsWith(".bin")) { sig ^= (uint32_t)f.size() + (uint32_t)n * 2654435761u; n++; }
+            if (nm.endsWith(".bin")) {
+                // Hash the NAME too: swapping a .bin for a same-sized one must
+                // invalidate the NVS cache, not silently keep the old entry.
+                uint32_t h = 2166136261u;
+                for (size_t i = 0; i < nm.length(); i++) {
+                    h ^= (uint8_t)nm[i];
+                    h *= 16777619u;
+                }
+                sig ^= h + (uint32_t)f.size() * 2654435761u + (uint32_t)n * 40503u;
+                n++;
+            }
         }
         f = dir.openNextFile();
     }
@@ -1560,8 +1957,10 @@ static bool apps_cache_load(uint32_t expected_sig) {
         uint32_t sz = g_app_cache.getUInt(key, 0);
         if (!nm.length()) continue;
         g_apps[g_app_count].name = nm;
-        g_apps[g_app_count].path = String("/WATCH/bin/") + nm + ".bin";
+        g_apps[g_app_count].path = apps_dir() + "/" + nm + ".bin";
         g_apps[g_app_count].size = sz;
+        USBSerial.printf("[cache]  %-14s %6.1f KB  %s\n",
+                         nm.c_str(), sz / 1024.0f, g_apps[g_app_count].path.c_str());
         g_app_count++;
     }
     g_app_cache.end();
@@ -1894,9 +2293,11 @@ static void show_launch_confirm(int idx) {
 // ---- Directory scan --------------------------------------------------------
 static void scan_apps() {
     g_app_count = 0;
-    File dir = SD_MMC.open("/WATCH/bin");
+    const String dirpath = apps_dir();
+    File dir = SD_MMC.open(dirpath);
     if (!dir || !dir.isDirectory()) {
-        USBSerial.println("[scan] /WATCH/bin missing");
+        USBSerial.printf("[scan] %s missing\n", dirpath.c_str());
+        scan_log_root();
         return;
     }
     uint32_t sig = apps_signature(dir);
@@ -1904,24 +2305,118 @@ static void scan_apps() {
     if (apps_cache_load(sig)) return;   // cache hit -> skip per-file stat loop
 
     // Cache miss: do a fresh directory walk and stat each file.
-    dir = SD_MMC.open("/WATCH/bin");
+    dir = SD_MMC.open(dirpath);
     File f = dir.openNextFile();
     while (f && g_app_count < MAX_APPS) {
         if (!f.isDirectory()) {
             String n = f.name();
             int s = n.lastIndexOf('/'); if (s >= 0) n = n.substring(s+1);
             String lo = n; lo.toLowerCase();
-            if (lo.endsWith(".bin")) {
-                g_apps[g_app_count].path = String("/WATCH/bin/") + n;
+            // "._AstroOS.bin" is AppleDouble metadata, not an image; flashing it
+            // would brick the boot into the OTA slot.  Same for dotfiles.
+            if (lo.endsWith(".bin") && n.length() > 4 && n[0] != '.' && f.size() > 0) {
+                g_apps[g_app_count].path = dirpath + "/" + n;
                 g_apps[g_app_count].name = n.substring(0, n.length() - 4);
                 g_apps[g_app_count].size = f.size();
+                USBSerial.printf("[scan]   %-14s %6.1f KB  %s\n",
+                                 g_apps[g_app_count].name.c_str(),
+                                 f.size() / 1024.0f, g_apps[g_app_count].path.c_str());
                 g_app_count++;
             }
         }
         f = dir.openNextFile();
     }
-    USBSerial.printf("[scan] found %d apps (fresh)\n", g_app_count);
+    USBSerial.printf("[scan] found %d apps in %s (fresh)\n", g_app_count, dirpath.c_str());
+    if (g_app_count == 0) scan_log_root();
     apps_cache_save(sig);
+}
+
+// ---- one lookup for every "launch <bin>" path ------------------------------
+// /WATCH/bin is filled by whatever computer the card was last plugged into, so
+// the file may be "Dual_Link.bin", "dual link.bin" or "DUALLINK.BIN" while the
+// command (voice or tap) says "Dual_Link".  The NVS cache can also be older
+// than the card.  Resolving in one place means both the app grid and the voice
+// paths agree on what "on the card" means.
+static String bin_stem(const String &s) {
+    String t = s;
+    t.trim();
+    if (t.length() > 4) {
+        String tail = t.substring(t.length() - 4);
+        tail.toLowerCase();
+        if (tail == ".bin") t = t.substring(0, t.length() - 4);
+    }
+    return t;
+}
+static String bin_norm(const String &s) {
+    String out; out.reserve(s.length());
+    for (size_t i = 0; i < s.length(); i++) {
+        char ch = s[i];
+        if (ch >= 'A' && ch <= 'Z') ch = (char)(ch - 'A' + 'a');
+        if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) out += ch;
+    }
+    return out;
+}
+// Walks `dir` for a .bin whose normalised stem equals `w`.  `depth` > 0 also
+// looks one level down, because some cards are copied as
+// /WATCH/bin/<App>/<App>.bin instead of a flat folder.
+static bool app_probe_in(const String &dir, const String &w, int depth) {
+    File d = SD_MMC.open(dir);
+    if (!d || !d.isDirectory()) { if (d) d.close(); return false; }
+    File f = d.openNextFile();
+    while (f) {
+        String n = f.name();
+        int sl = n.lastIndexOf('/'); if (sl >= 0) n = n.substring(sl + 1);
+        if (!f.isDirectory() && n.length() > 4 && n[0] != '.') {
+            String lo = n; lo.toLowerCase();
+            if (lo.endsWith(".bin") && f.size() > 0 && g_app_count < MAX_APPS) {
+                String stem = n.substring(0, n.length() - 4);
+                if (bin_norm(stem) == w) {
+                    g_apps[g_app_count].name = stem;
+                    g_apps[g_app_count].path = dir + "/" + n;
+                    g_apps[g_app_count].size = (size_t)f.size();
+                    g_app_count++;
+                    d.close();
+                    return true;
+                }
+            }
+        }
+        f = d.openNextFile();
+    }
+    d.close();
+    if (depth <= 0) return false;
+    d = SD_MMC.open(dir);
+    if (!d || !d.isDirectory()) { if (d) d.close(); return false; }
+    f = d.openNextFile();
+    while (f) {
+        String n = f.name();
+        int sl = n.lastIndexOf('/'); if (sl >= 0) n = n.substring(sl + 1);
+        const bool isdir = f.isDirectory();
+        f = d.openNextFile();            // release this entry before recursing
+        if (isdir && n.length() && n[0] != '.') {
+            if (app_probe_in(dir + "/" + n, w, depth - 1)) { d.close(); return true; }
+        }
+    }
+    d.close();
+    return false;
+}
+// Index into g_apps[], or -1.  Trying, in order: the boot scan, a forced
+// rescan (card updated since boot), then the card itself -- which also appends
+// the late find to g_apps so the rest of the launch path works unchanged.
+static int app_resolve(const char *wantName) {
+    String want = bin_stem(String(wantName));
+    const String w = bin_norm(want);
+    if (!w.length()) return -1;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < g_app_count; i++)
+            if (bin_norm(g_apps[i].name) == w) return i;
+        if (pass == 0) scan_apps();     // NVS list may predate the card
+    }
+    if (app_probe_in(apps_dir(), w, 1)) {
+        USBSerial.printf("[scan] %s picked up from %s after boot\n",
+                         want.c_str(), apps_dir().c_str());
+        return g_app_count - 1;
+    }
+    return -1;
 }
 
 // ---- List interactions -----------------------------------------------------
@@ -2080,6 +2575,11 @@ static void add_section_header(lv_obj_t *parent, const char *text, uint32_t colo
 
 static void populate_app_list() {
     if (!g_list_widget) return;
+    // The only scan used to be the one during the splash, so a card pushed in
+    // after boot left this screen empty forever.  Re-walk now that the user is
+    // actually looking at the list (only when it is empty -- a populated list is
+    // refreshed through app_resolve / the scan at boot).
+    if (!g_app_count && g_sd_ok) scan_apps();
     lv_obj_clean(g_list_widget);
 
     if (!g_app_count) {
@@ -2486,6 +2986,20 @@ static void build_screen_settings() {
     card_slider(list, "Brightness", "AMOLED backlight (20-255)",
                 20, 255, g_cur_brightness, cards_on_brightness_cb);
 
+    // 1b) v1.6 power manager: profile, timeout, night mode
+    card_dropdown(list, "Power Profile", "brightness + CPU policy",
+                  "Power Saver\nBalanced\nPerformance",
+                  pm_profile_index(), cards_on_power_profile_cb);
+    card_dropdown(list, "Screen Timeout", "idle seconds before dark",
+                  "8 s\n15 s\n30 s\n60 s",
+                  pm_timeout_index(), cards_on_timeout_cb);
+    card_toggle(list, "Night Mode", "dim now until switched off",
+                g_pmNightManual, cards_on_night_cb);
+    card_toggle(list, "Night Schedule", "22:00 - 07:00 auto dim",
+                g_pmNightSched, cards_on_night_sched_cb);
+    card_toggle(list, "Auto Sleep", "10 min dark -> deep sleep",
+                g_pmDeepOn, cards_on_deep_cb);
+
     // 2) Theme dropdown
     {
         static String theme_opts;
@@ -2723,6 +3237,16 @@ static void build_screen_battery() {
     lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
     lv_obj_align(sub, LV_ALIGN_TOP_LEFT, 24, 50);
 
+    // v1.4: the manual clock lives one swipe above this screen.  The hint is
+    // dim so it never competes with the battery number, but it is the only
+    // clue that the card exists.
+    lv_obj_t *hint = lv_label_create(s);
+    lv_label_set_text(hint, LV_SYMBOL_UP "  set time");
+    lv_obj_set_style_text_color(hint, lv_color_hex(theme_primary()), 0);
+    lv_obj_set_style_text_opa(hint, 140, 0);
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_align(hint, LV_ALIGN_TOP_RIGHT, -24, 32);
+
     // The big percent arc
     batt_arc = lv_arc_create(s);
     lv_obj_set_size(batt_arc, 280, 280);
@@ -2820,6 +3344,247 @@ static void build_screen_battery() {
 }
 
 // ============================================================================
+//  MANUAL CLOCK  --  swipe UP on the Battery screen
+//  ----------------------------------------------------------------------------
+//  WiFi/NTP is the normal source of the wall clock, but a watch with no
+//  network -- or one whose internal RTC was wiped by a dead battery -- has no
+//  way to be told the time at all.  This is that way: a card with hour and
+//  minute steppers, opened by a swipe up on the Battery screen.
+//
+//  Save writes the clock to all three places it has to reach:
+//    * the chip: settimeofday() sets the ESP32-S3's internal RTC, which is the
+//      only clock this board has (there is no separate RTC chip on it) and
+//      which keeps counting through deep sleep;
+//    * NVS: time_publish(..., manual = true) stores t / gmt / man=1 in
+//      "rtcsave", so time_decide() ADOPTS this clock on the next boot instead
+//      of overwinding it with an older snapshot.  That is the "no wifi" case
+//      surviving a reboot;
+//    * the face: g_ntp_synced is set so the 1 Hz tick renders it immediately.
+// ============================================================================
+static lv_obj_t *g_tc_dim   = nullptr;   // full-screen scrim on lv_layer_top()
+static lv_obj_t *g_tc_card  = nullptr;
+static lv_obj_t *g_tc_big   = nullptr;
+static lv_obj_t *g_tc_note  = nullptr;
+static int       g_tc_h     = 12;
+static int       g_tc_m     = 0;
+static bool      g_tc_have_date = false; // the chip already holds a date
+static bool      g_tc_open  = false;
+
+static bool time_card_is_open() { return g_tc_open; }
+
+static void time_card_paint() {
+    if (!g_tc_big) return;
+    char b[16];
+    if (g_time_24h) {
+        snprintf(b, sizeof(b), "%02d:%02d", g_tc_h, g_tc_m);
+    } else {
+        int h12 = g_tc_h % 12; if (h12 == 0) h12 = 12;
+        snprintf(b, sizeof(b), "%d:%02d", h12, g_tc_m);
+    }
+    lv_label_set_text(g_tc_big, b);
+}
+
+// One stepper button carries its unit (0 = hours, 1 = minutes) in bits 8+ and
+// a signed step in the low byte, through LVGL's user_data pointer.
+static void time_card_step_cb(lv_event_t *e) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    int code = (int)(intptr_t)lv_event_get_user_data(e);
+    const int unit = (code >> 8) & 0xFF;
+    const int step = (int)(int8_t)(code & 0xFF);
+    if (unit == 0) g_tc_h = (g_tc_h + step + 24) % 24;
+    else           g_tc_m = (g_tc_m + step + 60) % 60;
+    time_card_paint();
+    lastTouchMs = millis();
+}
+
+static void time_card_mk_step(lv_obj_t *card, const char *sym, int x, int y,
+                              int unit, int step) {
+    lv_obj_t *b = lv_btn_create(card);
+    lv_obj_set_size(b, 64, 46);
+    lv_obj_align(b, LV_ALIGN_TOP_MID, x, y);
+    lv_obj_set_style_radius(b, 12, 0);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0x0A0A0A), 0);
+    lv_obj_set_style_border_color(b, lv_color_hex(theme_primary()), 0);
+    lv_obj_set_style_border_width(b, 1, 0);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text(l, sym);
+    lv_obj_set_style_text_color(l, lv_color_hex(theme_primary()), 0);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_20, 0);
+    lv_obj_center(l);
+    lv_obj_add_event_cb(b, time_card_step_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)(((unit & 0xFF) << 8) | (step & 0xFF)));
+}
+
+static void time_card_close(bool repaint) {
+    g_tc_open = false;
+    if (g_tc_dim) { lv_obj_del(g_tc_dim); g_tc_dim = nullptr; }
+    g_tc_card = g_tc_big = g_tc_note = nullptr;
+    if (repaint) {
+        update_face_time();
+        if (batt_arc) update_battery_screen();
+        lv_timer_handler();
+    }
+}
+
+// %DATE% is "Mmm dd yyyy" ("Oct 22 2026").  Used only when the chip has no
+// clock at all: better a firmware-build date the user can correct than 1970,
+// which is below TIME_VALID_MIN and would refuse to be saved.
+static bool time_card_build_date(struct tm &t) {
+    static const char kMon[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+    char mon[4] = {0};
+    int  day = 0, year = 0;
+    if (sscanf(__DATE__, "%3s %d %d", mon, &day, &year) != 3) return false;
+    const char *p = strstr(kMon, mon);
+    if (!p || day < 1 || day > 31) return false;
+    memset(&t, 0, sizeof(t));
+    t.tm_year  = year - 1900;
+    t.tm_mon   = (int)((p - kMon) / 3);
+    t.tm_mday  = day;
+    t.tm_isdst = 0;
+    return true;
+}
+
+static void time_card_apply() {
+    struct tm t;
+    time_t now = time(nullptr);
+    const bool live = (now >= (time_t)TIME_VALID_MIN) && getLocalTime(&t, 5);
+    if (!live && !time_card_build_date(t)) {
+        USBSerial.println("[time] manual set failed: no date to work from");
+        time_card_close(false);
+        return;
+    }
+    t.tm_hour  = g_tc_h;
+    t.tm_min   = g_tc_m;
+    t.tm_sec   = 0;
+    t.tm_isdst = 0;
+
+    time_apply_tz(g_tp_gmt);        // mktime() reads the offset out of TZ
+    time_t epoch = mktime(&t);      // tm is LOCAL time -> epoch is UTC
+    if (epoch < (time_t)TIME_VALID_MIN) {
+        USBSerial.println("[time] manual set failed: computed epoch is implausible");
+        time_card_close(false);
+        return;
+    }
+
+    struct timeval tv = { epoch, 0 };
+    settimeofday(&tv, nullptr);     // the chip RTC is now set
+    g_ntp_synced = true;            // "there is a real clock", whatever its source
+    g_tp_valid   = true;
+    time_publish("manual set", true);       // NVS, man=1 -> adopted on next boot
+
+    USBSerial.printf("[time] manual set %02d:%02d local (epoch %ld, gmt %+ld s)\n",
+                     g_tc_h, g_tc_m, (long)epoch, (long)g_tp_gmt);
+    time_card_close(true);
+}
+
+static void time_card_open() {
+    if (g_tc_open || !screens[SCREEN_BATTERY]) return;
+
+    struct tm t;
+    g_tc_have_date = (time(nullptr) >= (time_t)TIME_VALID_MIN) && getLocalTime(&t, 5);
+    if (g_tc_have_date) { g_tc_h = t.tm_hour; g_tc_m = t.tm_min; }
+    else                { g_tc_h = 12;        g_tc_m = 0; }
+
+    g_tc_dim = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(g_tc_dim);
+    lv_obj_set_size(g_tc_dim, LCD_WIDTH, LCD_HEIGHT);
+    lv_obj_set_style_bg_color(g_tc_dim, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(g_tc_dim, 180, 0);
+    lv_obj_clear_flag(g_tc_dim, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(g_tc_dim, LV_OBJ_FLAG_CLICKABLE);   // the scrim eats stray taps
+
+    g_tc_card = lv_obj_create(g_tc_dim);
+    lv_obj_remove_style_all(g_tc_card);
+    lv_obj_set_size(g_tc_card, 380, 316);
+    lv_obj_center(g_tc_card);
+    lv_obj_set_style_bg_color(g_tc_card, lv_color_hex(0x111111), 0);
+    lv_obj_set_style_bg_opa(g_tc_card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(g_tc_card, 24, 0);
+    lv_obj_set_style_border_color(g_tc_card, lv_color_hex(theme_primary()), 0);
+    lv_obj_set_style_border_width(g_tc_card, 1, 0);
+    lv_obj_clear_flag(g_tc_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *eb = lv_label_create(g_tc_card);
+    lv_label_set_text(eb, "SET TIME");
+    lv_obj_set_style_text_color(eb, lv_color_hex(theme_primary()), 0);
+    lv_obj_set_style_text_font(eb, &lv_font_montserrat_12, 0);
+    lv_obj_align(eb, LV_ALIGN_TOP_MID, 0, 14);
+
+    g_tc_big = lv_label_create(g_tc_card);
+    lv_obj_set_style_text_color(g_tc_big, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(g_tc_big, &lv_font_montserrat_48, 0);
+    lv_obj_align(g_tc_big, LV_ALIGN_TOP_MID, 0, 40);
+
+    time_card_mk_step(g_tc_card, LV_SYMBOL_UP,   -120,  44, 0,  1);
+    time_card_mk_step(g_tc_card, LV_SYMBOL_DOWN, -120, 100, 0, -1);
+    time_card_mk_step(g_tc_card, LV_SYMBOL_UP,    120,  44, 1,  5);
+    time_card_mk_step(g_tc_card, LV_SYMBOL_DOWN,  120, 100, 1, -5);
+
+    lv_obj_t *ch = lv_label_create(g_tc_card);
+    lv_label_set_text(ch, "HOUR");
+    lv_obj_set_style_text_color(ch, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(ch, &lv_font_montserrat_12, 0);
+    lv_obj_align(ch, LV_ALIGN_TOP_MID, -120, 154);
+
+    lv_obj_t *cm = lv_label_create(g_tc_card);
+    lv_label_set_text(cm, "MIN");
+    lv_obj_set_style_text_color(cm, lv_color_hex(0x888888), 0);
+    lv_obj_set_style_text_font(cm, &lv_font_montserrat_12, 0);
+    lv_obj_align(cm, LV_ALIGN_TOP_MID, 120, 154);
+
+    g_tc_note = lv_label_create(g_tc_card);
+    lv_label_set_text(g_tc_note, g_tc_have_date
+        ? "Date kept. Saves to NVS + the RTC."
+        : "No clock yet - date comes from\nthe firmware build.");
+    lv_obj_set_style_text_color(g_tc_note, lv_color_hex(0x777777), 0);
+    lv_obj_set_style_text_font(g_tc_note, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_align(g_tc_note, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(g_tc_note, 340);
+    lv_obj_align(g_tc_note, LV_ALIGN_TOP_MID, 0, 180);
+
+    lv_obj_t *cancel = lv_btn_create(g_tc_card);
+    lv_obj_set_size(cancel, 150, 46);
+    lv_obj_align(cancel, LV_ALIGN_BOTTOM_LEFT, 20, -18);
+    lv_obj_set_style_radius(cancel, 23, 0);
+    lv_obj_set_style_bg_color(cancel, lv_color_hex(0x0A0A0A), 0);
+    lv_obj_set_style_border_color(cancel, lv_color_hex(0x777777), 0);
+    lv_obj_set_style_border_width(cancel, 1, 0);
+    lv_obj_add_event_cb(cancel,
+        [](lv_event_t *){
+            if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+            time_card_close(true);
+        }, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cl = lv_label_create(cancel);
+    lv_label_set_text(cl, "Cancel");
+    lv_obj_set_style_text_color(cl, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_text_font(cl, &lv_font_montserrat_16, 0);
+    lv_obj_center(cl);
+
+    lv_obj_t *save = lv_btn_create(g_tc_card);
+    lv_obj_set_size(save, 150, 46);
+    lv_obj_align(save, LV_ALIGN_BOTTOM_RIGHT, -20, -18);
+    lv_obj_set_style_radius(save, 23, 0);
+    lv_obj_set_style_bg_color(save, lv_color_hex(0x0A0A0A), 0);
+    lv_obj_set_style_border_color(save, lv_color_hex(0x00FF80), 0);
+    lv_obj_set_style_border_width(save, 1, 0);
+    lv_obj_add_event_cb(save,
+        [](lv_event_t *){
+            if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+            time_card_apply();
+        }, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *sl = lv_label_create(save);
+    lv_label_set_text(sl, "Save");
+    lv_obj_set_style_text_color(sl, lv_color_hex(0x00FF80), 0);
+    lv_obj_set_style_text_font(sl, &lv_font_montserrat_16, 0);
+    lv_obj_center(sl);
+
+    g_tc_open = true;
+    lastTouchMs = millis();
+    time_card_paint();
+    lv_timer_handler();
+}
+
+// ============================================================================
 //  Screen-off  --  smooth AMOLED brightness fade (v5.8)
 //  Using setBrightness instead of displayOff/displayOn because the CO5300
 //  sometimes comes back in a flaky state after a DISPOFF/DISPON cycle.
@@ -2877,7 +3642,10 @@ static void screen_on() {
     // pre-sleep frame brighten before the new one lands.
     lv_obj_invalidate(lv_scr_act());
     lv_timer_handler();
-    fade_brightness(DEFAULT_BRIGHTNESS, 200);
+    // v1.6: restore the user's level, capped by whatever context is active
+    // (night, low or critical battery) so a wake never flashes full brightness
+    // in the dark and then ramps back down.
+    fade_brightness(pm_wake_brightness(), 200);
     lastTouchMs = millis();
     lastWakeMs  = millis();                    // arm the 2 s post-wake grace
 }
@@ -2921,6 +3689,729 @@ static void deep_sleep_now() {
     // Only the BOOT button (GPIO0) is RTC-capable, so only it can wake us.
     esp_sleep_enable_ext1_wakeup((1ULL << 0), ESP_EXT1_WAKEUP_ANY_LOW);
     esp_deep_sleep_start();   // never returns
+}
+
+// ============================================================================
+//  v1.6 POWER MANAGER  --  state machine, brightness, CPU, battery policy,
+//                          profiles, night mode, diagnostics
+//  ----------------------------------------------------------------------------
+//  Everything here runs from loop() and is non-blocking except the existing
+//  fade helpers it reuses.  No new task, timer or polling loop is created.
+// ============================================================================
+
+static const char *pm_state_name(PmState s) {
+    switch (s) {
+        case PM_ACTIVE:     return "ACTIVE";
+        case PM_IDLE:       return "IDLE";
+        case PM_NIGHT:      return "NIGHT";
+        case PM_CHARGING:   return "CHARGING";
+        case PM_LOW_BATT:   return "LOW_BATT";
+        case PM_CRITICAL:   return "CRITICAL";
+        case PM_SCREEN_OFF: return "SCREEN_OFF";
+        default:            return "?";
+    }
+}
+
+static const PmProfileDef &pm_prof() {
+    if (g_pmProfileIdx >= PMP_COUNT) g_pmProfileIdx = PMP_BALANCED;
+    return kPmProfiles[g_pmProfileIdx];
+}
+static int pm_profile_index() { return (int)g_pmProfileIdx; }
+
+static int pm_timeout_index() {
+    int best = 1;                       // 15 s default
+    int bestDelta = 0x7FFFFFFF;
+    for (int i = 0; i < PM_TIMEOUT_CHOICES; i++) {
+        int d = abs((int)kPmTimeouts[i] - (int)g_pmTimeoutMs);
+        if (d < bestDelta) { bestDelta = d; best = i; }
+    }
+    return best;
+}
+
+static void pm_set_timeout_ms(uint16_t ms, bool persist) {
+    int best = 1;
+    int bestDelta = 0x7FFFFFFF;
+    for (int i = 0; i < PM_TIMEOUT_CHOICES; i++) {
+        int d = abs((int)kPmTimeouts[i] - (int)ms);
+        if (d < bestDelta) { bestDelta = d; best = i; }
+    }
+    g_pmTimeoutMs = kPmTimeouts[best];
+    if (persist) {
+        g_prefs.begin("pwr", false);
+        g_prefs.putUShort("toff", g_pmTimeoutMs);
+        g_prefs.end();
+    }
+}
+
+// ---- persistence -----------------------------------------------------------
+static void pm_save() {
+    g_prefs.begin("pwr", false);
+    g_prefs.putUChar("prof",    g_pmProfileIdx);
+    g_prefs.putBool("night",    g_pmNightManual);
+    g_prefs.putBool("nsched",   g_pmNightSched);
+    g_prefs.putUShort("toff",   g_pmTimeoutMs);
+    g_prefs.putBool("deep",     g_pmDeepOn);
+    g_prefs.end();
+}
+
+static void pm_load() {
+    g_prefs.begin("pwr", true);
+    int  prof  = (int)g_prefs.getUChar("prof", PMP_BALANCED);
+    bool night = g_prefs.getBool("night",  false);
+    bool sched = g_prefs.getBool("nsched", true);
+    bool deep  = g_prefs.getBool("deep",   true);
+    int  toff  = (int)g_prefs.getUShort("toff", 15000);
+    g_prefs.end();
+    if (prof < 0 || prof >= PMP_COUNT) prof = PMP_BALANCED;
+    g_pmProfileIdx  = (uint8_t)prof;
+    g_pmNightManual = night;
+    g_pmNightSched  = sched;
+    g_pmDeepOn      = deep;
+    pm_set_timeout_ms((uint16_t)toff, false);
+}
+
+// ---- night mode ------------------------------------------------------------
+// The RTC is read with a zero timeout: on a watch with no sync this returns
+// false immediately instead of blocking, and the schedule simply stays off.
+static bool pm_clock_hour(int *hour) {
+    if (!g_ntp_synced && !g_tp_valid) return false;   // no trustworthy wall clock
+    struct tm t;
+    if (!getLocalTime(&t, 0)) return false;
+    if (t.tm_hour < 0 || t.tm_hour > 23) return false;
+    *hour = t.tm_hour;
+    return true;
+}
+
+static bool pm_night_scheduled() {
+    if (!g_pmNightSched) return false;
+    int h = 0;
+    if (!pm_clock_hour(&h)) return false;
+    if (PM_NIGHT_START_HOUR <= PM_NIGHT_END_HOUR)          // same-day window
+        return (h >= PM_NIGHT_START_HOUR && h < PM_NIGHT_END_HOUR);
+    return (h >= PM_NIGHT_START_HOUR || h < PM_NIGHT_END_HOUR);   // wraps midnight
+}
+
+static bool pm_night_active() {
+    return g_pmNightManual || pm_night_scheduled();
+}
+
+// The level a wake fades up to.  Waking at night or on a flat pack must not
+// flash the full user level and then dim it again, so screen_on() asks for
+// this instead of g_brightness_target.  The user's own level is still the
+// ceiling -- a watch dimmed to 60 wakes at 60, never brighter.
+static uint8_t pm_wake_brightness() {
+    uint8_t t   = g_brightness_target;
+    uint8_t cap = 255;
+    if (g_pmBattLatch == 2)      cap = 20;
+    else if (g_pmBattLatch == 1) cap = pm_prof().low_bright;
+    else if (pm_night_active())  cap = pm_prof().night_bright;
+    return (t < cap) ? t : cap;
+}
+
+// ---- quiet face ------------------------------------------------------------
+// v1.8: a dim state draws the clock on black instead of the wallpaper.  On an
+// AMOLED every lit pixel is current, so at the same brightness a full-screen
+// photo costs several times what a few glyphs do -- and black pixels cost
+// nothing at all.  The user's wallpaper is untouched: this only decides
+// whether it is drawn, and refresh_wallpaper() owns that decision.
+//
+// Never runs while the panel is dark -- there is nothing to save on a black
+// screen, and toggling would force a repaint during the fade out.
+static void pm_face_quiet(bool quiet) {
+#if !PM_QUIET_FACE
+    quiet = false;                               // PM_QUIET_FACE 0 keeps the wallpaper
+#endif
+    if (quiet == g_pmQuietFace) return;
+    g_pmQuietFace = quiet;
+    if (!face_bg_img) return;                    // face not built yet
+    if (quiet) {
+        lv_obj_add_flag(face_bg_img, LV_OBJ_FLAG_HIDDEN);
+        if (face_bg_fill) lv_obj_add_flag(face_bg_fill, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    if (g_pmWpDirty) {                           // wallpaper changed while dim
+        g_pmWpDirty = false;
+        refresh_wallpaper();
+        return;
+    }
+    if (g_photo_count) {                         // reuse the loaded image
+        lv_obj_clear_flag(face_bg_img, LV_OBJ_FLAG_HIDDEN);
+        if (face_bg_fill) lv_obj_add_flag(face_bg_fill, LV_OBJ_FLAG_HIDDEN);
+    } else if (face_bg_fill) {
+        lv_obj_clear_flag(face_bg_fill, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void pm_face_policy() {
+    if (screenIsOff) return;
+    bool quiet = (g_pmState == PM_IDLE    || g_pmState == PM_NIGHT ||
+                  g_pmState == PM_LOW_BATT || g_pmState == PM_CRITICAL);
+    pm_face_quiet(quiet);
+}
+
+// ---- display ---------------------------------------------------------------
+static uint8_t pm_effective_brightness() {
+    uint8_t tgt = g_brightness_target;
+    uint8_t cap = 255;
+    switch (g_pmState) {
+        case PM_SCREEN_OFF: cap = 0;                              break;
+        case PM_CRITICAL:   cap = 20;                             break;
+        case PM_LOW_BATT:   cap = pm_prof().low_bright;           break;
+        case PM_NIGHT:      cap = pm_prof().night_bright;         break;
+        case PM_IDLE:       cap = pm_prof().idle_bright;          break;
+        default:            cap = 255;                            break;
+    }
+    return (tgt < cap) ? tgt : cap;
+}
+
+// Gradual, non-blocking ramp.  Dimming steps are larger than brightening ones
+// so the panel settles quickly when you stop touching it, but a wake still
+// reads as a fade rather than a flash.  Never touches g_brightness_target, so
+// the user's slider level survives every state change.
+static void pm_brightness_step(uint32_t now) {
+    if (screenIsOff) return;
+    uint8_t want = pm_effective_brightness();
+    if (g_cur_brightness == want) return;
+    if ((int32_t)(now - g_pmRampNext) < 0) return;
+    g_pmRampNext = now + PM_RAMP_INTERVAL_MS;
+
+    bool up  = (want > g_cur_brightness);
+    int  step = up ? 12 : 8;
+    int  v    = (int)g_cur_brightness + (up ? step : -step);
+    if (up  && v > (int)want) v = (int)want;
+    if (!up && v < (int)want) v = (int)want;
+    if (v < 0)   v = 0;
+    if (v > 255) v = 255;
+
+    static_cast<Arduino_CO5300 *>(gfx)->setBrightness((uint8_t)v);
+    g_cur_brightness = (uint8_t)v;
+}
+
+// ---- CPU -------------------------------------------------------------------
+static uint16_t pm_cpu_for_state() {
+    switch (g_pmState) {
+        case PM_SCREEN_OFF: return pm_prof().cpu_off_mhz;
+        case PM_IDLE:       return pm_prof().cpu_idle_mhz;
+        default:            return pm_prof().cpu_active_mhz;
+    }
+}
+
+// A running command may copy an app from the card into OTA (which already
+// sets 240 MHz itself) or hold a WiFi round-trip; changing the clock in the
+// middle of either is the one thing that can break them.
+static bool pm_cpu_busy(uint32_t now) {
+    if (screen_held(now)) return true;
+    if (g_wifi_scan_busy) return true;
+    if (g_pmMicBusy) return true;      // ESP-SR bring-up is running at 240
+    return false;
+}
+
+static void pm_apply_cpu(uint32_t now) {
+#if POWER_SAVE
+    if (pm_cpu_busy(now)) return;
+    uint16_t want = pm_cpu_for_state();
+    if (!want) return;
+    if (getCpuFrequencyMhz() == want) return;
+    setCpuFrequencyMhz(want);
+#endif
+}
+
+// Restores the clock for the CURRENT state.  Used where the old code hard-coded
+// CPU_FREQ_IDLE_MHZ on the way out of a temporary boost (PTT bring-up).
+static void pm_restore_cpu() {
+#if POWER_SAVE
+    uint16_t want = pm_cpu_for_state();
+    if (want && getCpuFrequencyMhz() != want) setCpuFrequencyMhz(want);
+#endif
+}
+
+// ---- notices ---------------------------------------------------------------
+static lv_obj_t *g_pmNotice = nullptr;
+static uint32_t  g_pmNoticeUntil = 0;
+
+static void pm_notice(const char *msg, uint32_t hold_ms) {
+    if (!g_pmNotice) {
+        g_pmNotice = lv_label_create(lv_layer_top());
+        lv_obj_set_style_bg_color(g_pmNotice, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(g_pmNotice, 220, 0);
+        lv_obj_set_style_radius(g_pmNotice, 14, 0);
+        lv_obj_set_style_pad_hor(g_pmNotice, 14, 0);
+        lv_obj_set_style_pad_ver(g_pmNotice, 8, 0);
+        lv_obj_set_style_border_color(g_pmNotice, lv_color_hex(theme_accent()), 0);
+        lv_obj_set_style_border_width(g_pmNotice, 1, 0);
+        lv_obj_set_style_text_color(g_pmNotice, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(g_pmNotice, &lv_font_montserrat_14, 0);
+        lv_obj_clear_flag(g_pmNotice, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_clear_flag(g_pmNotice, LV_OBJ_FLAG_CLICKABLE);
+    }
+    lv_label_set_text(g_pmNotice, msg);
+    lv_obj_clear_flag(g_pmNotice, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align(g_pmNotice, LV_ALIGN_BOTTOM_MID, 0, -44);
+    g_pmNoticeUntil = millis() + hold_ms;
+}
+
+static void pm_alert(const char *msg, bool wake) {
+    if (screenIsOff) {
+        if (!wake) {                // a dark panel is not worth lighting for a notice
+            USBSerial.printf("[pm] notice (screen off): %s\n", msg);
+            return;
+        }
+        screen_on();                // a threshold crossing is worth one wake
+    }
+    pm_notice(msg, PM_NOTICE_MS + 1200);
+}
+
+static void pm_notice_service(uint32_t now) {
+    if (!g_pmNotice || !g_pmNoticeUntil) return;
+    if ((int32_t)(now - g_pmNoticeUntil) < 0) return;
+    lv_obj_add_flag(g_pmNotice, LV_OBJ_FLAG_HIDDEN);
+    g_pmNoticeUntil = 0;
+}
+
+// ---- battery ---------------------------------------------------------------
+// Attribute the charge that left the pack since the last reading to the state
+// that was running during it.  Callers guarantee that only one state elapsed
+// (pm_note_battery() is invoked from pm_enter() before the new state is set),
+// so no proportional split is needed anywhere in here.
+static void pm_energy_note(uint32_t now) {
+    if (!g_has_pmu) return;
+    if (g_batt_pct < 0 || g_batt_pct > 100) return;
+
+    // While charging the pack is filling, so a delta is not drain.  Drop the
+    // baseline and start again from the next reading on battery.
+    if (g_charging) { g_pmEnLastPct = -1; return; }
+
+    int pct = (int)g_batt_pct;
+    if (g_pmEnLastPct < 0) {                       // first reading, or after a charge
+        g_pmEnLastPct = pct;
+        g_pmEnLastMs  = now;
+        return;
+    }
+
+    uint32_t dt   = (uint32_t)(now - g_pmEnLastMs);
+    int      dpct = g_pmEnLastPct - pct;           // positive == consumed
+
+    if (dpct < 0 || dpct > PM_ENERGY_MAX_DPCT) {   // nonsense reading: resync, don't smear
+        g_pmEnLastPct = pct;
+        g_pmEnLastMs  = now;
+        g_pmEnDropped++;
+        return;
+    }
+
+    // Under 1 % the PMIC cannot tell us anything: 1 % of a 400 mAh pack is
+    // 4 mAh, which is ~25 s of ACTIVE.  Short windows simply carry nothing and
+    // the charge shows up in the next one -- the total telescopes, so no energy
+    // is invented and none is lost.
+    if (dpct == 0 || dt < 1000UL) {
+        g_pmEnLastPct = pct;
+        g_pmEnLastMs  = now;
+        return;
+    }
+
+    float mah = (float)dpct * (float)BATT_CAPACITY_MAH / 100.0f;
+    if (g_pmState < PM_STATE_COUNT) {
+        g_pmEnMah[g_pmState]    += mah;
+        g_pmEnMeasMs[g_pmState] += dt;
+    }
+    g_pmEnTotalMah += mah;
+    g_pmEnSamples++;
+    g_pmEnLastPct = pct;
+    g_pmEnLastMs  = now;
+}
+
+static bool pm_batt_fresh(uint32_t now) {
+    if (!g_has_pmu || !g_pmBattSampleMs) return false;
+    return (now - g_pmBattSampleMs) < 60000UL;
+}
+
+static void pm_note_battery(uint32_t now) {
+    if (!g_has_pmu) return;
+    if (g_batt_pct < 0 || g_batt_pct > 100) return;    // keep the last valid stamp
+    g_pmBattSampleMs = now;
+    pm_energy_note(now);                               // v1.7: measured drain ledger
+}
+
+// Thresholds are latched with hysteresis so a pack that sags under AMOLED
+// load cannot flip the watch between LOW and normal every few seconds.
+static void pm_batt_policy(uint32_t now) {
+    static uint32_t lastSample = 0;
+    if (!pm_batt_fresh(now)) return;
+    if (g_pmBattSampleMs == lastSample) return;        // no new reading yet
+    lastSample = g_pmBattSampleMs;
+
+    if (g_charging) {
+        if (g_pmBattLatch) USBSerial.println("[pm] charging - battery limits cleared");
+        g_pmBattLatch  = 0;
+        g_pmOffStreak  = 0;
+        return;
+    }
+
+    int pct = g_batt_pct;
+    uint8_t before = g_pmBattLatch;
+    if (pct <= PM_BATT_CRIT_PCT) {
+        g_pmBattLatch = 2;
+    } else if (g_pmBattLatch == 2) {
+        if (pct > PM_BATT_CRIT_PCT + PM_BATT_HYST) g_pmBattLatch = 1;
+    } else if (pct <= PM_BATT_LOW_PCT) {
+        g_pmBattLatch = 1;
+    } else if (g_pmBattLatch == 1 && pct > PM_BATT_LOW_PCT + PM_BATT_HYST) {
+        g_pmBattLatch = 0;
+    }
+
+    if (g_pmBattLatch != before) {
+        char b[48];
+        if (g_pmBattLatch == 2) {
+            snprintf(b, sizeof(b), "Battery %d%% - charge now", pct);
+            pm_alert(b, true);          // 7 % is worth one wake
+        } else if (g_pmBattLatch == 1) {
+            snprintf(b, sizeof(b), "Battery %d%% - power saver", pct);
+            pm_alert(b, false);         // 20 % can wait for the next glance
+        } else if (!screenIsOff) {
+            pm_notice("Battery OK - limits cleared", PM_NOTICE_MS);
+        }
+    }
+
+    // Cell protection: two readings at or below PM_BATT_OFF_PCT, at least
+    // PM_BATT_OFF_SETTLE_MS apart.  Never repeats, never fights a charger.
+    if (pct <= PM_BATT_OFF_PCT) {
+        if (!g_pmOffStreak) {
+            g_pmOffStreak  = 1;
+            g_pmOffFirstMs = now;
+        } else if (g_pmOffStreak < 255) {
+            g_pmOffStreak++;
+        }
+        if (!g_pmOffDone && g_pmOffStreak >= PM_BATT_OFF_CONFIRMS &&
+            (uint32_t)(now - g_pmOffFirstMs) >= PM_BATT_OFF_SETTLE_MS &&
+            !screen_held(now)) {          // never cut an app copy in half
+            g_pmOffDone = true;
+            USBSerial.printf("[pm] %d%% confirmed twice - protecting the cell\n", pct);
+            pm_alert("Battery empty - sleeping", true);
+            time_save_now("battery critical");
+            delay(400);                        // let the notice paint
+            deep_sleep_now();                  // saves the clock again, then sleeps
+        }
+    } else {
+        g_pmOffStreak = 0;
+    }
+}
+
+// ---- states ----------------------------------------------------------------
+// The user's timeout is a ceiling, not a floor.  On a low pack the watch keeps
+// the panel lit for at most PM_LOW_HOLD_MS (8 s) and at critical for
+// PM_CRIT_HOLD_MS (5 s), whatever the Settings slider says -- a 60 s hold at
+// 7 % is how a watch dies mid-evening.  Charging clears the latch, so this
+// never fights a user who is plugged in.
+static uint32_t pm_hold_ms() {
+    uint32_t hold = g_pmTimeoutMs;
+    if (g_pmBattLatch == 2) {
+        if (hold > PM_CRIT_HOLD_MS) hold = PM_CRIT_HOLD_MS;
+    } else if (g_pmBattLatch == 1) {
+        if (hold > PM_LOW_HOLD_MS) hold = PM_LOW_HOLD_MS;
+    }
+    return hold;
+}
+
+// ---- auto deep sleep (v1.9) ------------------------------------------------
+// After the profile's dark-screen interval with no interaction, park the SoC:
+// deep sleep draws ~0.2 mA where light sleep still costs ~3 mA, so an idle
+// night drops from ~25 mAh to ~2 mAh.  Clock: deep_sleep_now() keeps the RTC
+// peripheral domain powered, so the wall clock keeps ticking and
+// getLocalTime() is already correct after the reboot (setup() also reconciles
+// the NVS snapshot against it).
+//
+// The cost of this state is that only BOOT wakes it -- TP_INT is GPIO38, which
+// is not an RTC pad, so ext1 cannot see the touch controller and no amount of
+// code here changes that.  Which is why the interval lives in the profile
+// table, is off in Performance, and has an off switch in Settings.
+static void pm_auto_deep(uint32_t now) {
+    if (!g_pmDeepOn) return;
+    uint32_t limit = pm_prof().deep_after_ms;
+    if (!limit) return;                        // this profile never auto-sleeps
+    if (!g_pmReady || !screenIsOff) return;    // a lit panel is not idle
+    if (g_charging) return;                    // pointless, and hides the charge
+    // On USB with the pack full the AXP2101 reports "not charging", so ask the
+    // PMIC directly: a docked watch must not reboot itself every ten minutes.
+    // One extra register read, only at the moment of the decision.
+    if (g_has_pmu && g_pmu.isVbusIn()) return;
+    if (pm_cpu_busy(now)) return;              // app copy, scan or mic bring-up
+    if (g_pmVoiceArmed) return;                // the wake word would die with us
+    if ((uint32_t)(now - lastTouchMs) < limit) return;
+
+    USBSerial.printf("[pm] idle %lu min on %s -> deep sleep (BOOT wakes)\n",
+                     (unsigned long)(limit / 60000UL), pm_prof().name);
+    deep_sleep_now();                          // saves the clock, never returns
+}
+
+static PmState pm_desired_state(uint32_t now) {
+    if (screenIsOff) return PM_SCREEN_OFF;
+
+    bool charging = (g_has_pmu && g_charging);
+    if (!charging && g_pmBattLatch == 2) return PM_CRITICAL;
+    if (!charging && g_pmBattLatch == 1) return PM_LOW_BATT;
+    // A command that holds the screen (voice phrase, app copy, update screen)
+    // gets readable brightness even at night or when dimmed; releasing the
+    // hold drops straight back into the profile.
+    if (screen_held(now))                return PM_ACTIVE;
+    if (pm_night_active())               return PM_NIGHT;
+    if (charging)                        return PM_CHARGING;
+    if ((uint32_t)(now - lastTouchMs) >= pm_idle_after_ms()) return PM_IDLE;
+    return PM_ACTIVE;
+}
+
+static uint32_t pm_idle_after_ms() {
+    uint32_t idle = pm_prof().idle_after_ms;
+    uint32_t hold = pm_hold_ms();
+    uint32_t cap  = (hold > 3000) ? hold - 3000 : 1500;
+    return (idle > cap) ? cap : idle;
+}
+
+static void pm_enter(PmState s, uint32_t now) {
+    if (s == g_pmState) return;
+
+    // Close the energy window here, while g_pmState still names the outgoing
+    // state.  One I2C read per transition is what lets every sample be
+    // attributed to a single mode instead of a blend of two.
+    if (g_has_pmu) {
+        pmu_refresh();
+        pm_note_battery(now);
+    }
+
+    PmState prev = g_pmState;
+    if (g_pmStateSince) g_pmStateMs[prev] += (uint32_t)(now - g_pmStateSince);
+    g_pmState      = s;
+    g_pmStateSince = now;
+    g_pmTransitions++;
+    pm_apply_cpu(now);
+    pm_face_policy();               // wallpaper only in the bright states
+
+    // One line per transition, at most one per second, so an idle dim / wake
+    // pair cannot flood the monitor at 80 MHz.
+    static uint32_t lastPrint = 0;
+    if ((uint32_t)(now - lastPrint) >= 1000) {
+        lastPrint = now;
+        USBSerial.printf("[pm] %s -> %s  cpu=%u MHz  bright=%u  batt=%d%%%s\n",
+                         pm_state_name(prev), pm_state_name(s),
+                         (unsigned)getCpuFrequencyMhz(),
+                         (unsigned)pm_effective_brightness(),
+                         (g_has_pmu ? g_batt_pct : -1),
+                         (g_has_pmu && g_charging) ? " chg" : "");
+    }
+}
+
+static void pm_service(uint32_t now) {
+    if (!g_pmReady) return;
+
+    // Same two keep-alive signals the pre-PM loop used: a finger on the panel,
+    // the post-wake grace, and a command holding the screen.  Nothing else is
+    // allowed to count as activity.
+    bool in_wake_grace = (uint32_t)(now - lastWakeMs) < WAKE_GRACE_MS;
+    if (touchActive || in_wake_grace || screen_held(now)) lastTouchMs = now;
+
+    if (screenIsOff && digitalRead(TP_INT) == LOW) {
+        lastTouchMs = now;
+        screen_on();                    // stamps lastWakeMs -> grace window
+    }
+
+    pm_batt_policy(now);
+
+    if (!screenIsOff && (uint32_t)(now - lastTouchMs) >= pm_hold_ms()) {
+        screen_off();                   // fades, clears the touch IRQ latch
+        pm_enter(PM_SCREEN_OFF, now);
+    } else {
+        PmState want = pm_desired_state(now);
+        if (want != g_pmState) pm_enter(want, now);
+    }
+
+    pm_brightness_step(now);
+    pm_notice_service(now);
+    pm_log(now);
+    pm_auto_deep(now);              // last: everything above may have woken us
+}
+
+static void pm_activity(const char *why) {
+    lastTouchMs = millis();
+    USBSerial.printf("[pm] activity: %s\n", why ? why : "?");
+}
+
+static bool pm_wifi_allowed() {
+    if (!g_wifi_toggle) return false;
+    if (screenIsOff)    return false;
+    if (!pm_prof().wifi_ok) return false;
+    if (g_pmBattLatch >= 1 && !g_charging) return false;    // radio is optional
+    if (screen_held(millis())) return false;
+    return true;
+}
+
+// ---- diagnostics -----------------------------------------------------------
+static uint32_t pm_dwell_ms(PmState s, uint32_t now) {
+    uint32_t t = g_pmStateMs[s];
+    if (s == g_pmState && g_pmStateSince) t += (uint32_t)(now - g_pmStateSince);
+    return t;
+}
+
+// Measured mA for a state, or -1 when no window has landed in it yet.
+static float pm_energy_ma(PmState s) {
+    if (s >= PM_STATE_COUNT) return -1.0f;
+    if (g_pmEnMeasMs[s] < 1000UL) return -1.0f;
+    return g_pmEnMah[s] * 3600000.0f / (float)g_pmEnMeasMs[s];
+}
+
+// The per-mode table, from the pack itself.  One row per state that has been
+// entered, plus the share of everything measured so far.
+static void pm_energy_dump() {
+    if (!g_has_pmu) {
+        USBSerial.println("[pm] energy: no PMU on this board - nothing to measure");
+        return;
+    }
+    if (!g_pmEnSamples) {
+        USBSerial.println("[pm] energy: no drain measured yet (needs one full % step)");
+        return;
+    }
+
+    float sum = 0.0f;
+    for (int i = 0; i < PM_STATE_COUNT; i++) sum += g_pmEnMah[i];
+
+    USBSerial.printf("[pm] energy: %lu windows, %.1f mAh measured, capacity %u mAh\n",
+                     (unsigned long)g_pmEnSamples, sum, (unsigned)BATT_CAPACITY_MAH);
+
+    uint32_t now = millis();
+    for (int i = 0; i < PM_STATE_COUNT; i++) {
+        uint32_t dwell = pm_dwell_ms((PmState)i, now);
+        if (!dwell && !g_pmEnMah[i]) continue;
+        float ma    = pm_energy_ma((PmState)i);
+        float share = (sum > 0.0f) ? g_pmEnMah[i] * 100.0f / sum : 0.0f;
+        if (ma < 0.0f) {
+            USBSerial.printf("[pm]   %-11s %6.2fh %8.1fmAh      - %4.0f%%\n",
+                             pm_state_name((PmState)i),
+                             (float)dwell / 3600000.0f, g_pmEnMah[i], share);
+        } else {
+            USBSerial.printf("[pm]   %-11s %6.2fh %8.1fmAh %5.0fmA %4.0f%%\n",
+                             pm_state_name((PmState)i),
+                             (float)dwell / 3600000.0f, g_pmEnMah[i], ma, share);
+        }
+    }
+    if (g_pmEnDropped) {
+        USBSerial.printf("[pm]   %lu readings discarded as invalid\n",
+                         (unsigned long)g_pmEnDropped);
+    }
+}
+
+static void pm_log(uint32_t now) {
+    if (!g_pmLogNext) { g_pmLogNext = now + PM_LOG_INTERVAL_MS; return; }
+    if ((int32_t)(now - g_pmLogNext) < 0) return;
+    g_pmLogNext = now + PM_LOG_INTERVAL_MS;
+
+    uint32_t up = now - g_pmBootMs;
+    USBSerial.printf("[pm] %s  batt=%d%% %dmV%s  cpu=%u MHz  bright=%u/%u  "
+                     "awake=%lus off=%lus  xitions=%lu  heap=%uK\n",
+                     pm_state_name(g_pmState),
+                     g_has_pmu ? g_batt_pct : -1, g_batt_mv,
+                     (g_has_pmu && g_charging) ? " chg" : "",
+                     (unsigned)getCpuFrequencyMhz(),
+                     (unsigned)g_cur_brightness, (unsigned)g_brightness_target,
+                     (unsigned long)(pm_dwell_ms(PM_ACTIVE, now) / 1000UL),
+                     (unsigned long)(pm_dwell_ms(PM_SCREEN_OFF, now) / 1000UL),
+                     (unsigned long)g_pmTransitions,
+                     (unsigned)(ESP.getFreeHeap() / 1024));
+    if (up > 60000UL && g_has_pmu && g_batt_pct >= 0 && g_pmPctAtBoot) {
+        int drop = (int)g_pmPctAtBoot - g_batt_pct;
+        if (drop > 0) {
+            USBSerial.printf("[pm] %d%% used in %lu min  (~%.2f %%/h)\n",
+                             drop, (unsigned long)(up / 60000UL),
+                             (float)drop * 3600000.0f / (float)up);
+        }
+    }
+
+    // v1.7: the measured per-mode table, every 30 min.
+    if (!g_pmEnDumpNext) {
+        g_pmEnDumpNext = now + PM_ENERGY_DUMP_MS;
+    } else if ((int32_t)(now - g_pmEnDumpNext) >= 0) {
+        g_pmEnDumpNext = now + PM_ENERGY_DUMP_MS;
+        pm_energy_dump();
+    }
+}
+
+// ---- startup ---------------------------------------------------------------
+static void pm_init() {
+    g_pmBootMs      = millis();
+    g_pmState       = PM_ACTIVE;
+    g_pmStateSince  = g_pmBootMs;
+    g_pmTransitions = 0;
+    for (int i = 0; i < PM_STATE_COUNT; i++) {
+        g_pmStateMs[i]  = 0;
+        g_pmEnMah[i]    = 0.0f;
+        g_pmEnMeasMs[i] = 0;
+    }
+    g_pmEnTotalMah = 0.0f;
+    g_pmEnLastPct  = -1;
+    g_pmEnLastMs   = 0;
+    g_pmEnSamples  = 0;
+    g_pmEnDropped  = 0;
+    g_pmEnDumpNext = 0;
+    g_pmPctAtBoot  = (g_has_pmu && g_batt_pct >= 0) ? (uint8_t)g_batt_pct : 0;
+    g_pmBattLatch  = 0;
+    g_pmOffStreak  = 0;
+    g_pmOffDone    = false;
+    g_pmNoticeUntil = 0;
+    if (g_has_pmu) pm_note_battery(g_pmBootMs);
+    g_pmReady = true;
+
+    pm_apply_cpu(g_pmBootMs);
+    USBSerial.printf("[pm] profile %s | timeout %us | idle dim %ums | night %s%s\n",
+                     pm_prof().name, (unsigned)(g_pmTimeoutMs / 1000),
+                     (unsigned)pm_idle_after_ms(),
+                     g_pmNightManual ? "manual" : "off",
+                     (g_pmNightSched && !g_pmNightManual) ? " + schedule" : "");
+    USBSerial.printf("[pm] cpu %u MHz  brightness %u/%u  batt %d%%%s\n",
+                     (unsigned)getCpuFrequencyMhz(),
+                     (unsigned)g_cur_brightness, (unsigned)g_brightness_target,
+                     g_has_pmu ? g_batt_pct : -1,
+                     (g_has_pmu && g_charging) ? " (charging)" : "");
+    uint32_t dpark = g_pmDeepOn ? pm_prof().deep_after_ms : 0;
+    if (dpark)
+        USBSerial.printf("[pm] auto deep sleep after %lu min dark (BOOT wakes)\n",
+                         (unsigned long)(dpark / 60000UL));
+}
+
+// ---- Settings rows ---------------------------------------------------------
+static void cards_on_power_profile_cb(lv_event_t *e) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    int sel = lv_dropdown_get_selected(lv_event_get_target(e));
+    if (sel < 0 || sel >= PMP_COUNT) return;
+    if (sel == (int)g_pmProfileIdx) return;
+    g_pmProfileIdx = (uint8_t)sel;
+    pm_save();
+    USBSerial.printf("[pm] profile -> %s\n", kPmProfiles[sel].name);
+    pm_apply_cpu(millis());                 // idle clock may change with the profile
+}
+
+static void cards_on_timeout_cb(lv_event_t *e) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    int sel = lv_dropdown_get_selected(lv_event_get_target(e));
+    if (sel < 0 || sel >= PM_TIMEOUT_CHOICES) return;
+    pm_set_timeout_ms(kPmTimeouts[sel], true);
+    USBSerial.printf("[pm] screen timeout -> %us\n", (unsigned)(g_pmTimeoutMs / 1000));
+}
+
+static void cards_on_night_cb(lv_event_t *e) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    g_pmNightManual = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    pm_save();
+    USBSerial.printf("[pm] night mode %s\n", g_pmNightManual ? "on" : "off");
+}
+
+static void cards_on_night_sched_cb(lv_event_t *e) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    g_pmNightSched = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    pm_save();
+    USBSerial.printf("[pm] night schedule %s\n", g_pmNightSched ? "on" : "off");
+}
+
+static void cards_on_deep_cb(lv_event_t *e) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    g_pmDeepOn = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    pm_save();
+    USBSerial.printf("[pm] auto deep sleep %s\n", g_pmDeepOn ? "on" : "off");
 }
 
 // ============================================================================
@@ -3377,7 +4868,12 @@ static void show_developer_info() {
     lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 60);
 
-    char buf[384];
+    // v1.7: opening this screen is the on-demand trigger for the measured
+    // per-mode drain table, so it can be pulled without waiting for the
+    // 30-minute summary.
+    pm_energy_dump();
+
+    char buf[640];
     snprintf(buf, sizeof(buf),
         "Firmware:  LauncherOS v7.0\n"
         "Theme:     %s (#%d)\n"
@@ -3388,7 +4884,10 @@ static void show_developer_info() {
         "Apps found:      %d\n"
         "Wallpapers:      %d\n"
         "Favourites:      %d\n"
-        "Categories file: %s",
+        "Categories file: %s\n\n"
+        "Power:     %s (%s)\n"
+        "Awake %lum  idle %lum  dark %lum\n"
+        "Batt: %d%%  %dmV%s",
         theme_name_at(g_theme_idx), g_theme_idx,
         g_launcher_style == LS_PILL      ? "Pill list" :
         g_launcher_style == LS_COVERFLOW ? "3D CoverFlow" : "Grid",
@@ -3396,7 +4895,13 @@ static void show_developer_info() {
         (unsigned)(ESP.getFreePsram() / 1024),
         (unsigned)getCpuFrequencyMhz(),
         g_app_count, g_photo_count, g_fav_count,
-        g_cat_file_present ? "yes" : "no");
+        g_cat_file_present ? "yes" : "no",
+        pm_state_name(g_pmState), pm_prof().name,
+        (unsigned long)(pm_dwell_ms(PM_ACTIVE, millis()) / 60000UL),
+        (unsigned long)(pm_dwell_ms(PM_IDLE,   millis()) / 60000UL),
+        (unsigned long)(pm_dwell_ms(PM_SCREEN_OFF, millis()) / 60000UL),
+        g_has_pmu ? g_batt_pct : -1, g_batt_mv,
+        (g_has_pmu && g_charging) ? " charging" : "");
     lv_obj_t *info = lv_label_create(g_dev_screen);
     lv_label_set_text(info, buf);
     lv_obj_set_style_text_color(info, lv_color_hex(0xBBBBBB), 0);
@@ -3492,7 +4997,11 @@ static void cards_on_brightness_cb(lv_event_t *e) {
     if (v < 20)  v = 20;
     if (v > 255) v = 255;
     static_cast<Arduino_CO5300 *>(gfx)->setBrightness((uint8_t)v);
-    g_cur_brightness = (uint8_t)v;
+    g_cur_brightness    = (uint8_t)v;
+    g_brightness_target = (uint8_t)v;
+    g_prefs.begin("dcw", false);
+    g_prefs.putInt("bright", v);
+    g_prefs.end();
 }
 static void cards_on_theme_cb(lv_event_t *e) {
     if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
@@ -3765,7 +5274,14 @@ enum XIntent {
   XI_OPEN_PUZZLES, XI_OPEN_KNOWLEDGE, XI_GIVE_PUZZLE, XI_TEACH,
   XI_WIFI_ON, XI_WIFI_OFF, XI_BLE_ON, XI_BLE_OFF,
   XI_GPS_ON, XI_GPS_OFF, XI_BEACON_ON, XI_BEACON_OFF,
-  XI_SHOW_BATTERY, XI_SHOW_STATUS
+  XI_SHOW_BATTERY, XI_SHOW_STATUS,
+  // v1.1 -- clock / display / system intents (phrase table below)
+  XI_SYNC_TIME, XI_SYNC_DATE, XI_TIME_STATUS, XI_GET_TIME, XI_GET_DATE, XI_GET_DAY,
+  XI_OPEN_CLOCK_SETTINGS, XI_TIME_12H, XI_TIME_24H,
+  XI_BRIGHT_UP, XI_BRIGHT_DOWN, XI_BRIGHT_MAX, XI_BRIGHT_MIN, XI_BRIGHT_50,
+  XI_RESTART, XI_SHUTDOWN,
+  XI_GET_MEMORY, XI_GET_FREE_RAM, XI_GET_FLASH_STORAGE, XI_GET_SD_STATUS,
+  XI_GET_FREE_STORAGE, XI_GET_SYSTEM_STATUS
 };
 struct XTmpl { const char *label; const char *keys; int intent; };
 static const XTmpl kTmpl[] = {
@@ -3787,6 +5303,225 @@ static const XTmpl kTmpl[] = {
   { "Return home",        "home clock exit return face watch",   XI_HOME_EXIT },
 };
 #define X_NTMPL ((int)(sizeof(kTmpl)/sizeof(kTmpl[0])))
+
+// ============================================================================
+//  v1.1  PHRASE TABLE  --  the fixed spoken commands
+//  ----------------------------------------------------------------------------
+//  Every entry is matched against the utterance AFTER it has been lower-cased
+//  and reduced to alphanumeric words.  Matching is on the WORD SEQUENCE, with
+//  filler ("xander", "please", "the", "now", ...) ignored, so the same table
+//  serves the on-screen keyboard today and a speech recogniser later without a
+//  rewrite.  Longer phrases win, which is what separates "sync time" from
+//  "check time status".
+//
+//  Keep entries in the shape a recogniser returns them: plain words, no
+//  punctuation, no case tricks, no hyphenated "Wi-Fi" (the normaliser folds
+//  "wi fi" -> "wifi" and "blue tooth" -> "bluetooth" before matching).
+// ============================================================================
+struct XPhrase { const char *words; uint8_t intent; };
+static const XPhrase kPhrase[] = {
+    // ---- clock -----------------------------------------------------------
+    { "sync time",                       XI_SYNC_TIME },
+    { "sync clock",                      XI_SYNC_TIME },
+    { "update the time",                 XI_SYNC_TIME },
+    { "update time",                     XI_SYNC_TIME },
+    { "sync date",                       XI_SYNC_DATE },
+    { "check time status",               XI_TIME_STATUS },
+    { "time status",                     XI_TIME_STATUS },
+    { "what time is it",                 XI_GET_TIME },
+    { "what is the time",                XI_GET_TIME },
+    { "what s the time",                 XI_GET_TIME },
+    { "whats the time",                  XI_GET_TIME },
+    { "what time",                       XI_GET_TIME },
+    { "what s today s date",             XI_GET_DATE },
+    { "whats today s date",              XI_GET_DATE },
+    { "what is today s date",            XI_GET_DATE },
+    { "what is the date",                XI_GET_DATE },
+    { "what s the date",                 XI_GET_DATE },
+    { "whats the date",                  XI_GET_DATE },
+    { "what day is it",                  XI_GET_DAY },
+    { "what s the day",                  XI_GET_DAY },
+    { "whats the day",                   XI_GET_DAY },
+    // bare one-word asks (safe: "sync time" leaves "sync" over, not filler)
+    { "time",                            XI_GET_TIME },
+    { "date",                            XI_GET_DATE },
+    { "day",                             XI_GET_DAY },
+    { "open clock settings",             XI_OPEN_CLOCK_SETTINGS },
+    { "clock settings",                  XI_OPEN_CLOCK_SETTINGS },
+    { "use twelve hour time",            XI_TIME_12H },
+    { "twelve hour time",                XI_TIME_12H },
+    { "12 hour time",                    XI_TIME_12H },
+    { "use twenty four hour time",       XI_TIME_24H },
+    { "twenty four hour time",           XI_TIME_24H },
+    { "24 hour time",                    XI_TIME_24H },
+    // ---- display ----------------------------------------------------------
+    { "brightness up",                   XI_BRIGHT_UP },
+    { "brighter",                        XI_BRIGHT_UP },
+    { "brightness down",                 XI_BRIGHT_DOWN },
+    { "dimmer",                          XI_BRIGHT_DOWN },
+    { "maximum brightness",              XI_BRIGHT_MAX },
+    { "max brightness",                  XI_BRIGHT_MAX },
+    { "minimum brightness",              XI_BRIGHT_MIN },
+    { "min brightness",                  XI_BRIGHT_MIN },
+    { "set brightness to fifty percent", XI_BRIGHT_50 },
+    { "brightness fifty percent",        XI_BRIGHT_50 },
+    // ---- radios ------------------------------------------------------------
+    { "turn wifi on",                    XI_WIFI_ON },
+    { "wifi on",                         XI_WIFI_ON },
+    { "enable wifi",                     XI_WIFI_ON },
+    { "turn wifi off",                   XI_WIFI_OFF },
+    { "wifi off",                        XI_WIFI_OFF },
+    { "disable wifi",                    XI_WIFI_OFF },
+    { "turn bluetooth on",               XI_BLE_ON },
+    { "bluetooth on",                    XI_BLE_ON },
+    { "enable bluetooth",                XI_BLE_ON },
+    { "turn bluetooth off",              XI_BLE_OFF },
+    { "bluetooth off",                   XI_BLE_OFF },
+    { "disable bluetooth",               XI_BLE_OFF },
+    // ---- power / system ----------------------------------------------------
+    { "restart the watch",               XI_RESTART },
+    { "restart watch",                   XI_RESTART },
+    { "reboot the watch",                XI_RESTART },
+    { "shut down the watch",             XI_SHUTDOWN },
+    { "shutdown the watch",              XI_SHUTDOWN },
+    { "power off the watch",             XI_SHUTDOWN },
+    { "battery status",                  XI_SHOW_BATTERY },
+    { "how much battery is left",        XI_SHOW_BATTERY },
+    { "battery left",                    XI_SHOW_BATTERY },
+    { "show memory usage",               XI_GET_MEMORY },
+    { "memory usage",                    XI_GET_MEMORY },
+    { "how much ram is free",            XI_GET_FREE_RAM },
+    { "free ram",                        XI_GET_FREE_RAM },
+    { "show flash storage",              XI_GET_FLASH_STORAGE },
+    { "flash storage",                   XI_GET_FLASH_STORAGE },
+    { "show sd card status",             XI_GET_SD_STATUS },
+    { "sd card status",                  XI_GET_SD_STATUS },
+    { "how much storage is left",        XI_GET_FREE_STORAGE },
+    { "free storage",                    XI_GET_FREE_STORAGE },
+    { "system status",                   XI_GET_SYSTEM_STATUS },
+};
+#define X_NPHASE ((int)(sizeof(kPhrase)/sizeof(kPhrase[0])))
+
+// ---- tall on-screen command chips (short labels, same intents) -------------
+struct XChip { const char *label; uint8_t intent; };
+static const XChip kChips[] = {
+    { "What time is it?", XI_GET_TIME },
+    { "Sync time",        XI_SYNC_TIME },
+    { "Brightness up",    XI_BRIGHT_UP },
+    { "Brightness down",  XI_BRIGHT_DOWN },
+    { "System status",    XI_GET_SYSTEM_STATUS },
+    { "Shut down",        XI_SHUTDOWN },
+};
+#define X_NCHIP ((int)(sizeof(kChips)/sizeof(kChips[0])))
+
+// ============================================================================
+//  v1.1  OS LAUNCHER  --  spoken name OR mood -> the .bin the card holds
+//  ----------------------------------------------------------------------------
+//  Keys are lower-case with NO spaces: the matcher joins the spoken tokens
+//  ("astro" + "os" -> "astroos", "it's go time" -> "itsgotime") before looking
+//  one up, which is also what an ASR result looks like.  Multi-word entries are
+//  the natural-language handles (mood, intent) for the same app; a key of 6+
+//  characters stands on its own, while short keys like "music" still need a
+//  launch verb or an otherwise-empty sentence so "music status" cannot yank
+//  you into SpotifyOS.
+//
+//  The .bin name is resolved against g_apps (scanned from /WATCH/bin at boot),
+//  NOT hard-coded, so a missing app gets an honest "not on the card" answer
+//  instead of a dead tap or a bad flash.
+// ============================================================================
+struct XOsAlias { const char *say; const char *bin; };
+static const XOsAlias kOs[] = {
+    // ---- by name ---------------------------------------------------------
+    { "astroos",    "AstroOS"    },
+    { "spotifyos",  "SpotifyOS"  },
+    { "tkdos",      "TKDOS"      },
+    { "sportos",    "SportOS"    },
+    { "gameos",     "GameOS"     },
+    { "exploreros", "ExplorerOS" },
+    { "tacticalos", "TacticalOS" },
+    { "bookos",     "BookOS"     },
+    { "waypointos", "WaypointOS" },
+    { "duallink",   "Dual_Link"  },
+    // ---- short names (people drop the "OS" when talking) -----------------
+    { "astro",      "AstroOS"    },
+    { "spotify",    "SpotifyOS"  },
+    { "tkd",        "TKDOS"      },
+    { "sport",      "SportOS"    },
+    { "game",       "GameOS"     },
+    { "explorer",   "ExplorerOS" },
+    { "tactical",   "TacticalOS" },
+    { "book",       "BookOS"     },
+    { "waypoint",   "WaypointOS" },
+    { "dual",       "Dual_Link"  },
+    // ---- moods and intents (the fun part) --------------------------------
+    { "itsgotime",          "SportOS"    },   // "it's go time"
+    { "gymtime",            "SportOS"    },
+    { "workouttime",        "SportOS"    },
+    { "letstrain",          "SportOS"    },
+    { "letssweat",          "SportOS"    },
+    { "workout",            "SportOS"    },
+    { "exercise",           "SportOS"    },
+    { "imbored",            "GameOS"     },   // "I'm bored"
+    { "iwanttoplay",        "GameOS"     },
+    { "playagame",          "GameOS"     },
+    { "gametime",           "GameOS"     },
+    { "havesomefun",        "GameOS"     },
+    { "killtime",           "GameOS"     },
+    { "bored",              "GameOS"     },
+    { "bootsometunes",      "SpotifyOS"  },   // "boot some tunes"
+    { "bootuptunes",        "SpotifyOS"  },
+    { "playmusic",          "SpotifyOS"  },
+    { "listentomusic",      "SpotifyOS"  },   // "listen to music"
+    { "spotifytime",        "SpotifyOS"  },
+    { "tunein",             "SpotifyOS"  },
+    { "tunes",              "SpotifyOS"  },
+    { "tune",               "SpotifyOS"  },
+    { "songs",              "SpotifyOS"  },
+    { "song",               "SpotifyOS"  },
+    { "music",              "SpotifyOS"  },
+    { "takemetothestars",   "AstroOS"    },
+    { "stargazing",         "AstroOS"    },
+    { "spacestuff",         "AstroOS"    },
+    { "astronomytime",      "AstroOS"    },
+    { "lookatthesky",       "AstroOS"    },
+    { "stars",              "AstroOS"    },
+    { "dosometkd",          "TKDOS"      },
+    { "taekwondo",          "TKDOS"      },
+    { "tkdtraining",        "TKDOS"      },
+    { "practicemartialarts","TKDOS"      },
+    { "martialarts",        "TKDOS"      },
+    { "letsexplore",        "ExplorerOS" },
+    { "goexploring",        "ExplorerOS" },
+    { "adventuretime",      "ExplorerOS" },
+    { "takeawalk",          "ExplorerOS" },
+    { "getoutside",         "ExplorerOS" },
+    { "explore",            "ExplorerOS" },
+    { "hike",               "ExplorerOS" },
+    { "fieldmode",          "TacticalOS" },
+    { "tacticalmode",       "TacticalOS" },
+    { "godark",             "TacticalOS" },
+    { "missiontime",        "TacticalOS" },
+    { "whatstheplan",       "TacticalOS" },
+    { "lockitin",           "TacticalOS" },
+    { "iwanttoread",        "BookOS"     },
+    { "readabook",          "BookOS"     },
+    { "readingtime",        "BookOS"     },
+    { "booktime",           "BookOS"     },
+    { "readmeastory",       "BookOS"     },
+    { "read",               "BookOS"     },
+    { "whereami",           "WaypointOS" },   // "where am I"
+    { "markthisspot",       "WaypointOS" },
+    { "setawaypoint",       "WaypointOS" },
+    { "ineeddirections",    "WaypointOS" },
+    { "howdoigetthere",     "WaypointOS" },
+    { "navigate",           "WaypointOS" },
+    { "linkup",             "Dual_Link"  },
+    { "pairwithmyphone",    "Dual_Link"  },
+    { "connecttomyphone",   "Dual_Link"  },
+    { "syncwithmyphone",    "Dual_Link"  },
+    { "connectmyphone",     "Dual_Link"  },
+};
+#define X_NOS ((int)(sizeof(kOs)/sizeof(kOs[0])))
 
 // ---- state -----------------------------------------------------------------
 static bool       g_xander_active = false;
@@ -3812,6 +5547,11 @@ static Preferences g_xprefs;
 static bool       g_x_loaded = false;
 static long       g_xs_solved=0, g_xs_correct=0, g_xs_hints=0, g_xs_streak=0, g_xs_best=0, g_xs_hard=0;
 static bool       g_x_voice=false, g_x_alwayson=false;
+// v1.6: BOOT-to-talk is a setting, not a given.  Off means the physical button
+// is left alone entirely -- no mic, no window, no overlay -- for anyone who
+// bumps that corner of the watch (it sits right where a thumb rests) or who
+// would rather the only way in is the always-on wake word.
+static bool       g_x_bootmic=true;
 static int        g_x_battlim=1;
 
 // ---- module forward declarations -------------------------------------------
@@ -3837,6 +5577,15 @@ static void xander_rebuild_launcher_screens();
 //      "only the XANDER title paints, then the whole UI freezes" bug).
 enum XAction { XA_NONE = 0, XA_ENTER, XA_RENDER, XA_EXIT };
 static volatile XAction g_x_action = XA_NONE;
+// v1.1: OPEN_CLOCK_SETTINGS leaves Xander and lands on the Settings screen
+// instead of the clock face.  Handled in the deferred worker, never inline.
+static bool              g_x_goto_settings = false;
+// v1.1: an NTP round-trip blocks for up to ~10 s.  Commands only ARM it here
+// (g_x_sync_at = deadline); xander_service() runs it from loop() one paint
+// later, so "Syncing..." is actually on screen first and we never call into
+// LVGL recursively from an event callback.
+static uint32_t          g_x_sync_at = 0;
+static bool              g_x_sync_date = false;
 static uint32_t          g_x_free_at = 0;        // delayed 2nd free pass (0 = idle)
 
 // ---- persistence -----------------------------------------------------------
@@ -3851,6 +5600,7 @@ static void x_stats_load() {
     g_xs_hard    = g_xprefs.getLong("hard", 0);
     g_x_voice    = g_xprefs.getBool("voice", false);
     g_x_alwayson = g_xprefs.getBool("aon", false);
+    g_x_bootmic  = g_xprefs.getBool("bootmic", true);   // default: on
     g_x_battlim  = g_xprefs.getInt("blim", 1);
     g_xprefs.end();
     g_x_loaded = true;
@@ -3869,6 +5619,7 @@ static void x_settings_save() {
     g_xprefs.begin("xander", false);
     g_xprefs.putBool("voice", g_x_voice);
     g_xprefs.putBool("aon", g_x_alwayson);
+    g_xprefs.putBool("bootmic", g_x_bootmic);
     g_xprefs.putInt("blim", g_x_battlim);
     g_xprefs.end();
 }
@@ -3909,6 +5660,124 @@ static bool x_is_stop(const String &w) {
     static const char *S[] = { "launch","open","start","run","go","to","the",
                                "mode","os","me","my","please","xander","a","an","show","get" };
     for (unsigned i = 0; i < sizeof(S)/sizeof(S[0]); i++) if (w == S[i]) return true;
+    return false;
+}
+
+// ---- v1.1 phrase/alias matcher helpers -------------------------------------
+// Words a speaker (or a recogniser) sprinkles around a command.  They are
+// ignored when deciding whether the utterance was ONLY "sync time" etc.
+static bool x_is_filler(const String &w) {
+    static const char *F[] = { "xander","hey","ok","okay","please","now","for",
+                               "me","the","a","an","to","just","can","you","i",
+                               "want","and","my","is","it","what","whats","s",
+                               // v1.1 moods: "i am bored", "do some tkd",
+                               // "put on some music", "tune in"
+                               "am","some","on","up","in","do" };
+    for (unsigned i = 0; i < sizeof(F)/sizeof(F[0]); i++) if (w == F[i]) return true;
+    return false;
+}
+// Token equality with a forgiving prefix rule, so "todays"/"today" and
+// "astro"/"astroos" still line up without opening the door to 2-letter noise.
+static bool x_tok_eq(const String &a, const String &b) {
+    if (a == b) return true;
+    int m = a.length() < b.length() ? a.length() : b.length();
+    if (m < 4) return false;
+    return a.substring(0, m) == b.substring(0, m);
+}
+// Lower-case, alphanumeric-only tokeniser with the word splits a recogniser
+// loves to produce folded back into one token.
+static int x_norm_tokens(const String &in, String *out, int maxn) {
+    String s;
+    s.reserve(in.length() + 8);
+    for (size_t i = 0; i < in.length(); i++) {
+        char c = (char)tolower((unsigned char)in[i]);
+        bool alnum = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+        s += alnum ? c : ' ';
+    }
+    // Pad so the phrase rewrites below can require word boundaries.  The
+    // apostrophe folds are what let "I'm bored" and "It's go time" reach the
+    // single-token mood keys -- but "what's" is NOT folded, because the clock
+    // phrases are written "what s ..." and must keep matching.
+    s = " " + s + " ";
+    s.replace(" i m ",        " im ");
+    s.replace(" it s ",       " its ");
+    s.replace(" let s ",      " lets ");
+    s.replace(" wi fi ",      " wifi ");
+    s.replace(" blue tooth ", " bluetooth ");
+    s.replace(" dual link ",  " duallink ");
+    return x_tokenize(s, out, maxn);
+}
+// Longest full phrase present in the utterance, IN ORDER, skipping filler
+// words between its own words -- that is what makes "hey xander, sync the
+// time please" hit "sync time" without needing an entry for every polite
+// insertion.  Words outside the match must be filler too, otherwise a stray
+// "time" phrase could be stolen by an unrelated command.
+static bool x_phrase_match(const String *t, int n, int &outIntent) {
+    int bestLen = 0;
+    outIntent = -1;
+    String pt[8];
+    for (int p = 0; p < X_NPHASE; p++) {
+        int pn = x_tokenize(String(kPhrase[p].words), pt, 8);
+        if (pn == 0 || pn > n) continue;
+        for (int start = 0; start < n; start++) {
+            int k = 0, i = start;
+            while (i < n && k < pn) {
+                if (x_tok_eq(t[i], pt[k])) { k++; i++; }
+                else if (x_is_filler(t[i])) { i++; }
+                else break;
+            }
+            if (k < pn) continue;
+            bool fillerOnly = true;
+            for (int j = 0; j < n && fillerOnly; j++) {
+                if (j >= start && j < i) continue;
+                if (!x_is_filler(t[j])) fillerOnly = false;
+            }
+            if (!fillerOnly) continue;
+            if (pn > bestLen) { bestLen = pn; outIntent = kPhrase[p].intent; }
+        }
+    }
+    return outIntent >= 0;
+}
+// "open AstroOS" / "spotifyos" / "go to dual link" -> real .bin on the card.
+// Returns true when it owned the utterance (including the honest "not on the
+// card" reply), false to let the other matchers run.
+static bool x_try_launch_os(String *t, int n) {
+    bool verb = x_tok_has(t, n, "open")  || x_tok_has(t, n, "launch") ||
+                x_tok_has(t, n, "start") || x_tok_has(t, n, "run")    ||
+                x_tok_has(t, n, "boot")  || x_tok_has(t, n, "go")     ||
+                x_tok_has(t, n, "play")  || x_tok_has(t, n, "put");
+    String join;
+    for (int i = 0; i < n; i++) join += t[i];
+    for (int i = 0; i < X_NOS; i++) {
+        if (join.indexOf(kOs[i].say) < 0) continue;
+        // A multi-word mood key ("itsgotime", "imbored", "bootsometunes") is
+        // specific enough to stand alone; a short key ("music", "read",
+        // "stars") still needs a verb or an otherwise-empty sentence, so
+        // "music status" cannot yank you into SpotifyOS.
+        if (!verb && strlen(kOs[i].say) < 6) {
+            // No verb: the utterance must be the name itself ("astro os").
+            bool pure = true;
+            String kt[4]; int kn = x_tokenize(String(kOs[i].say), kt, 4);
+            for (int a = 0; a < n && pure; a++) {
+                if (x_is_filler(t[a])) continue;
+                bool part = false;
+                for (int b = 0; b < kn && !part; b++) part = x_tok_eq(t[a], kt[b]);
+                if (!part) pure = false;
+            }
+            if (!pure) continue;
+        }
+        int idx = app_resolve(kOs[i].bin);
+        if (idx < 0) {
+            g_x_last = String(kOs[i].bin) + " is not on the card.";
+            g_x_orb = 2;
+            x_finish_info();
+            return true;
+        }
+        USBSerial.printf("[XANDER] voice launch -> %s (%s)\n",
+                         kOs[i].bin, g_apps[idx].path.c_str());
+        x_launch_app(idx);          // OTA-copies the .bin and reboots
+        return true;
+    }
     return false;
 }
 static int x_best_tmpl(String *t, int n, int &outIdx) {
@@ -4039,9 +5908,11 @@ static void x_kb_cb(lv_event_t *e) {
     }
 }
 static void x_chip_cb(lv_event_t *e) {
+    // <1000: legacy template chip | 1000..1999: app | >=2000: v1.1 command chip
     intptr_t ud = (intptr_t)lv_event_get_user_data(e);
-    if (ud >= 1000) x_launch_app((int)(ud - 1000));
-    else            x_do(kTmpl[ud].intent);
+    if      (ud >= 2000) x_do(kChips[ud - 2000].intent);
+    else if (ud >= 1000) x_launch_app((int)(ud - 1000));
+    else                 x_do(kTmpl[ud].intent);
 }
 // puzzle
 static void x_puz_cat_cb(lv_event_t *e) {
@@ -4158,7 +6029,9 @@ static void x_render_console() {
     lv_obj_t *list = x_list(126, 172);
     for (int i = 0; i < X_NTMPL; i++)
         x_row_btn(list, kTmpl[i].label, theme_accent(), x_chip_cb, (intptr_t)i);
-    int nApp = g_app_count < 6 ? g_app_count : 6;
+    for (int i = 0; i < X_NCHIP; i++)
+        x_row_btn(list, kChips[i].label, theme_primary(), x_chip_cb, (intptr_t)(2000 + i));
+    int nApp = g_app_count < 12 ? g_app_count : 12;
     for (int j = 0; j < nApp; j++) {
         String lbl = String(LV_SYMBOL_PLAY "  Launch ") + g_apps[j].name;
         x_row_btn(list, lbl.c_str(), theme_primary(), x_chip_cb, (intptr_t)(1000 + j));
@@ -4333,11 +6206,36 @@ static void x_open_puzzle(int i) {
     g_x_puz_view = 1; g_x_puz_id = i; g_x_puz_hint = false; g_x_puz_reveal = false;
     g_x_orb = 1; x_render();
 }
+// v1.1: one place that changes the panel level so voice, the Settings slider
+// and the persisted wake target can never disagree.
+static void x_bright_apply(int v) {
+    if (v < 20)  v = 20;
+    if (v > 255) v = 255;
+    if (screenIsOff) screen_on();         // never adjust an invisible panel
+    g_brightness_target = (uint8_t)v;
+    // Direct set, NOT fade_brightness(): this runs inside an LVGL event and
+    // the fade helper pumps lv_timer_handler, which must never be re-entered
+    // from an event.  The Settings slider behaves identically.
+    static_cast<Arduino_CO5300 *>(gfx)->setBrightness((uint8_t)v);
+    g_cur_brightness = (uint8_t)v;
+    g_prefs.begin("dcw", false);
+    g_prefs.putInt("bright", v);
+    g_prefs.end();
+}
+static String x_bright_msg(uint8_t v) {
+    char b[48];
+    snprintf(b, sizeof(b), "Brightness %d%%.", (int)(((int)v * 100) / 255));
+    return String(b);
+}
+
 static void x_do(int intent) {
+    // A recognised command is user activity (v1.6): it must not be treated as
+    // an idle period just because the input came from voice or a chip.
+    pm_activity("xander command");
     switch (intent) {
     case XI_HELP:
-        g_x_last = "Try: launch <app>, give me a puzzle, teach me something, "
-                   "what is <topic>, battery, status, wifi on/off, bluetooth on/off. "
+        g_x_last = "Try: open AstroOS, sync time, what time is it, brightness up, "
+                   "battery status, system status, wifi on/off, restart, shut down. "
                    "Swipe up to enter, down to exit, left for puzzles, right for knowledge.";
         g_x_orb = 0; x_finish_info(); return;
     case XI_HOME_EXIT:      xander_exit(); return;
@@ -4378,13 +6276,188 @@ static void x_do(int intent) {
                  g_wifi_connected ? "on" : "off", g_ble_toggle ? "on" : "off");
         g_x_last = b; g_x_orb = 1; x_finish_info(); return;
     }
+    // ---- v1.1 clock -------------------------------------------------------
+    case XI_SYNC_TIME:
+    case XI_SYNC_DATE: {
+        if (!g_wifi_toggle) {
+            g_x_last = "WiFi is off - turn it on first.";
+            g_x_orb = 2; x_finish_info(); return;
+        }
+        // Blocking by design, but never from inside this event: arm the
+        // deferred worker one paint from now so "Syncing..." is visible and
+        // LVGL is not re-entered from a callback.
+        g_x_last = "Syncing over WiFi..."; g_x_orb = 0; x_finish_info();
+        g_x_sync_date = (intent == XI_SYNC_DATE);
+        g_x_sync_at   = millis() + 80;
+        return;
+    }
+    case XI_TIME_STATUS: {
+        char b[128];
+        long oh = (long)(g_tp_gmt / 3600);
+        long om = (long)(labs((long)g_tp_gmt % 3600L) / 60);
+        snprintf(b, sizeof(b), "Clock %s - %s - UTC%s%ld:%02ld",
+                 g_ntp_synced ? "synced" : "not synced",
+                 g_time_24h ? "24-hour" : "12-hour",
+                 g_tp_gmt < 0 ? "-" : "+", labs(oh), om);
+        g_x_last = b; g_x_orb = g_ntp_synced ? 1 : 0; x_finish_info(); return;
+    }
+    case XI_GET_TIME: {
+        struct tm tm;
+        if (!getLocalTime(&tm, 5)) { g_x_last = "The clock is not set yet."; g_x_orb = 2; }
+        else {
+            char b[32];
+            strftime(b, sizeof(b), g_time_24h ? "It is %H:%M." : "It is %I:%M %p.", &tm);
+            g_x_last = b; g_x_orb = 1;
+        }
+        x_finish_info(); return;
+    }
+    case XI_GET_DATE: {
+        struct tm tm;
+        if (!getLocalTime(&tm, 5)) { g_x_last = "The clock is not set yet."; g_x_orb = 2; }
+        else {
+            char b[64];
+            strftime(b, sizeof(b), "Today is %A %d %B %Y.", &tm);
+            g_x_last = b; g_x_orb = 1;
+        }
+        x_finish_info(); return;
+    }
+    case XI_GET_DAY: {
+        struct tm tm;
+        if (!getLocalTime(&tm, 5)) { g_x_last = "The clock is not set yet."; g_x_orb = 2; }
+        else {
+            char b[48];
+            strftime(b, sizeof(b), "It is %A.", &tm);
+            g_x_last = b; g_x_orb = 1;
+        }
+        x_finish_info(); return;
+    }
+    case XI_OPEN_CLOCK_SETTINGS:
+        // Leave through the deferred worker so the Settings screen is built
+        // from loop(), not from inside the LVGL event that got us here.
+        g_x_goto_settings = true;
+        xander_exit();
+        return;
+    case XI_TIME_12H:
+    case XI_TIME_24H: {
+        g_time_24h = (intent == XI_TIME_24H);
+        g_prefs.begin("dcw", false);
+        g_prefs.putBool("t24", g_time_24h);
+        g_prefs.end();
+        update_face_time();
+        g_x_last = g_time_24h ? "Clock set to 24-hour time." : "Clock set to 12-hour time.";
+        g_x_orb = 1; x_finish_info(); return;
+    }
+    // ---- v1.1 display -----------------------------------------------------
+    case XI_BRIGHT_UP:
+        x_bright_apply((int)g_brightness_target + 30);
+        g_x_last = x_bright_msg(g_brightness_target); g_x_orb = 1; x_finish_info(); return;
+    case XI_BRIGHT_DOWN:
+        x_bright_apply((int)g_brightness_target - 30);
+        g_x_last = x_bright_msg(g_brightness_target); g_x_orb = 1; x_finish_info(); return;
+    case XI_BRIGHT_MAX:
+        x_bright_apply(255);
+        g_x_last = "Brightness at maximum."; g_x_orb = 1; x_finish_info(); return;
+    case XI_BRIGHT_MIN:
+        x_bright_apply(20);
+        g_x_last = "Brightness at minimum."; g_x_orb = 1; x_finish_info(); return;
+    case XI_BRIGHT_50:
+        x_bright_apply(128);
+        g_x_last = "Brightness at 50 percent."; g_x_orb = 1; x_finish_info(); return;
+    // ---- v1.1 power / system ----------------------------------------------
+    case XI_RESTART:
+        time_save_now("voice restart");
+        g_x_last = "Restarting."; g_x_orb = 1; x_finish_info();
+        delay(250);          // no lvgl_pump() here: this is inside an event
+        esp_restart();
+        return;
+    case XI_SHUTDOWN:
+        time_save_now("voice shutdown");
+        g_x_last = "Shutting down."; g_x_orb = 1; x_finish_info();
+        delay(250);
+        WiFi.disconnect(true, true);
+        WiFi.mode(WIFI_OFF);
+        btStop();
+        if (g_has_pmu) g_pmu.shutdown();   // AXP2101 hard power-off (press PWR to boot)
+        deep_sleep_now();                  // only reached if the PMU refused
+        return;
+    case XI_GET_MEMORY: {
+        char b[128];
+        snprintf(b, sizeof(b), "Heap %u KB free of %u KB. PSRAM %u KB free of %u KB.",
+                 (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getHeapSize() / 1024),
+                 (unsigned)(ESP.getFreePsram() / 1024), (unsigned)(ESP.getPsramSize() / 1024));
+        g_x_last = b; g_x_orb = 1; x_finish_info(); return;
+    }
+    case XI_GET_FREE_RAM: {
+        char b[112];
+        snprintf(b, sizeof(b), "%u KB RAM and %u KB PSRAM free.",
+                 (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(ESP.getFreePsram() / 1024));
+        g_x_last = b; g_x_orb = 1; x_finish_info(); return;
+    }
+    case XI_GET_FLASH_STORAGE: {
+        const esp_partition_t *p = esp_ota_get_running_partition();
+        char b[128];
+        snprintf(b, sizeof(b), "Flash %u MB. Firmware %u KB in a %u KB slot.",
+                 (unsigned)(ESP.getFlashChipSize() / (1024u * 1024u)),
+                 (unsigned)(ESP.getSketchSize() / 1024u),
+                 (unsigned)((p ? p->size : 0) / 1024u));
+        g_x_last = b; g_x_orb = 1; x_finish_info(); return;
+    }
+    case XI_GET_SD_STATUS: {
+        char b[112];
+        if (!g_sd_ok) { g_x_last = "No SD card mounted."; g_x_orb = 2; }
+        else {
+            uint8_t t = (uint8_t)SD_MMC.cardType();
+            snprintf(b, sizeof(b), "SD %s, %u MB, %u MB used.",
+                     t == CARD_NONE ? "not present" : "mounted",
+                     (unsigned)(SD_MMC.cardSize() / (1024ULL * 1024ULL)),
+                     (unsigned)(SD_MMC.usedBytes() / (1024ULL * 1024ULL)));
+            g_x_last = b; g_x_orb = 1;
+        }
+        x_finish_info(); return;
+    }
+    case XI_GET_FREE_STORAGE: {
+        char b[112];
+        if (!g_sd_ok) { g_x_last = "No SD card mounted."; g_x_orb = 2; }
+        else {
+            uint64_t total = SD_MMC.totalBytes();
+            uint64_t used  = SD_MMC.usedBytes();
+            if (used > total) used = total;
+            snprintf(b, sizeof(b), "%u MB free of %u MB on the card.",
+                     (unsigned)((total - used) / (1024ULL * 1024ULL)),
+                     (unsigned)(total / (1024ULL * 1024ULL)));
+            g_x_last = b; g_x_orb = 1;
+        }
+        x_finish_info(); return;
+    }
+    case XI_GET_SYSTEM_STATUS: {
+        char b[168];
+        snprintf(b, sizeof(b), "Battery %d%%%s  WiFi %s  BLE %s  SD %s  Heap %u KB  up %lumin",
+                 g_batt_pct < 0 ? 0 : g_batt_pct, g_charging ? " chg" : "",
+                 g_wifi_connected ? "on" : "off", g_ble_toggle ? "on" : "off",
+                 g_sd_ok ? "ok" : "none",
+                 (unsigned)(ESP.getFreeHeap() / 1024),
+                 (unsigned long)(millis() / 60000UL));
+        g_x_last = b; g_x_orb = 1; x_finish_info(); return;
+    }
     default: g_x_last = xrand(X_R_UNK, 3); g_x_orb = 2; x_finish_info(); return;
     }
 }
 static void x_process(String raw) {
     String in = raw; in.toLowerCase(); in.trim();
     if (in.length() == 0) { g_x_last = xrand(X_R_UNK, 3); g_x_orb = 2; x_finish_info(); return; }
-    // knowledge-topic triggers
+
+    String t[12]; int n = x_norm_tokens(in, t, 12);
+
+    // 1) A named OS on the card ("open AstroOS", "spotifyos", "go to dual link").
+    if (x_try_launch_os(t, n)) return;
+
+    // 2) The fixed v1.1 phrase table.  This runs BEFORE the "what is" knowledge
+    //    trigger, otherwise "what is the time" would be answered with "I do not
+    //    have that in my library yet".
+    int pi = -1;
+    if (x_phrase_match(t, n, pi)) { x_do(pi); return; }
+
+    // 3) knowledge-topic triggers
     static const char *trigs[] = { "what is", "what's", "whats", "what are",
                                    "tell me about", "explain", "define", "teach me about" };
     int tp = -1;
@@ -4398,7 +6471,6 @@ static void x_process(String raw) {
         if (a >= 0) { x_open_article(a); g_x_last = "Here is what I have."; return; }
         g_x_last = "I do not have that in my library yet."; g_x_orb = 2; x_finish_info(); return;
     }
-    String t[12]; int n = x_tokenize(in, t, 12);
     int ti; int ts = x_best_tmpl(t, n, ti);
     int ai; int as = x_find_app_tok(t, n, ai);
     bool launchVerb = x_tok_has(t, n, "launch") || x_tok_has(t, n, "start") ||
@@ -4455,6 +6527,27 @@ static void xander_service() {
         g_x_free_at = 0;
         if (g_xander_active) xander_free_launcher_screens();
     }
+    // v1.1 deferred NTP sync (armed by XI_SYNC_TIME / XI_SYNC_DATE).  Runs in
+    // loop() context, one paint after the "Syncing..." screen was built, so
+    // the ~10 s round-trip cannot re-enter LVGL from an event callback.
+    if (g_x_sync_at && millis() >= g_x_sync_at) {
+        g_x_sync_at = 0;
+        g_ntp_synced     = false;     // honest result, even if it was true before
+        g_wifi_connected = false;
+        wifi_connect_and_sync();      // connects, NTPs, then drops WiFi again
+        lastTouchMs = millis();       // the round-trip can outlast the sleep timer
+        if (g_ntp_synced) {
+            time_save_now("voice sync");
+            g_x_last = g_x_sync_date ? "Date and time synced." : "Time synced.";
+            g_x_orb  = 1;
+        } else {
+            g_x_last = "Sync failed - no network reachable.";
+            g_x_orb  = 2;
+        }
+        if (current_screen == SCREEN_FACE) update_face_time();
+        if (g_xander_active) { g_x_action = XA_RENDER; }
+    }
+
     if (g_x_action == XA_NONE) return;
     XAction act = g_x_action;
     g_x_action = XA_NONE;
@@ -4485,8 +6578,13 @@ static void xander_service() {
         if (g_x_scr) lv_obj_clean(g_x_scr);
         g_x_resp_lbl = nullptr;
         xander_rebuild_launcher_screens();
-        current_screen = SCREEN_FACE;
-        lv_scr_load_anim(screens[SCREEN_FACE], LV_SCR_LOAD_ANIM_FADE_ON, 160, 0, false);
+        // v1.1: "open clock settings" lands on Settings; every other exit
+        // (swipe down, "return home", help) lands on the clock face as before.
+        bool to_settings = g_x_goto_settings;
+        g_x_goto_settings = false;
+        current_screen = to_settings ? SCREEN_SETTINGS : SCREEN_FACE;
+        lastTouchMs = millis();
+        lv_scr_load_anim(screens[current_screen], LV_SCR_LOAD_ANIM_FADE_ON, 160, 0, false);
     }
 }
 static void xander_handle_swipe(SwipeEvent ev) {
@@ -4528,9 +6626,17 @@ static void xset_voice_cb(lv_event_t *e) {
     if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
     g_x_voice = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED); x_settings_save();
 }
+// Declared here because the Always-On toggle is built long before the
+// push-to-talk engine (and its overlay) that these reach into.
+static void aon_restart();
+static void aon_wake_disarm(bool wait);
+static void ptt_flash(const String &msg, uint32_t holdMs = 1600);
+
 static void xset_aon_cb(lv_event_t *e) {
     if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
     g_x_alwayson = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED); x_settings_save();
+    aon_restart();          // apply immediately, no reboot needed
+    ptt_flash(g_x_alwayson ? "Always-on on" : "Always-on off", 1200);
 }
 static void xset_blim_cb(lv_event_t *e) {
     if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
@@ -4542,6 +6648,24 @@ static void xset_reset_cb(lv_event_t *) {
     x_stats_save();
     show_xander_settings();   // rebuild to reflect zeros
 }
+// Defined with the push-to-talk module far below; declared here because the
+// settings card is built before that code.
+static void ptt_mictest();
+static void ptt_boot_off();
+static void xset_mictest_cb(lv_event_t *e) { (void)e; ptt_mictest(); }
+
+// BOOT-to-talk: on = a press opens the mic (the default), off = the button is
+// ignored by voice entirely.  Turning it off mid-window closes the mic rather
+// than leaving a session open that no press can end.
+static void xset_bootmic_cb(lv_event_t *e) {
+    if (millis() - lastSwipeMs < CLICK_AFTER_SWIPE_MS) return;
+    g_x_bootmic = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+    x_settings_save();
+    if (!g_x_bootmic) ptt_boot_off();
+    ptt_flash(g_x_bootmic ? "BOOT to talk on" : "BOOT to talk off", 1200);
+}
+
+
 static void show_xander_settings() {
     x_stats_load();
     g_xset_scr = lv_obj_create(NULL);
@@ -4575,6 +6699,9 @@ static void show_xander_settings() {
     lv_label_set_text(stat, sb);
     lv_obj_set_style_text_color(stat, lv_color_hex(theme_primary()), 0);
     lv_obj_set_style_text_font(stat, &lv_font_montserrat_14, 0);
+    card_action(list, "Test Microphone", "1 s level check, result on serial",
+                LV_SYMBOL_AUDIO "  Test", theme_primary(), xset_mictest_cb);
+    card_toggle(list, "BOOT to Talk", "press BOOT to open the mic", g_x_bootmic, xset_bootmic_cb);
     card_toggle(list, "Voice Response", "spoken replies (v1.5)", g_x_voice, xset_voice_cb);
     card_toggle(list, "Always-On Xander", "wake-word listening (v1.5)", g_x_alwayson, xset_aon_cb);
     card_dropdown(list, "Battery Limit", "pause always-on below",
@@ -4599,6 +6726,1295 @@ static void xander_open_settings_cb(lv_event_t *) {
 // #                        END XANDER v1.0 MODULE                            #
 // ############################################################################
 
+// ============================================================================
+//  v1.2  PUSH-TO-TALK VOICE
+//  ----------------------------------------------------------------------------
+//  PRESS BOOT (GPIO0) anywhere in the launcher to start listening.  ONE press,
+//  no second press:
+//      press  -> the mic opens, ESP_SR MultiNet listens in COMMAND mode
+//      match  -> the phrase runs (launch OS / system intent) on its own, after
+//                a short "HEARD: ..." flash so a wrong match is visible
+//      6 s    -> the window closes and whatever was heard runs; a press that
+//                heard nothing simply ends
+//
+//  The button IS the wake word, so "Xander" is not required and is not in the
+//  phrase list.
+//
+//  Not hold-to-talk: you can lower your arm and keep talking, and the window is
+//  timed rather than gated on the button staying down.  A second press during
+//  the window still ends it early and runs the match, so the wait is optional.
+//
+//  Why it is shaped this way:
+//   * ESP_SR calls onEvent() FROM ITS OWN TASK.  The handler only records the
+//     id; teardown, UI and launching all happen in loop() -- no LVGL from a
+//     foreign task, and no I2S.end() while a feed task is still reading.
+//   * No 'model' partition -> the feature disables itself with one clear log
+//     line and every other launcher path behaves exactly as before.
+//   * The listener never coexists with another I2S user (the launcher has none).
+// ============================================================================
+#define PTT_PIN            0      // onboard BOOT, active LOW
+#define PTT_DEBOUNCE_MS    25
+
+// ============================================================================
+//  MICROPHONE -- read this before touching the pin numbers
+// ============================================================================
+//  This board has NO raw I2S microphone.  The 2.06 uses an ES7210 ADC with two
+//  digital mics feeding it, and an ES8311 for playback; both codecs sit on the
+//  SAME I2S clocks (the ESP32-S3 is master and must generate MCLK):
+//
+//      BCLK 41   LRCK/WS 45   MCLK 16   codec -> ESP32 (DIN) 42
+//
+//  Those numbers are not guesses: they are BSP_I2S_SCLK / LCLK / MCLK / DSIN in
+//  the vendor's own board support package for this exact panel
+//  (waveshare/esp32_s3_touch_amoled_2_06).  Pin 40 is the ESP32 -> codec data
+//  line and is not used here because the launcher does not play audio.
+//
+//  A raw-mic setup on any other pins reads nothing at all: the ESP32 happily
+//  clocks an idle bus and every sample is 0 -> "-99 dBFS, peak 0".  That was
+//  the v7.0 behaviour (it looked for an INMP441 on 17/18/16).
+//
+//  The ES7210 also has to be woken over I2C before it puts anything on SDOUT.
+//  Reset defaults leave its ADC powered down, so without es7210_start() the
+//  data line stays silent no matter which pins are used.  The sequence below is
+//  the vendor's (esp_codec_dev es7210_open + es7210_enable) in slave mode, MIC1 +
+//  MIC2 enabled, 16-bit, plain I2S -- i.e. left slot = MIC1, right = MIC2, which
+//  is why a mono-left read gets a single clean mic.
+// ============================================================================
+#define PTT_I2S_BCLK_PIN   41     // shared with the ES8311
+#define PTT_I2S_WS_PIN     45     // LRCK
+#define PTT_I2S_DIN_PIN    42     // ES7210 SDOUT -> ESP32
+#define PTT_I2S_MCLK_PIN   16     // ESP32 -> both codecs, 256 * fs
+#define ES7210_GAIN_CODE   10     // 0..14 = 0..37.5 dB in 3 dB steps; 10 = 30 dB
+
+static uint8_t g_micAddr  = 0;      // 7-bit address that answered, 0 = none
+static bool    g_micReady = false;  // registers written, ADC running
+
+static bool mic_i2c_probe(uint8_t a) {
+    Wire.beginTransmission(a);
+    return Wire.endTransmission() == 0;
+}
+
+static bool es7210_write(uint8_t reg, uint8_t val) {
+    Wire.beginTransmission(g_micAddr);
+    Wire.write(reg);
+    Wire.write(val);
+    return Wire.endTransmission() == 0;
+}
+
+static bool es7210_update(uint8_t reg, uint8_t mask, uint8_t val) {
+    Wire.beginTransmission(g_micAddr);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom((int)g_micAddr, 1) != 1) return false;
+    uint8_t regv = Wire.read();
+    return es7210_write(reg, (uint8_t)((regv & ~mask) | (mask & val)));
+}
+
+// One register script that leaves the ES7210 capturing.  Call only while the
+// I2S clocks are already running: the chip is a slave, and its power-up state
+// machine needs MCLK/BCLK/LRCK to finish starting.  It is re-run on every bus
+// open (button, always-on, mic test) because closing I2S stops MCLK, and a
+// slave codec whose clocks vanish does not necessarily come back on its own.
+static bool es7210_start() {
+
+    // AD1/AD0 strap the address; this board leaves them at 00 (= 0x40), but a
+    // wrong address is indistinguishable from a dead codec, so probe first.
+    if (!g_micAddr) {
+        for (uint8_t a = 0x40; a <= 0x43; a++)
+            if (mic_i2c_probe(a)) { g_micAddr = a; break; }
+    }
+    if (!g_micAddr) {
+        USBSerial.println("[mic] no ES7210 on I2C 0x40..0x43 - the mic cannot work");
+        return false;
+    }
+
+    bool ok = true;
+    ok &= es7210_write(0x00, 0xff);              // reset
+    ok &= es7210_write(0x00, 0x41);
+    ok &= es7210_write(0x01, 0x3f);              // all ADC clocks off for now
+    ok &= es7210_write(0x09, 0x30);              // power-on state timing
+    ok &= es7210_write(0x0A, 0x30);
+    ok &= es7210_write(0x23, 0x2a);              // HPF "quick setup"
+    ok &= es7210_write(0x22, 0x0a);
+    ok &= es7210_write(0x20, 0x0a);
+    ok &= es7210_write(0x21, 0x2a);
+    ok &= es7210_update(0x08, 0x01, 0x00);       // slave: clocks come from the S3
+    ok &= es7210_write(0x40, 0x43);              // analog power, VDDA 3.3 V
+    ok &= es7210_write(0x41, 0x70);              // MIC bias 2.87 V
+    ok &= es7210_write(0x42, 0x70);
+    ok &= es7210_write(0x07, 0x20);              // OSR
+    ok &= es7210_write(0x02, 0xc1);              // ADC clock, clear state
+
+    // MIC1 + MIC2 (two mics => plain I2S, not TDM: TDM only kicks in at 3+).
+    for (uint8_t r = 0x43; r <= 0x46; r++) ok &= es7210_update(r, 0x10, 0x00);
+    ok &= es7210_write(0x4B, 0xff);
+    ok &= es7210_write(0x4C, 0xff);
+    ok &= es7210_update(0x01, 0x0b, 0x00);       // enable the MIC1/MIC2 ADC clock
+    ok &= es7210_write(0x4B, 0x00);              // MIC bias + PGA for 1/2
+    ok &= es7210_update(0x43, 0x10, 0x10);       // MIC1 PGA on
+    ok &= es7210_update(0x44, 0x10, 0x10);       // MIC2 PGA on
+    ok &= es7210_write(0x12, 0x00);              // SDOUT: 2-slot I2S, not TDM
+    ok &= es7210_update(0x43, 0x0f, ES7210_GAIN_CODE);
+    ok &= es7210_update(0x44, 0x0f, ES7210_GAIN_CODE);
+
+    // Bring the ADC out of power-down.
+    ok &= es7210_write(0x01, 0x34);              // 0x3f with the clock bits cleared
+    ok &= es7210_write(0x06, 0x00);
+    ok &= es7210_write(0x40, 0x43);
+    ok &= es7210_write(0x47, 0x08);
+    ok &= es7210_write(0x48, 0x08);
+    ok &= es7210_write(0x49, 0x08);
+    ok &= es7210_write(0x4A, 0x08);
+    ok &= es7210_write(0x40, 0x43);
+    ok &= es7210_write(0x00, 0x71);
+    ok &= es7210_write(0x00, 0x41);
+
+    // 16-bit samples, Philips I2S framing.
+    ok &= es7210_update(0x11, 0xe0, 0x60);
+    ok &= es7210_update(0x11, 0x03, 0x00);
+
+    if (!ok) {
+        USBSerial.printf("[mic] ES7210 at 0x%02X did not accept its registers\n", g_micAddr);
+        return false;
+    }
+    g_micReady = true;
+    USBSerial.printf("[mic] ES7210 at 0x%02X running: 16 kHz, 16-bit, MIC1 left / MIC2 right, gain %d dB\n",
+                     g_micAddr, ES7210_GAIN_CODE * 3);
+    return true;
+}
+
+// Boot-time presence check.  Answers the only question that matters when the
+// level reads -99: is the codec there at all, and at which address?
+static void mic_probe_report() {
+    uint8_t found = 0;
+    for (uint8_t a = 0x40; a <= 0x43; a++)
+        if (mic_i2c_probe(a)) { found = a; break; }
+    const bool es8311 = mic_i2c_probe(0x18) || mic_i2c_probe(0x19);
+    USBSerial.printf("[mic] i2c probe: ES7210 %s, ES8311 %s\n",
+                     found ? "found" : "** MISSING **",
+                     es8311 ? "found" : "** MISSING **");
+    if (found) g_micAddr = found;
+}
+// One press = one window.  The phrase that matched runs automatically when the
+// window closes -- there is no second press to remember.
+//
+// MultiNet closes its own window first: esp32-hal-sr.c creates it with a fixed
+// 5760 ms (multinet->create(mn_name, 5760)) and reports SR_EVENT_TIMEOUT, which
+// ptt_service() treats as the end of the session.  So the real window is 5.76 s
+// and PTT_MAX_SESSION_MS is only the backstop for the case where the engine
+// never reaches a verdict at all (dead mic, stalled feed): without it the mic
+// would stay open and drain the battery.
+#define PTT_MAX_SESSION_MS 6000
+#define PTT_RUN_DELAY_MS   700    // show "HEARD: ..." this long, then run it
+
+// PTT_WAKE is the always-on gate.  It lives in the same phrase table as every
+// other command, so one ESP_SR engine covers both button push-to-talk and the
+// hands-free path -- there is no second sketch and no second model.
+enum PttKind : uint8_t { PTT_APP = 0, PTT_INTENT = 1, PTT_WAKE = 2 };
+
+struct PttCmd {
+    const char *phrase;   // what MultiNet is trained to hear
+    uint8_t     kind;     // PTT_APP | PTT_INTENT
+    int16_t     arg;      // XI_* for PTT_INTENT
+    const char *bin;      // .bin base name for PTT_APP
+};
+
+// Keep the phrases SHORT and DISTINCT: MultiNet spots whole phrases, so
+// "astro" and "spotify" overlap far less than "open astro o s" would, and a
+// button-gated session has no wake word to strip first.
+static const PttCmd kPtt[] = {
+    // ---- wake gate for always-on (settings > Always-On Xander) -----------
+    { "xander",              PTT_WAKE, 0, nullptr       },
+    // ---- the ten OS .bin files -------------------------------------------
+    { "astro",               PTT_APP, 0, "AstroOS"    },
+    { "spotify",             PTT_APP, 0, "SpotifyOS"  },
+    { "taekwondo",           PTT_APP, 0, "TKDOS"      },
+    { "sport",               PTT_APP, 0, "SportOS"    },
+    { "game",                PTT_APP, 0, "GameOS"     },
+    { "explore",             PTT_APP, 0, "ExplorerOS" },
+    { "tactical",            PTT_APP, 0, "TacticalOS" },
+    { "book",                PTT_APP, 0, "BookOS"     },
+    { "waypoint",            PTT_APP, 0, "WaypointOS" },
+    { "dual link",           PTT_APP, 0, "Dual_Link"  },
+    // ---- clock -----------------------------------------------------------
+    { "what time is it",     PTT_INTENT, XI_GET_TIME,          nullptr },
+    { "what is the date",    PTT_INTENT, XI_GET_DATE,          nullptr },
+    { "sync time",           PTT_INTENT, XI_SYNC_TIME,         nullptr },
+    { "check time status",   PTT_INTENT, XI_TIME_STATUS,       nullptr },
+    // ---- display ---------------------------------------------------------
+    { "brightness up",       PTT_INTENT, XI_BRIGHT_UP,         nullptr },
+    { "brightness down",     PTT_INTENT, XI_BRIGHT_DOWN,       nullptr },
+    { "maximum brightness",  PTT_INTENT, XI_BRIGHT_MAX,        nullptr },
+    { "minimum brightness",  PTT_INTENT, XI_BRIGHT_MIN,        nullptr },
+    // ---- radios ----------------------------------------------------------
+    { "turn wifi on",        PTT_INTENT, XI_WIFI_ON,           nullptr },
+    { "turn wifi off",       PTT_INTENT, XI_WIFI_OFF,          nullptr },
+    { "turn bluetooth on",   PTT_INTENT, XI_BLE_ON,            nullptr },
+    { "turn bluetooth off",  PTT_INTENT, XI_BLE_OFF,           nullptr },
+    // ---- power / status / navigation -------------------------------------
+    { "battery status",      PTT_INTENT, XI_SHOW_BATTERY,      nullptr },
+    { "system status",       PTT_INTENT, XI_GET_SYSTEM_STATUS, nullptr },
+    { "restart the watch",   PTT_INTENT, XI_RESTART,           nullptr },
+    { "shut down the watch", PTT_INTENT, XI_SHUTDOWN,          nullptr },
+    { "open puzzles",        PTT_INTENT, XI_OPEN_PUZZLES,      nullptr },
+    { "open knowledge",      PTT_INTENT, XI_OPEN_KNOWLEDGE,    nullptr },
+    { "return home",         PTT_INTENT, XI_HOME_EXIT,         nullptr },
+};
+#define PTT_N ((int)(sizeof(kPtt) / sizeof(kPtt[0])))
+
+static sr_cmd_t   g_pttCmds[PTT_N];      // built in ptt_init()
+static I2SClass   g_pttI2S;
+static bool       g_pttReady     = false; // phrase table built
+static bool       g_pttUsable    = true;  // false after a hard failure
+static bool       g_pttArmed     = false; // this press is already handled
+static bool       g_pttListening = false;
+static volatile int g_pttHit     = 0;     // written by ESP_SR's task
+static uint32_t   g_pttStartMs   = 0;
+static uint32_t   g_pttHitMs     = 0;     // when loop() first saw the match
+static lv_obj_t  *g_pttBox       = nullptr;
+static uint32_t   g_pttHideAt    = 0;
+static int        g_pttShownHit  = -1;    // hit already painted in the overlay
+static uint8_t    g_pttFails     = 0;     // failed starts this boot
+static int        g_pttLastId    = 0;
+static uint32_t   g_pttLastMs    = 0;
+
+// MultiNet is created with a fixed listening window (esp32-hal-sr.c calls
+// create(mn_name, 5760)) and, when it expires, puts the engine in SR_MODE_OFF --
+// detection is then OFF, not paused.  For a button press that expiry IS the end
+// of the session, so this timestamp is all that is needed to run the match.
+// (Always-on keeps one renewal: its gate is 7 s long and a speaker who says
+// "xander", pauses, then speaks should not be cut off at 5.76 s.)
+static volatile uint32_t g_pttMnExpiredAt = 0;   // set by ESP_SR's task
+static volatile uint8_t  g_pttMnRearms    = 0;   // window renewals (always-on only)
+
+// ---- always-on (settings > Always-On Xander) ----------------------------
+// One engine, two doors.  The button opens a manual session that runs what it
+// heard as soon as it hears it; always-on keeps the same engine open and runs
+// a phrase the moment the wake gate has been spoken.  No EI model, no second
+// sketch -- MultiNet already has every phrase, "xander" included.
+static bool       g_pttAuto      = false; // this session was opened by always-on
+static uint32_t   g_aonWakeMs    = 0;     // last time the wake gate was opened
+#define AON_GATE_MS        7000   // how long after "xander" a phrase may run
+
+static void ptt_on_event(sr_event_t event, int command_id, int phrase_id) {
+    (void)phrase_id;
+    if (event == SR_EVENT_COMMAND && command_id > 0 && g_pttHit == 0)
+        g_pttHit = command_id;          // first match wins; read in loop()
+    else if (event == SR_EVENT_TIMEOUT)
+        g_pttMnExpiredAt = millis() ? millis() : 1;   // handled in ptt_service()
+}
+
+// ---- LVGL object pool -> PSRAM (see LV_MEM_CUSTOM in lv_conf.h) -----------
+// One ~64 KB pool is requested at lv_init() and grown in small steps.  Keeping
+// it out of internal DRAM is worth far more to ESP-SR (which needs one large
+// contiguous internal block) than the extra latency of touching PSRAM during
+// widget layout.  Internal RAM, then the generic heap, are the fallbacks, so a
+// device without working PSRAM still boots.
+//
+// NOTE: defined here, not at the top of the file.  The Arduino prototype pass
+// injects generated prototypes ahead of the FIRST function definition in the
+// sketch; if that definition sits above `struct LTheme`, every later prototype
+// that mentions LTheme fails with "does not name a type".
+extern "C" void *lv_pool_alloc(size_t size) {
+    if (!size) size = 1;
+    void *p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    return p;
+}
+
+extern "C" void lv_pool_free(void *ptr) {
+    if (ptr) heap_caps_free(ptr);
+}
+
+extern "C" void *lv_pool_realloc(void *ptr, size_t size) {
+    if (!size) size = 1;
+    void *p = heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) p = heap_caps_realloc(ptr, size, MALLOC_CAP_8BIT);
+    return p;
+}
+
+// Internal RAM is what the AFE/MultiNet allocations come from, and what LVGL
+// draws out of.  Printing it either side of ESP_SR.begin() turns a silent
+// "voice unavailable" into a number you can act on.
+static void ptt_heap(const char *tag) {
+    USBSerial.printf("[ptt] heap %-14s internal free %6u  largest %6u  psram free %7u\n",
+                     tag,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+// Same probe as the standalone sketch: the label must exist and not be blank,
+// otherwise esp_srmodel_init() would fail deep inside AFE bring-up.
+static bool ptt_model_ok() {
+    const esp_partition_t *p = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "model");
+    if (!p) {
+        USBSerial.println("[ptt] no 'model' partition - voice disabled");
+        return false;
+    }
+    uint8_t head[16] = {0};
+    if (esp_partition_read(p, 0, head, sizeof(head)) != ESP_OK) return false;
+    for (size_t i = 0; i < sizeof(head); i++) {
+        if (head[i] != 0xFF) {
+            USBSerial.printf("[ptt] model @ 0x%06X (%u KB) ready\n",
+                             (unsigned)p->address, (unsigned)(p->size / 1024));
+            return true;
+        }
+    }
+    USBSerial.printf("[ptt] model @ 0x%06X is blank - flash srmodels.bin there\n",
+                     (unsigned)p->address);
+    return false;
+}
+
+// ============================================================================
+//  Voice model provisioning from the card
+//  ----------------------------------------------------------------------------
+//  The MultiNet blob is 3.3 MB and the factory slot is 5 MB with ~3.85 MB of
+//  launcher already in it, so the model can never be part of the app image.
+//  It has to reach 0x910000 some other way, and there are exactly two:
+//
+//    (a) the Upload rule in the "DualCore 5MB APP / 3.9MB MODEL" menu entry,
+//        which writes srmodels.bin in the same esptool call as the app;
+//    (b) this function -- srmodels.bin sits on the SD card and a blank model
+//        partition is filled on the next boot.
+//
+//  (b) is what makes "upload the launcher and nothing else" actually true, and
+//  it also repairs a watch whose partition was wiped by an "EraseFlash: Enabled"
+//  upload without re-flashing from a PC.  Once written it never runs again:
+//  ptt_model_ok() sees a non-blank head and returns early.
+// ============================================================================
+static const char *kModelSrc[] = {
+    "/WATCH/srmodels.bin", "/WATCH/SRMODELS.BIN",
+    "/WATCH/bin/srmodels.bin", "/WATCH/bin/SRMODELS.BIN",
+    "/srmodels.bin", "/bin/srmodels.bin",
+};
+static uint8_t g_modelChunk[4096];
+
+static bool sd_provision_model() {
+    const esp_partition_t *p = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "model");
+    if (!p) {
+        USBSerial.println("[model] no 'model' partition in this table - voice needs the DualCore 5MB one");
+        return false;
+    }
+    if (ptt_model_ok()) return true;        // already there (menu entry or an earlier boot)
+
+    const char *src = nullptr;
+    size_t len = 0;
+    for (size_t i = 0; i < sizeof(kModelSrc) / sizeof(kModelSrc[0]); i++) {
+        if (!SD_MMC.exists(kModelSrc[i])) continue;
+        File f = SD_MMC.open(kModelSrc[i], FILE_READ);
+        if (!f) continue;
+        len = (size_t)f.size();
+        f.close();
+        if (len == 0 || len > (size_t)p->size) {
+            USBSerial.printf("[model] %s is %u B, partition holds %u - skipped\n",
+                             kModelSrc[i], (unsigned)len, (unsigned)p->size);
+            continue;
+        }
+        src = kModelSrc[i];
+        break;
+    }
+    if (!src) {
+        USBSerial.printf("[model] blank at 0x%06X and no srmodels.bin on the card\n",
+                         (unsigned)p->address);
+        USBSerial.println("[model] copy srmodels.bin to /WATCH/srmodels.bin once, or Upload the 'DualCore 5MB' scheme");
+        return false;
+    }
+
+    USBSerial.printf("[model] writing %s (%u KB) -> 0x%06X\n",
+                     src, (unsigned)(len / 1024), (unsigned)p->address);
+    File f = SD_MMC.open(src, FILE_READ);
+    if (!f) return false;
+
+    const size_t span = (len + 4095u) & ~(size_t)4095u;   // erase in 4 KB sectors
+    if (esp_partition_erase_range(p, 0, span) != ESP_OK) {
+        USBSerial.println("[model] erase failed");
+        f.close();
+        return false;
+    }
+
+    size_t done = 0, painted = 0;
+    bool ok = true;
+    while (done < len) {
+        size_t want = len - done;
+        if (want > sizeof(g_modelChunk)) want = sizeof(g_modelChunk);
+        int got = f.read(g_modelChunk, want);
+        if (got <= 0) { ok = false; break; }
+        if (esp_partition_write(p, done, g_modelChunk, (size_t)got) != ESP_OK) { ok = false; break; }
+        done += (size_t)got;
+        if (done - painted >= 262144u) {          // repaint the splash every 256 KB
+            painted = done;
+            char msg[32];
+            snprintf(msg, sizeof(msg), "voice model %u%%", (unsigned)(done * 100 / len));
+            splash_progress(74 + (int)(done * 22 / len), msg);
+        }
+    }
+    f.close();
+    if (!ok || done != len) {
+        USBSerial.printf("[model] write failed at %u/%u B - partition left blank\n",
+                         (unsigned)done, (unsigned)len);
+        return false;
+    }
+    USBSerial.printf("[model] %u KB written, verifying\n", (unsigned)(len / 1024));
+    return ptt_model_ok();      // re-reads the head: a silent failure is caught here
+}
+
+static void ptt_flash(const String &msg, uint32_t holdMs) {
+    // Voice feedback is pointless on a dark panel.  Every caller runs in loop
+    // context, and this is the single choke point for "Opening mic...",
+    // "Yes?", "HEARD: ..." and the command results, so waking the screen here
+    // covers a BOOT press, a wake word, and a session that was already open.
+    if (screenIsOff) screen_on();
+    if (!g_pttBox) {
+        g_pttBox = lv_label_create(lv_layer_top());
+        lv_obj_set_style_bg_color(g_pttBox, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(g_pttBox, 220, 0);
+        lv_obj_set_style_radius(g_pttBox, 16, 0);
+        lv_obj_set_style_pad_hor(g_pttBox, 14, 0);
+        lv_obj_set_style_pad_ver(g_pttBox, 8, 0);
+        lv_obj_set_style_border_color(g_pttBox, lv_color_hex(theme_primary()), 0);
+        lv_obj_set_style_border_width(g_pttBox, 1, 0);
+        lv_obj_set_style_text_color(g_pttBox, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_text_font(g_pttBox, &lv_font_montserrat_16, 0);
+        lv_obj_clear_flag(g_pttBox, LV_OBJ_FLAG_SCROLLABLE);
+    }
+    lv_label_set_text(g_pttBox, msg.c_str());
+    lv_obj_clear_flag(g_pttBox, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_align(g_pttBox, LV_ALIGN_TOP_MID, 0, 14);
+    lv_obj_move_foreground(g_pttBox);
+    lv_timer_handler();                 // loop context: safe to paint now
+    g_pttHideAt = millis() + holdMs;
+}
+
+// AFE + MultiNet are allocated from internal RAM inside begin().  Below this
+// largest-block figure create_from_config() starts failing, so refuse cleanly
+// instead of risking an assert deep inside ESP-SR.
+#define PTT_MIN_LARGEST_BLOCK 40000
+
+static const char *g_pttErr = nullptr;
+// Backing store for the one message that carries a measurement (the RAM
+// refusal).  The screen shows "need 40K, have 18K" instead of a bare
+// "Not enough RAM", which is the difference between a guess and a diagnosis.
+static char        g_pttErrBuf[48];
+
+// AFE + MultiNet want real time; at the 80 MHz idle clock the feed task can
+// fall behind the microphone.  Every exit path from the bring-up restores the
+// idle clock, so a failed start cannot leave the watch burning 240 MHz.
+#if POWER_SAVE
+static inline void ptt_cpu(bool fast) {
+    // v1.6: the boost is still local to the voice path, but the restore now
+    // asks the power manager for the CURRENT state's clock instead of forcing
+    // the old fixed idle value -- otherwise leaving a phrase would pin the
+    // watch at 80 MHz until the next state change.
+    if (fast) { g_pmMicBusy = true;  setCpuFrequencyMhz(CPU_FREQ_BUSY_MHZ); }
+    else      { g_pmMicBusy = false; pm_restore_cpu(); }
+}
+#else
+static inline void ptt_cpu(bool) {}
+#endif
+
+// ----------------------------------------------------------------------------
+//  Bring-up: bus + codec in loop context, sr_start() on a throwaway task.
+//  ----------------------------------------------------------------------------
+//  sr_start() in esp32-hal-sr.c has an error path that runs
+//  `vTaskDelete(g_sr_data->handle_task)`.  With a NULL handle -- one of the
+//  three ESP-SR tasks failed to allocate -- that is vTaskDelete(NULL), which
+//  deletes THE TASK THAT CALLED IT.  Called from loop() that task is the
+//  Arduino loop task, and the symptom is exactly the report: the last painted
+//  frame stays on the panel ("Opening mic..." forever), no panic, no log line,
+//  nothing answers touch or BOOT afterwards.
+//
+//  So only sr_start() moves to a throwaway task.  I2S and the ES7210 stay in
+//  loop context: they are quick, and Wire must not be shared with a second task
+//  while the panel is being serviced.
+// ----------------------------------------------------------------------------
+static volatile uint8_t  g_pttBring     = 0;   // 0 idle, 1 starting, 2 up, 3 failed
+static volatile uint32_t g_pttBringMs   = 0;
+static bool              g_pttBringAuto = false;
+#define PTT_BRING_TIMEOUT_MS 8000UL
+
+static bool ptt_open_mic() {
+    if (!g_pttReady)  { g_pttErr = "Voice not ready";   return false; }
+    // Keep a specific reason set at boot ("No voice model") -- it tells the
+    // user what to flash, whereas "Voice unavailable" tells them nothing.
+    if (!g_pttUsable) { if (!g_pttErr) g_pttErr = "Voice unavailable"; return false; }
+
+    const uint32_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    if (largest < PTT_MIN_LARGEST_BLOCK) {
+        USBSerial.printf("[ptt] refusing to start: largest internal block %u < %u\n",
+                         (unsigned)largest, (unsigned)PTT_MIN_LARGEST_BLOCK);
+        ptt_heap("short on ram");
+        snprintf(g_pttErrBuf, sizeof g_pttErrBuf, "Need %uK RAM, have %uK",
+                 (unsigned)(PTT_MIN_LARGEST_BLOCK / 1024), (unsigned)(largest / 1024));
+        g_pttErr = g_pttErrBuf;
+        // Deliberately NOT latched to g_pttUsable: the shortfall is a snapshot
+        // of internal SRAM at this instant (a screen teardown still in flight, an
+        // I2S buffer held by the wake-word task).  The next press re-measures and
+        // may pass, so keep voice retryable instead of dead until reboot.
+        return false;
+    }
+
+    ptt_cpu(true);
+
+    g_pttHit         = 0;
+    g_pttShownHit    = -1;
+    g_pttHitMs       = 0;
+    g_pttMnExpiredAt = 0;
+    g_pttMnRearms    = 0;
+    ptt_heap("before begin");
+
+    g_pttI2S.setPins(PTT_I2S_BCLK_PIN, PTT_I2S_WS_PIN, -1,
+                     PTT_I2S_DIN_PIN, PTT_I2S_MCLK_PIN);
+    g_pttI2S.setTimeout(2000);
+    if (!g_pttI2S.begin(I2S_MODE_STD, 16000, I2S_DATA_BIT_WIDTH_16BIT,
+                        I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT)) {
+        USBSerial.println("[ptt] I2S start failed - BCLK 41, WS 45, DIN 42, MCLK 16");
+        g_pttErr = "Mic did not start";
+        ptt_cpu(false);
+        return false;
+    }
+    USBSerial.println("[ptt] I2S open: 16 kHz / 16-bit / mono-left, MCLK 4.096 MHz");
+
+    // The ES7210 stays silent until it is told to start, and it only accepts
+    // that once the clocks above are running.  Without this the session would
+    // open, listen to a dead bus and time out -- the old "it hears nothing".
+    if (!es7210_start()) {
+        g_pttI2S.end();
+        g_pttErr = "Mic codec failed";
+        ptt_cpu(false);
+        return false;
+    }
+
+    ESP_SR.onEvent(ptt_on_event);        // the callback is set once per boot
+    return true;
+}
+
+// The one call that can delete its caller.  Two attempts: a failed create can
+// leave the heap fragmented enough that the second succeeds, and sr_start()
+// cleans up after itself on a clean error return.
+static void ptt_sr_task(void *) {
+    bool ok = false;
+    for (int attempt = 1; attempt <= 2 && !ok; attempt++) {
+        ok = ESP_SR.begin(g_pttI2S, g_pttCmds, PTT_N, SR_CHANNELS_MONO,
+                          SR_MODE_COMMAND, "M");
+        if (!ok) delay(60);
+    }
+    g_pttBring = ok ? 2 : 3;
+    vTaskDelete(NULL);
+}
+
+// 0 = still starting, 1 = listening, -1 = failed.  Never blocks past the
+// I2S/ES7210 register writes, so loop() keeps painting and stays responsive
+// even if sr_start() wedges or dies on the way in.
+static int ptt_start_poll(bool autoMode) {
+    if (g_pttListening) return 1;
+
+    if (g_pttBring == 1) {
+        if (millis() - g_pttBringMs <= PTT_BRING_TIMEOUT_MS) return 0;
+        // The task never reported back: it is wedged inside ESP-SR, or the
+        // library's error path deleted it.  Latch voice off for this boot --
+        // retrying a half-built engine just wedges again -- and leave the bus
+        // alone, because a live feed task may still own it.
+        g_pttBring  = 4;
+        g_pttUsable = false;
+        g_pttErr    = "Voice hung - reboot";
+        USBSerial.println("[ptt] sr start never returned - voice latched off");
+    }
+
+    if (g_pttBring == 4) {
+        // Hung, not failed: no I2S.end() and no clock change here.  A feed task
+        // that survived inside ESP-SR may still be reading the bus, and closing
+        // it underneath would be the freeze this whole split exists to avoid.
+        g_pttBring = 0;
+        return -1;
+    }
+
+    if (g_pttBring == 2) {
+        g_pttBring = 0;
+        ptt_heap("after begin");
+        g_pttAuto      = g_pttBringAuto;
+        g_pttListening = true;
+        g_pttStartMs   = millis();
+        USBSerial.printf("[ptt] listening... (%d phrases, %lus window)\n",
+                         PTT_N, (unsigned long)(PTT_MAX_SESSION_MS / 1000));
+        return 1;
+    }
+
+    if (g_pttBring == 3) {
+        g_pttBring = 0;
+        // A clean failure means sr_stop() already ran inside ESP-SR, so the
+        // bus is ours again: close it and drop back to the idle clock.
+        g_pttI2S.end();
+        ptt_cpu(false);
+        USBSerial.println("[ptt] ESP_SR.begin failed - is srmodels.bin at 0x910000?");
+        if (++g_pttFails >= 3) {
+            g_pttUsable = false;
+            USBSerial.println("[ptt] disabled for this boot after 3 failures");
+        }
+        g_pttErr = "Voice unavailable";
+        return -1;
+    }
+
+    // Idle: open the bus, wake the codec, then hand sr_start() to its task.
+    if (!g_pttUsable) { if (!g_pttErr) g_pttErr = "Voice unavailable"; return -1; }
+    if (!ptt_open_mic()) return -1;
+
+    g_pttErr       = nullptr;
+    g_pttBringAuto = autoMode;
+    g_pttBringMs   = millis();
+    g_pttBring     = 1;
+    if (xTaskCreatePinnedToCore(ptt_sr_task, "ptt sr", 4096, nullptr, 4, nullptr, 0) != pdPASS) {
+        g_pttBring = 3;
+        return ptt_start_poll(autoMode);   // close the bus, report, once
+    }
+    return 0;
+}
+
+// ESP_SR's tasks must stop before the bus does; this is the only teardown path.
+static int ptt_stop() {
+    if (!g_pttListening) return 0;
+    ESP_SR.end();
+    g_pttI2S.end();
+    g_pttListening   = false;
+    g_pttAuto        = false;
+    g_pttHitMs       = 0;
+    g_pttMnExpiredAt = 0;
+    g_aonWakeMs      = 0;   // the gate never outlives the session that opened it
+    ptt_cpu(false);
+    int id = g_pttHit;
+    g_pttHit = 0;
+    g_pttLastMs = millis() - g_pttStartMs;
+    g_pttLastId = id;
+    if (id > 0 && id <= PTT_N)
+        USBSerial.printf("[ptt] session ended after %lums, id=%d (\"%s\")\n",
+                         (unsigned long)g_pttLastMs, id, kPtt[id - 1].phrase);
+    else
+        USBSerial.printf("[ptt] session ended after %lums, nothing matched\n",
+                         (unsigned long)g_pttLastMs);
+    return id;
+}
+
+// Settings > BOOT to Talk turned off while a button window is open.  Always-on
+// sessions are left alone: they are opened by the wake word, not the button.
+static void ptt_boot_off() {
+    if (g_pttListening && !g_pttAuto) ptt_stop();
+    USBSerial.println("[ptt] BOOT button disabled by settings");
+}
+
+// Holds the panel on for as long as the command runs: wakes it if it was dark,
+// pauses the idle countdown for the duration, and restarts the countdown when
+// the command returns.  Commands that reboot (an SD app launch) never reach the
+// destructor, which is exactly right -- the panel should stay lit until the
+// restart.  The cap only bounds a wedged command.
+#define COMMAND_SCREEN_HOLD_MS 300000UL         // 5 min
+struct CommandScreenHold {
+    CommandScreenHold() {
+        if (screenIsOff) screen_on();
+        lastTouchMs = millis();
+        screen_hold(COMMAND_SCREEN_HOLD_MS);
+    }
+    ~CommandScreenHold() { screen_hold_release(); }
+};
+
+static void ptt_run(int id) {
+    if (id <= 0) { ptt_flash("No command heard"); return; }
+    if (id > PTT_N) return;
+    const PttCmd &c = kPtt[id - 1];
+    CommandScreenHold screenHold;       // lit + paused for the whole command
+
+    // The gate itself is not a command: it only arms the window in which a
+    // hands-free phrase is allowed to run.
+    if (c.kind == PTT_WAKE) {
+        g_aonWakeMs = millis();
+        USBSerial.println("[aon] wake accepted");
+        ptt_flash("Yes?", 1200);
+        return;
+    }
+
+    // Puzzles and Knowledge live INSIDE the Xander layer, so voice has to open
+    // that layer first when the normal launcher screens are showing.
+    if (!g_xander_active && (c.arg == XI_OPEN_PUZZLES || c.arg == XI_OPEN_KNOWLEDGE)) {
+        xander_enter();
+        if (c.arg == XI_OPEN_PUZZLES) { g_x_top = 0; g_x_puz_view = 0; }
+        else                          { g_x_top = 2; g_x_kn_view = 0; g_x_kn_cat = ""; }
+        ptt_flash(c.arg == XI_OPEN_PUZZLES ? "Puzzles" : "Knowledge", 900);
+        return;
+    }
+    if (!g_xander_active && c.arg == XI_HOME_EXIT) {
+        ptt_flash("Already home", 900);
+        return;
+    }
+
+    if (c.kind == PTT_APP) {
+        // Same lookup the app grid uses: /WATCH/bin on the card is the truth,
+        // whatever spelling the file arrived with (see app_resolve).
+        int idx = app_resolve(c.bin);
+        if (idx < 0) {
+            USBSerial.printf("[ptt] %s not found under %s\n", c.bin, apps_dir().c_str());
+            ptt_flash(String(c.bin) + " is not in /WATCH/bin");
+            return;
+        }
+        USBSerial.printf("[ptt] launch %s <- %s\n", c.bin, g_apps[idx].path.c_str());
+        ptt_flash(String("Opening ") + c.bin, 900);
+        load_app_from_sd(g_apps[idx]);   // OTA-copies + reboots; does not return
+        return;
+    }
+
+    USBSerial.printf("[ptt] intent %d (%s)\n", (int)c.arg, c.phrase);
+    ptt_flash(String("\"") + c.phrase + "\"", 900);
+    x_do((int)c.arg);                   // some of these block (sync) or reboot
+    if (g_x_last.length()) ptt_flash(g_x_last);
+}
+
+// Called every loop(); owns the whole toggle lifecycle.
+static void ptt_service() {
+    const uint32_t now  = millis();
+    const bool     down = (digitalRead(PTT_PIN) == LOW);
+
+    // Engine bring-up in flight (ptt_start_poll).  Report the outcome the
+    // moment the task says so; nothing here blocks, so the panel keeps painting
+    // and a failed start is a message on the overlay instead of a frozen frame.
+    // Polled before the toggle check: a session must always be finalised, even
+    // if the button is switched off while the engine is still coming up.
+    if (g_pttBring) {
+        const int st = ptt_start_poll(g_pttBringAuto);
+        if (st == 1)     ptt_flash("LISTENING - speak now", 60000);
+        else if (st < 0) ptt_flash(g_pttErr ? g_pttErr : "Voice unavailable", 2200);
+        if (g_pttBring) return;                 // still coming up
+    }
+
+    // Settings > BOOT to Talk off: the button is not ours, so no session, no
+    // "Opening mic..." overlay, nothing.  The press is swallowed (and re-armed
+    // on release) so flipping the toggle back on cannot inherit a stale press.
+    if (!g_x_bootmic) {
+        if (g_pttListening && !g_pttAuto) ptt_stop();
+        g_pttArmed = down;
+        if (g_pttHideAt && now >= g_pttHideAt) {
+            g_pttHideAt = 0;
+            if (g_pttBox) lv_obj_add_flag(g_pttBox, LV_OBJ_FLAG_HIDDEN);
+        }
+        return;
+    }
+
+    // MultiNet's window closed (esp32-hal-sr.c: 5760 ms, then SR_MODE_OFF).
+    // For a button press that is the end of the session: whatever was matched
+    // inside the window runs now, and a press that heard nothing just ends.
+    // Re-arming is gone on purpose -- a second window would only listen to a
+    // room the speaker already stopped talking into.
+    if (g_pttListening && g_pttMnExpiredAt) {
+        if (now - g_pttMnExpiredAt < 30) return;      // let the SR task settle
+        g_pttMnExpiredAt = 0;
+        if (!g_pttAuto) {
+            USBSerial.printf("[ptt] window closed after %lums\n",
+                             (unsigned long)(now - g_pttStartMs));
+            ptt_run(ptt_stop());
+            g_pttArmed = down;
+            return;
+        }
+        // Always-on: the gate is 7 s, so renew once to keep it audible to the
+        // end.  aon_service() closes the session when the gate expires.
+        if (++g_pttMnRearms <= 1) {
+            ESP_SR.setMode(SR_MODE_COMMAND);
+            USBSerial.println("[aon] command window renewed (1 of 1)");
+        }
+    }
+
+    // Backstop: the engine never reached a verdict (dead mic, stalled feed), so
+    // nothing would ever close the mic.  End the session and run the match.
+    if (g_pttListening && !g_pttAuto && (now - g_pttStartMs > PTT_MAX_SESSION_MS)) {
+        ptt_run(ptt_stop());
+        g_pttArmed = down;
+        return;
+    }
+
+    if (g_pttListening) {
+        // No screen-off mid-session -- including an always-on window, which can
+        // sit open for the 7 s gate after being triggered on a dark screen.
+        lastTouchMs = now;
+    }
+    if (g_pttListening && !g_pttAuto) {
+        // A match ends the listening itself: ESP_SR puts the engine in
+        // SR_MODE_OFF the instant it detects one (esp32-hal-sr.c,
+        // ESP_MN_STATE_DETECTED), so there is nothing left to listen to.  Paint
+        // what was heard for a beat -- long enough to read it, and to see a
+        // mis-match -- then run it.  No second press, no waiting out the window.
+        if (g_pttHit > 0) {
+            if (!g_pttHitMs) {
+                g_pttHitMs    = now;
+                g_pttShownHit = g_pttHit;
+                String heard = String("HEARD: \"") + kPtt[g_pttHit - 1].phrase + "\"";
+                ptt_flash(heard, 60000);
+                USBSerial.printf("[ptt] matched \"%s\"\n", kPtt[g_pttHit - 1].phrase);
+            }
+            if (now - g_pttHitMs >= PTT_RUN_DELAY_MS) {
+                ptt_run(ptt_stop());
+                g_pttArmed = down;
+                return;
+            }
+        }
+    }
+
+    if (down) {
+        if (g_pttArmed) return;                 // this press is already handled
+        // BOOT is the voice button, so a press from a dark screen serves both
+        // halves of the request: light the panel, then open the window.  This
+        // press used to be handed to the wake path alone, which is how a
+        // session could run with its overlay invisible on a black screen.
+        if (screenIsOff) screen_on();
+        delay(PTT_DEBOUNCE_MS);
+        if (digitalRead(PTT_PIN) != LOW) return;    // bounce
+        g_pttArmed = true;
+
+        // Hands-free session: a press is "listen now", not "stop".  It opens
+        // the same gate the wake phrase opens, so BOOT stays useful when the
+        // wake word is missed without tearing the engine down.
+        if (g_pttListening && g_pttAuto) {
+            g_aonWakeMs = millis();
+            ptt_flash("Yes?", 1200);
+            return;
+        }
+
+        if (g_pttListening) {
+            ptt_run(ptt_stop());                // optional: finish the window now
+        } else {
+            // The detector may be holding the mic; release it before ESP_SR
+            // opens its own, or I2S comes up already claimed.
+            aon_wake_disarm(true);
+            // Paint before the bring-up so the press feels acknowledged
+            // immediately; the rest of it lands on later loop passes, which is
+            // what keeps the panel alive if sr_start() misbehaves.
+            ptt_flash("Opening mic...", 1200);
+            const int st = ptt_start_poll(false);
+            if (st == 1)     ptt_flash("LISTENING - speak now", 60000);
+            else if (st < 0) ptt_flash(g_pttErr ? g_pttErr : "Voice unavailable", 2200);
+            // st == 0: the poll at the top of ptt_service finishes the job.
+        }
+        return;
+    }
+
+    // ---- released: re-arm for the next press, retire the overlay ----------
+    g_pttArmed = false;
+    if (g_pttHideAt && now >= g_pttHideAt) {
+        g_pttHideAt = 0;
+        if (g_pttBox) lv_obj_add_flag(g_pttBox, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// Resolved in ptt_init() (before the detector task exists) so a model without a
+// "Xander" class can be reported at boot instead of failing silently later.
+static int g_wakeLabel = -1;
+
+static void ptt_init() {
+    pinMode(PTT_PIN, INPUT_PULLUP);
+    for (int i = 0; i < PTT_N; i++) {
+        g_pttCmds[i].command_id = i + 1;
+        snprintf(g_pttCmds[i].str, sizeof(g_pttCmds[i].str), "%s", kPtt[i].phrase);
+        USBSerial.printf("[ptt]  %2d  %s\n", i + 1, kPtt[i].phrase);
+    }
+    // Resolve the EI class by NAME: a re-export can reorder the 10 classes and
+    // index 5 would then be a different word.
+    g_wakeLabel = -1;
+    for (int i = 0; i < EI_CLASSIFIER_LABEL_COUNT; i++) {
+        if (strcmp(ei_classifier_inferencing_categories[i], "Xander") == 0) {
+            g_wakeLabel = i;
+            break;
+        }
+    }
+    USBSerial.printf("[aon] EI detector: class 'Xander' %s (index %d of %d)\n",
+                     g_wakeLabel >= 0 ? "found" : "MISSING", g_wakeLabel,
+                     EI_CLASSIFIER_LABEL_COUNT);
+
+    g_pttReady  = true;
+    g_pttUsable = ptt_model_ok();
+    if (!g_pttUsable) g_pttErr = "No voice model";
+    if (g_pttUsable)
+        USBSerial.printf("[ptt] press BOOT to talk (%d phrases) - button %s\n",
+                         PTT_N, g_x_bootmic ? "enabled" : "DISABLED in settings");
+    USBSerial.printf("[aon] always-on %s\n",
+                     !g_x_alwayson ? "off" : (g_pttUsable ? "armed" : "requested but unavailable"));
+}
+
+// ============================================================================
+//  ALWAYS-ON  (settings > Always-On Xander)
+// ============================================================================
+// Two stages, both inside this sketch:
+//
+//   STAGE 1  the Edge Impulse "WATCH" model scores 250 ms slices and opens the
+//            gate when class "Xander" >= AON_WAKE_THRESHOLD on two consecutive
+//            slices.  This is the part MultiNet cannot do: "Xander" is out of
+//            vocabulary, so letter-to-sound rules mangle it.
+//   STAGE 2  ESP_SR MultiNet hears the command inside AON_GATE_MS and runs it
+//            exactly as a button session would, then hands the mic back.
+//
+// Why a task: one detector slice costs ~250 ms of capture plus inference, and
+// spending that inside loop() would stall LVGL for a third of a second at a
+// time -- swipes and card taps would stutter.  Stage 1 therefore runs on core 0
+// while the UI keeps core 1.  Only one owner has the I2S bus at a time: the
+// task closes it and parks before ESP_SR (or a button session) opens its own.
+//
+// Cost, stated plainly: while armed the mic and the detector stay powered, so
+// the battery falls noticeably faster than push-to-talk.  The Battery Limit
+// dropdown stops it, and stopping releases I2S completely.
+
+#define AON_WAKE_THRESHOLD 0.70f   // class confidence for "Xander"
+#define AON_WAKE_CONFIRM   2       // consecutive slices above it
+
+static I2SClass         g_wakeI2S;
+static TaskHandle_t     g_wakeTask    = nullptr;
+static volatile bool    g_wakeWanted  = false;  // main asks the task to listen
+static volatile bool    g_wakeBusOpen = false;  // the task holds the I2S bus
+static volatile bool    g_wakeParked  = true;   // bus released, task idle
+static volatile bool    g_wakeHit     = false;  // "Xander" confirmed
+static volatile uint8_t g_wakeErr     = 0;      // 1 = I2S, 2 = inference, 3 = mic codec
+// v1.3-voice RAM fix: this used to be `static int16_t g_wakeSlice[N]` -- 8 KB
+// (EI_CLASSIFIER_SLICE_SIZE samples) of internal DRAM reserved for the whole
+// boot whether or not Always-On was switched on.  Voice (AFE + MultiNet) needs
+// one big contiguous internal block, so those 8 KB are worth more as heap.
+// The task allocates the slice when it opens the mic and frees it when it
+// parks, in PSRAM when there is any.
+static int16_t         *g_wakeSlice  = nullptr;
+
+// The SDK's signal adapter: offset/length are int16 samples from g_wakeSlice.
+static int aon_ei_get_data(size_t offset, size_t length, float *out_ptr) {
+    return numpy::int16_to_float(g_wakeSlice + offset, out_ptr, length);
+}
+
+// Fill one 250 ms slice.  Runs on the wake task only; the stall timeout keeps a
+// dead I2S from wedging the detector forever.
+static bool aon_capture_slice(size_t samples) {
+    if (!g_wakeSlice) return false;
+    size_t got = 0;
+    uint32_t last = millis();
+    while (got < samples) {
+        if (!g_wakeWanted) return false;            // asked to release
+        size_t want = samples - got;
+        if (want > 512) want = 512;
+        const size_t bytes = g_wakeI2S.readBytes((char *)(g_wakeSlice + got),
+                                                 want * sizeof(int16_t));
+        if (bytes == 0) {
+            if (millis() - last > 400) return false;
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
+        }
+        got += bytes / sizeof(int16_t);
+        last = millis();
+    }
+    return true;
+}
+
+static void aon_wake_task(void *) {
+    int  hits   = 0;
+    bool inited = false;
+
+    for (;;) {
+        if (!g_wakeWanted) {
+            if (g_wakeBusOpen) {
+                g_wakeI2S.end();                    // hand the bus back
+                g_wakeBusOpen = false;
+                inited = false;
+            }
+            if (g_wakeSlice) {                      // parked == slice buffer released
+                heap_caps_free(g_wakeSlice);
+                g_wakeSlice = nullptr;
+            }
+            g_wakeParked = true;
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            continue;
+        }
+
+        if (!g_wakeSlice) {
+            g_wakeSlice = (int16_t *)heap_caps_malloc(
+                EI_CLASSIFIER_SLICE_SIZE * sizeof(int16_t),
+                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!g_wakeSlice)
+                g_wakeSlice = (int16_t *)heap_caps_malloc(
+                    EI_CLASSIFIER_SLICE_SIZE * sizeof(int16_t),
+                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            if (!g_wakeSlice) {
+                USBSerial.println("[aon] cannot allocate the detector slice "
+                                  "- always-on stays off");
+                g_wakeErr    = 2;
+                g_wakeWanted = false;
+                vTaskDelay(pdMS_TO_TICKS(200));
+                continue;
+            }
+        }
+
+        if (!g_wakeBusOpen) {
+            g_wakeI2S.setPins(PTT_I2S_BCLK_PIN, PTT_I2S_WS_PIN, -1,
+                              PTT_I2S_DIN_PIN, PTT_I2S_MCLK_PIN);
+            g_wakeI2S.setTimeout(500);
+            if (!g_wakeI2S.begin(I2S_MODE_STD, 16000, I2S_DATA_BIT_WIDTH_16BIT,
+                                 I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT)) {
+                g_wakeErr = 1;
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            if (!es7210_start()) {          // clocks are up, wake the ADC
+                g_wakeErr = 3;
+                g_wakeI2S.end();
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            g_wakeBusOpen = true;
+            g_wakeParked  = false;
+        }
+        if (!inited) {
+            run_classifier_init();              // fresh window after a handover
+            hits   = 0;
+            inited = true;
+        }
+
+        if (!aon_capture_slice(EI_CLASSIFIER_SLICE_SIZE)) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        signal_t signal     = {};
+        signal.total_length = EI_CLASSIFIER_SLICE_SIZE;
+        signal.get_data     = &aon_ei_get_data;
+
+        ei_impulse_result_t result = {};
+        if (run_classifier_continuous(&signal, &result, false, false) != EI_IMPULSE_OK) {
+            g_wakeErr = 2;
+            run_classifier_init();
+            hits = 0;
+            continue;
+        }
+        if (g_wakeLabel < 0) continue;
+
+        const float score = result.classification[g_wakeLabel].value;
+        hits = (score >= AON_WAKE_THRESHOLD) ? hits + 1 : 0;
+        if (hits >= AON_WAKE_CONFIRM) {
+            g_wakeHit    = true;
+            g_wakeWanted = false;   // next pass closes the bus and parks
+        }
+    }
+}
+
+static void aon_wake_arm() {
+    if (!g_x_alwayson || !g_pttReady || !g_pttUsable) return;
+    if (g_wakeLabel < 0) return;                    // no "Xander" class in model
+    if (!g_wakeTask) {
+        if (xTaskCreatePinnedToCore(aon_wake_task, "aon_wake", 8192, nullptr,
+                                    1, &g_wakeTask, 0) != pdPASS) {
+            g_wakeTask = nullptr;
+            USBSerial.println("[aon] cannot create the wake task");
+            return;
+        }
+    }
+    if (!g_wakeWanted) {
+        g_wakeHit    = false;
+        g_wakeWanted = true;
+        if (g_wakeParked) xTaskNotifyGive(g_wakeTask);
+        USBSerial.println("[aon] EI wake armed - say \"Xander\"");
+    }
+}
+
+// Release the mic for a button session or the mic test.  wait=true spins
+// briefly so the caller can open I2S immediately afterwards without racing
+// the detector for the peripheral.
+static void aon_wake_disarm(bool wait) {
+    if (!g_wakeTask) return;
+    g_wakeWanted = false;
+    g_wakeHit    = false;
+    if (g_wakeParked) return;
+    xTaskNotifyGive(g_wakeTask);                    // nudge it out of a wait
+    if (!wait) return;
+    for (int i = 0; i < 250 && !g_wakeParked; i++) delay(2);
+}
+
+static int aon_batt_floor() {
+    switch (g_x_battlim) {          // dropdown order: 20%, 30%, 40%, Never
+        case 0:  return 20;
+        case 1:  return 30;
+        case 2:  return 40;
+        default: return 0;          // Never
+    }
+}
+
+static bool aon_battery_low() {
+    const int floor_pct = aon_batt_floor();
+    return floor_pct > 0 && g_batt_pct >= 0 && g_batt_pct <= floor_pct;
+}
+
+static void aon_stop(const char *why) {
+    if (!g_pttListening || !g_pttAuto) return;
+    ptt_stop();                     // discards whatever was half-heard
+    USBSerial.printf("[aon] stopped (%s)\n", why);
+}
+
+static void aon_restart() {
+    if (!g_x_alwayson) {
+        aon_stop("toggle off");
+        aon_wake_disarm(true);
+        return;
+    }
+    if (!g_pttReady || !g_pttUsable) return;
+    if (g_pttListening || g_pttBring) return;   // a session (or its bring-up) is running
+    aon_wake_arm();
+}
+
+// Called every loop(), right after ptt_service().
+static void aon_service() {
+    // A listening wake word cannot survive deep sleep, so the power manager
+    // refuses to park the SoC while Always-On Xander is asked for.  Set here,
+    // above every early return, so the flag always describes this pass.
+    g_pmVoiceArmed = g_x_alwayson;
+    if (!g_x_alwayson) {
+        aon_stop("off");
+        aon_wake_disarm(false);
+        return;
+    }
+    if (!g_pttReady || !g_pttUsable) return;    // no model, or disabled this boot
+
+    if (aon_battery_low()) {
+        aon_stop("battery limit");
+        aon_wake_disarm(false);
+        return;
+    }
+
+    // A button session -- or its bring-up -- owns the mic; the detector stays
+    // parked until it ends.  A bring-up is polled here as well: ptt_service()
+    // cannot be relied on (the button may be disabled in settings), and a
+    // wake-word session has to be finalised by somebody.
+    if (g_pttBring) {
+        aon_wake_disarm(false);
+        if (ptt_start_poll(g_pttBringAuto) < 0 && g_x_alwayson && g_pttUsable)
+            aon_wake_arm();
+        return;
+    }
+    if (g_pttListening && !g_pttAuto) { aon_wake_disarm(false); return; }
+
+    if (g_wakeErr) {
+        USBSerial.printf("[aon] detector problem (%s)\n",
+                         g_wakeErr == 1 ? "I2S would not open"
+                                        : (g_wakeErr == 3 ? "ES7210 mic codec did not start"
+                                                          : "inference failed"));
+        g_wakeErr = 0;
+    }
+
+    if (!g_pttListening) {
+        if (g_wakeHit) {
+            if (!g_wakeParked) return;          // bus still closing; next loop
+            g_wakeHit   = false;
+            g_aonWakeMs = millis();
+            USBSerial.println("[aon] wake accepted (edge impulse)");
+            ptt_flash("Yes?", 1200);
+            const int st = ptt_start_poll(true);
+            if (st < 0) {
+                USBSerial.printf("[aon] command window failed (%s)\n",
+                                 g_pttErr ? g_pttErr : "unknown");
+                aon_wake_arm();                 // straight back to listening
+            }
+            return;
+        }
+        aon_wake_arm();
+        return;
+    }
+
+    if (!g_pttAuto) return;                     // a button session is in charge
+
+    const int hit = g_pttHit;
+    if (hit > 0 && hit <= PTT_N) {
+        g_pttHit      = 0;
+        g_pttShownHit = -1;
+
+        // MultiNet may also hear "xander"; that only refreshes the gate.
+        if (kPtt[hit - 1].kind == PTT_WAKE) { ptt_run(hit); return; }
+
+        const int id = ptt_stop();              // closes the window, frees I2S
+        ptt_run(id);                            // may reboot (app) or block (sync)
+        if (g_x_alwayson && g_pttUsable) aon_wake_arm();
+        return;
+    }
+
+    // Nothing heard: close the window and hand the mic back to the detector
+    // instead of leaving MultiNet listening to the room.
+    if (!g_aonWakeMs || millis() - g_aonWakeMs > AON_GATE_MS) {
+        aon_stop("gate expired");
+        aon_wake_arm();
+    }
+}
+
+// One-second level check, reachable from Xander > settings > Test Microphone.
+// Opens the exact I2S path ESP_SR uses, so a healthy number here means the
+// wiring is right and any remaining problem is the phrase model, not the mic.
+//   -20..-12 dBFS  speaking near the watch
+//   -60..-40 dBFS  quiet room with a working mic
+//   -90 or "no data"  nothing arriving (wiring / power / slot select)
+static void ptt_mictest() {
+    if (g_pttListening || g_pttBring) { ptt_flash("Already listening", 1200); return; }
+
+    aon_wake_disarm(true);          // the detector must let go of the mic first
+    ptt_flash("Mic test: stay quiet", 700);
+    g_pttI2S.setPins(PTT_I2S_BCLK_PIN, PTT_I2S_WS_PIN, -1,
+                     PTT_I2S_DIN_PIN, PTT_I2S_MCLK_PIN);
+    g_pttI2S.setTimeout(500);
+    if (!g_pttI2S.begin(I2S_MODE_STD, 16000, I2S_DATA_BIT_WIDTH_16BIT,
+                        I2S_SLOT_MODE_MONO, I2S_STD_SLOT_LEFT)) {
+        USBSerial.println("[mic] I2S would not open");
+        ptt_flash("Mic did not start", 2200);
+        return;
+    }
+    if (!es7210_start()) {
+        g_pttI2S.end();
+        ptt_flash("No ES7210 mic", 2400);
+        return;
+    }
+
+    static int16_t buf[512];
+    uint32_t n = 0;
+    int64_t  sum = 0;
+    int32_t  peak = 0;
+    double   sq = 0.0;
+    const uint32_t t0 = millis();
+
+    while (n < 16000 && (millis() - t0) < 3000) {
+        size_t bytes = g_pttI2S.readBytes(reinterpret_cast<char *>(buf), sizeof(buf));
+        if (bytes == 0) { delay(2); continue; }
+        const size_t got = bytes / sizeof(int16_t);
+        for (size_t i = 0; i < got; i++) {
+            const int32_t v = buf[i];
+            sum += v;
+            if (abs(v) > peak) peak = abs(v);
+            sq += (double)v * (double)v;
+        }
+        n += got;
+    }
+    g_pttI2S.end();
+
+    if (n < 1600) {
+        USBSerial.printf("[mic] no data (only %lu samples in %lums)\n",
+                         (unsigned long)n, (unsigned long)(millis() - t0));
+        ptt_flash("No mic data on DIN 42", 2400);
+        return;
+    }
+
+    const double dc     = (double)sum / (double)n;
+    const double meanSq = sq / (double)n;
+    const double acVar  = meanSq - dc * dc;
+    const double rms    = sqrt(acVar > 0 ? acVar : 0);
+    const double dbfs   = (rms > 0.5) ? 20.0 * log10(rms / 32768.0) : -99.0;
+
+    USBSerial.printf("[mic] %lu samples  dc %.1f  rms %.1f (%.1f dBFS)  peak %ld\n",
+                     (unsigned long)n, dc, rms, dbfs, (long)peak);
+    if (dbfs <= -90.0)
+        USBSerial.println("[mic] silent: ES7210 answered but SDOUT is flat - "
+                          "MCLK (16) or DIN (42) not reaching the codec");
+    else if (dbfs < -55.0)
+        USBSerial.println("[mic] very quiet - usable, but speak close for MultiNet");
+    else
+        USBSerial.println("[mic] level looks healthy");
+
+    char msg[48];
+    snprintf(msg, sizeof(msg), "Mic %.0f dBFS  peak %ld", dbfs, (long)peak);
+    ptt_flash(msg, 4000);
+}
+
 void setup() {
     USBSerial.begin(115200);
 
@@ -4607,12 +8023,30 @@ void setup() {
     bool from_deep_sleep =
         (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1);
 
-    USBSerial.printf("\n=== LauncherOS v7.0 (merged: themes + card settings + styles + carousel loader) ===  %s\n",
+    USBSerial.printf("\n=== LauncherOS v7.0-ramfix (merged: themes + card settings + styles + carousel loader) ===  %s\n",
                      from_deep_sleep ? "(wake from deep sleep)" : "(cold boot)");
+    // Build stamp + the two numbers that decide whether voice can start.
+    // If this line is missing from the monitor, the image on the watch is not
+    // this source -- re-upload before drawing conclusions about RAM.
+    USBSerial.printf("[boot] built %s %s\n", __DATE__, __TIME__);
+    USBSerial.printf("[boot] psram %s (size %u B, free %u B)  internal free %u B, largest %u B\n",
+                     ESP.getPsramSize() ? "OK" : "** MISSING **",
+                     (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram(),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    if (!ESP.getPsramSize())
+        USBSerial.println("[boot] ** PSRAM not detected: Tools > PSRAM = OPI PSRAM "
+                          "(QSPI on modules with quad PSRAM), Flash Size = 16MB. "
+                          "Without it the 49 KB draw buffer and the LVGL pool fall "
+                          "back into internal RAM and voice cannot start. **");
     // v7.0: pull persisted preferences BEFORE we build any screen so the
     // very first paint uses the right theme + launcher style.
     theme_load_from_nvs();
     launcher_style_load_from_nvs();
+    // v1.6: power settings must exist before build_screen_settings() seeds the
+    // profile / timeout / night rows (pm_init() arms the runtime later, once
+    // the panel and PMU are up).
+    pm_load();
     // v6.0: re-anchor the bootloader on ourselves so any loaded app that
     // reboots (intentionally, via crash, or via power-cycle) comes back
     // to LauncherOS instead of into the last-flashed OTA slot.
@@ -4655,6 +8089,11 @@ void setup() {
                              // transaction to ~1/4 the time, letting the
                              // CPU return to idle (or light sleep) sooner.
 
+    // Which audio codecs answer on this bus.  The mic is an ES7210 (capture)
+    // and the speaker an ES8311 (output); both must be present for voice, and
+    // a missing ES7210 is the one failure that shows up as "-99 dBFS".
+    mic_probe_report();
+
     // Touch controller reset pulse
     pinMode(TP_RESET, OUTPUT);
     digitalWrite(TP_RESET, LOW);
@@ -4673,11 +8112,31 @@ void setup() {
     favs_load();
 
     lv_init();
-    // LVGL 8.4 partial draw buffer: 60-line RGB565 strip (lv_color_t units).
-    size_t bufPx = LCD_WIDTH * 60;
+    // LVGL 8.4 partial draw buffer: a 60-line RGB565 strip (lv_color_t units).
+    // v1.3-voice: this 49,200 B strip comes from PSRAM.  Only the flush callback
+    // touches it, and the S3's SPI DMA reads PSRAM directly, so the cost is
+    // bandwidth instead of a refused PTT.
+    //
+    // If there is no PSRAM (wrong Tools > PSRAM setting, or a module without
+    // it) the 60-line strip is 49 KB of the internal RAM voice needs.  In that
+    // case fall back to a 12-line strip -- 9.8 KB, still one strip per flush,
+    // just more flushes -- instead of taking the 49 KB out of the voice budget.
+    size_t lines = ESP.getPsramSize() ? 60 : 12;
+    size_t bufPx = LCD_WIDTH * lines;
+    const char *bufWhere = "PSRAM";
     lvgl_buf = (lv_color_t *)heap_caps_malloc(bufPx*sizeof(lv_color_t),
-                                              MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+                                              MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    if (!lvgl_buf) {
+        lines  = 12;                     // PSRAM refused it: shrink before retry
+        bufPx  = LCD_WIDTH * lines;
+        bufWhere = "internal (no PSRAM!)";
+        lvgl_buf = (lv_color_t *)heap_caps_malloc(bufPx*sizeof(lv_color_t),
+                                                  MALLOC_CAP_INTERNAL|MALLOC_CAP_8BIT);
+    }
     if (!lvgl_buf) lvgl_buf = (lv_color_t *)heap_caps_malloc(bufPx*sizeof(lv_color_t), MALLOC_CAP_8BIT);
+    USBSerial.printf("[lcd] draw buffer %u lines, %u B in %s\n",
+                     (unsigned)lines, (unsigned)(bufPx * sizeof(lv_color_t)), bufWhere);
+    ptt_heap("lvgl ready");          // internal headroom voice will start from
     lv_disp_draw_buf_init(&draw_buf, lvgl_buf, NULL, bufPx);
 
     lv_disp_drv_init(&disp_drv);
@@ -4692,13 +8151,25 @@ void setup() {
     indev_drv.read_cb = my_touchpad_read;
     lv_indev_drv_register(&indev_drv);
 
+    // v1.1: restore the persisted panel level + clock format before the first
+    // bright frame, so a user who dimmed the watch is not flash-banged on boot.
+    {
+        g_prefs.begin("dcw", true);
+        int  b     = g_prefs.getInt("bright", DEFAULT_BRIGHTNESS);
+        g_time_24h = g_prefs.getBool("t24", false);
+        g_prefs.end();
+        if (b < 20)  b = 20;
+        if (b > 255) b = 255;
+        g_brightness_target = (uint8_t)b;
+    }
     build_splash();
     lv_timer_handler();                      // render the first splash frame
-    fade_brightness(DEFAULT_BRIGHTNESS, 260); // soft fade-up out of power-on black
+    fade_brightness(g_brightness_target, 260); // soft fade-up out of power-on black
     splash_progress(10, "init display");
     splash_progress(25, "mounting SD");
     SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_DATA);
     bool sd_ok = SD_MMC.begin("/sdcard", true);
+    g_sd_ok = sd_ok;
     if (sd_ok) {
         splash_progress(40, "wifi config");      parse_wifi_config();
         time_apply_tz(g_gmt_offset_sec);
@@ -4712,6 +8183,8 @@ void setup() {
             splash_progress(55, "connecting wifi");
             wifi_connect_and_sync();
         }
+        splash_progress(74, "voice model");
+        sd_provision_model();                     // runs only when 0x910000 is blank
         splash_progress(82, "scanning apps");    scan_apps();
         splash_progress(88, "categories");       load_categories_txt();
         splash_progress(92, "scanning photos");  scan_photos();
@@ -4744,12 +8217,16 @@ void setup() {
     lv_scr_load_anim(screens[SCREEN_FACE], LV_SCR_LOAD_ANIM_FADE_ON, 260, 0, false);
     lastTouchMs = millis();
 
-#if POWER_SAVE
-    // Drop the CPU to 80 MHz now that boot/WiFi/SD are done.  Plenty fast
-    // for LVGL on this panel.  Bumped back up to 240 only during OTA copy.
-    setCpuFrequencyMhz(CPU_FREQ_IDLE_MHZ);
-    USBSerial.printf("[pm] CPU @ %d MHz\n", CPU_FREQ_IDLE_MHZ);
-#endif
+    // v1.2: build the push-to-talk phrase table and probe the model partition.
+    // Safe to do after the UI exists -- ptt_init() only touches GPIO + NVS-free
+    // state, and reports a missing model instead of failing the boot.
+    ptt_init();
+
+    // v1.6: hand every power decision to the manager.  It applies the
+    // profile's awake clock now that boot/WiFi/SD are done (80 MHz on Balanced
+    // and Power Saver, 240 only on Performance) and adopts the panel level the
+    // splash already faded up to.
+    pm_init();
 }
 
 // ============================================================================
@@ -4771,6 +8248,15 @@ void loop() {
     // back into the splash screen every time it dimmed.
     lvgl_pump();
 
+    // v1.2: push-to-talk.  Hold BOOT to open the mic, release to run what was
+    // heard.  Runs before the swipe/PSU logic so a held button is never treated
+    // as a touch or a screen toggle.
+    ptt_service();
+
+    // v1.5: always-on.  Runs after ptt_service() so a button press is handled
+    // first, and reopens the mic automatically after every executed phrase.
+    aon_service();
+
     // Consume any queued swipe (set by my_touchpad_read on release).
     if (!screenIsOff && g_pending_swipe != SWIPE_NONE) {
         SwipeEvent ev = g_pending_swipe;
@@ -4784,6 +8270,13 @@ void loop() {
         // normal launcher screens the original horizontal nav is untouched.
         if (g_xander_active) {
             xander_handle_swipe(ev);
+        } else if (time_card_is_open()) {
+            // The manual-clock card is modal: it owns every gesture.  Swiping
+            // down is the second way out of it (Cancel is the first), which
+            // keeps it consistent with how Xander is dismissed.
+            if (ev == SWIPE_DOWN) time_card_close(true);
+        } else if (current_screen == SCREEN_BATTERY && ev == SWIPE_UP) {
+            time_card_open();
         } else if (current_screen == SCREEN_FACE && ev == SWIPE_UP) {
             xander_enter();
         } else if (ev == SWIPE_LEFT || ev == SWIPE_RIGHT) {
@@ -4842,17 +8335,27 @@ void loop() {
             if (current_screen == SCREEN_BATTERY) update_battery_screen();
         }
     }
-    // 3s/15s tick - refresh battery readings (PMU).  Battery % barely
+    // 5s/15s tick - refresh battery readings (PMU).  Battery % barely
     // moves in 3 s on a real pack, but it climbs visibly while charging,
     // so we poll fast (5 s) when on USB and slow (15 s) on battery.
     // Each PMU read is an I2C round-trip, so this alone removes ~270
     // CPU wakeups per hour while idle.
+    //
+    // v1.8: a dark panel keeps sampling, just slowly.  Before this, every
+    // battery rule -- the low/critical latch, cell protection, charging
+    // detection -- was dead whenever the screen was off, which is the state a
+    // watch spends most of its life in: a pack could sit at 5 % all night
+    // without the protection ever arming, and plugging in went unnoticed
+    // until the next tap.  One I2C read per 5 min is invisible next to the
+    // 250 ms light-sleep tick that is already running.
     static uint32_t tB = 0;
-    uint32_t batt_period = g_charging ? 5000U : 15000U;
+    uint32_t batt_period = screenIsOff ? PM_DARK_SAMPLE_MS
+                                       : (g_charging ? 5000U : 15000U);
     if (now - tB > batt_period) {
         tB = now;
+        pmu_refresh();
+        pm_note_battery(now);              // v1.6: freshness for the battery policy
         if (!screenIsOff) {
-            pmu_refresh();
             if (current_screen == SCREEN_FACE)    update_face_battery();
             if (current_screen == SCREEN_BATTERY) update_battery_screen();
         }
@@ -4865,34 +8368,17 @@ void loop() {
         time_save_now("periodic");
     }
 
-    // Screen-off countdown (v5.13 -- hysteresis-backed).
-    //   Now that my_touchpad_read uses release hysteresis (3 consecutive
-    //   fingers=0 reads required before declaring release), `touchActive`
-    //   is reliable on its own.  Two keep-alive layers remain:
-    //     1. touchActive          -- finger is genuinely on the panel
-    //     2. WAKE_GRACE_MS window -- 2 s after every screen_on(),
-    //        the auto-timeout cannot fire (prevents wake -> immediately
-    //        re-sleep race conditions).
-    //   The old TP_INT level check was dropped because that line PULSES
-    //   low on each new-data interrupt rather than staying low while a
-    //   finger is down -- it was a misleading signal here.
-    //   For the screen-off WAKE path we still use digitalRead(TP_INT):
-    //   we only need to catch the pulse moment to know "user just
-    //   touched the panel", which is exactly what TP_INT gives us.
-    bool in_wake_grace = (now - lastWakeMs < WAKE_GRACE_MS);
-    if (touchActive || in_wake_grace) {
-        lastTouchMs = now;
-    }
-    if (!screenIsOff && (now - lastTouchMs > SCREEN_OFF_TIMEOUT_MS)) {
-        screen_off();
-    } else if (screenIsOff && digitalRead(TP_INT) == LOW) {
-        lastTouchMs = now;                          // wake-tap resets the countdown
-        screen_on();
-    }
+    // v1.6: the power manager owns the screen-off countdown, the wake tap and
+    // every brightness / CPU / battery decision.  It reads exactly the same
+    // signals this loop used before (touchActive, the post-wake grace, a
+    // command hold) so the v5.13 hysteresis behaviour is preserved intact --
+    // see pm_service() for the state machine.
+    pm_service(now);
 
 #if POWER_SAVE
     // Periodic NTP re-sync (briefly turns WiFi back on, syncs, drops it).
-    if (!screenIsOff) wifi_resync_if_due();
+    // pm_wifi_allowed() already covers screen-off and a blocked radio.
+    if (pm_wifi_allowed()) wifi_resync_if_due();
 #endif
 
 #if POWER_SAVE && LIGHT_SLEEP_WHEN_OFF

@@ -26,9 +26,32 @@
 /*=========================
    MEMORY
  *=========================*/
-#define LV_MEM_CUSTOM       0
-#define LV_MEM_SIZE         (64U * 1024U)   /* 64 KB heap for LVGL objects */
+/* v1.3-voice: the LVGL object pool used to be a 64 KB static array in .bss,
+   i.e. 64 KB of internal DRAM that ESP-SR's AFE/MultiNet could never have.
+   That static block plus the 49 KB draw buffer is what pushed the biggest free
+   internal block below the 40 KB ptt_start() needs, producing the "Not enough
+   RAM" refusal.  With LV_MEM_CUSTOM 1 the pool is allocated at lv_init() time
+   through lv_pool_*(), which lives in LauncherOS.ino and prefers PSRAM while
+   still falling back to internal RAM if that ever fails.  LV_MEM_SIZE is then
+   unused (kept for reference only). */
+#define LV_MEM_CUSTOM       1
+#define LV_MEM_SIZE         (64U * 1024U)   /* only used when LV_MEM_CUSTOM 0 */
 #define LV_MEM_ADR          0
+
+#include <stddef.h>
+#ifdef __cplusplus
+extern "C" {
+#endif
+void *lv_pool_alloc(size_t size);
+void *lv_pool_realloc(void *ptr, size_t size);
+void  lv_pool_free(void *ptr);
+#ifdef __cplusplus
+}
+#endif
+
+#define LV_MEM_CUSTOM_ALLOC(size)        lv_pool_alloc(size)
+#define LV_MEM_CUSTOM_FREE(ptr)          lv_pool_free(ptr)
+#define LV_MEM_CUSTOM_REALLOC(ptr, size) lv_pool_realloc((ptr), (size))
 #define LV_MEM_BUF_MAX_NUM  16
 #define LV_MEMCPY_MEMSET_STD 0
 
