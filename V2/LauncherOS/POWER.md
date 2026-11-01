@@ -1,4 +1,4 @@
-# LauncherOS power management (v1.9)
+# LauncherOS power management (v2.1)
 
 Everything here lives inside `LauncherOS.ino`. No new files, tasks or libraries
 were added, and every new hardware call goes through objects the launcher
@@ -8,11 +8,11 @@ already owned (`gfx`, `g_pmu`, `g_prefs`, `FT3168`).
 
 | Section | Lines (approx) |
 | --- | --- |
-| State enum + profile types, before the first function | 380 |
-| Configuration constants, profile table, runtime state, settings | 645 |
-| Power manager implementation (state machine, brightness, CPU, battery, night, notices, diagnostics) | 3686 |
-| Settings rows | 4329 |
-| `setup()` / `loop()` integration | 7959 / 8176 |
+| State enum + profile types, before the first function | 389 |
+| Configuration constants, profile table, runtime state, settings | 680 |
+| Power manager implementation (state machine, brightness, CPU, battery, night, notices, diagnostics) | 3719 |
+| Settings rows | 4424 |
+| `setup()` / `loop()` integration | 8065 / 8282 |
 
 The Arduino builder injects generated prototypes before the first function
 definition, so any type used in a `static` function signature (`PmState`,
@@ -30,8 +30,12 @@ One state is active at a time. Highest priority wins:
 | `LOW_BATT` | on battery, ≤ 20 % | profile `low_bright` | black | active | blocked |
 | `NIGHT` | manual toggle, or 22:00–07:00 | profile `night_bright` | black | active | allowed |
 | `CHARGING` | AXP2101 reports charging | user level | shown | active | allowed |
-| `IDLE` | no activity for `idle_after_ms` | profile `idle_bright` | black | `cpu_idle` | allowed |
 | `ACTIVE` | anything else | user level | shown | `cpu_active` | allowed |
+
+`ACTIVE` covers the entire screen-on window: there is no auto-dim (v2.1, below).
+`PM_IDLE` still exists in the enum and the table still carries `idle_bright` /
+`cpu_idle` columns, but nothing enters it — the only brightness changes while
+the panel is lit come from `night`, `low`, `critical` or the user's slider.
 
 Order in `pm_desired_state()`: a dark screen outranks everything, the battery
 latches outrank night, and night outranks charging (so plugging in overnight
@@ -47,18 +51,37 @@ reason about a mode it cannot return from without a reboot.
 
 ## Profiles
 
-| Profile | idle | night | low | idle after | active | idle | off | WiFi |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Power Saver | 45 | 25 | 30 | 4 s | 80 MHz | 80 | 80 | no |
-| Balanced *(default)* | 70 | 35 | 40 | 5 s | 80 MHz | 80 | 80 | yes |
-| Performance | 100 | 50 | 50 | 8 s | 240 MHz | 160 | 80 | yes |
+| Profile | idle | night | low | active | idle | off | WiFi |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Power Saver | 45 | 25 | 30 | 240 MHz | 80 | 80 | no |
+| Balanced *(default)* | 70 | 35 | 40 | 240 MHz | 80 | 80 | yes |
+| Performance | 100 | 50 | 50 | 240 MHz | 160 | 80 | yes |
 
 Brightness caps are applied as `min(user_target, cap)`, so a watch dimmed to 60
-wakes and dims at 60 in every state — the user's level is always the ceiling.
+wakes at 60 in every state — the user's level is always the ceiling.
+
+### No auto-dim (v2.1)
+
+The profile table has no `idle_after_ms` column any more, and `pm_desired_state()`
+no longer has a branch that returns `IDLE`. A lit panel keeps the user's
+brightness for the entire screen-on window and goes straight to black at the
+timeout, which is what the pre-v1.6 firmware did.
+
+The dim was removed rather than retuned because it read as the watch falling
+asleep mid-use: the dim state also hides the wallpaper, so the panel dropped to
+a few glyphs on black and every glance ended there. Power Saver's 4 s value was
+the worst case, but a dim step in the middle of the window is wrong at any value.
+
+**Every profile now runs the SoC at 240 MHz while the panel is lit.** The 80 MHz
+active clock was the other half of the same complaint: LVGL and the QSPI flush
+both ride this core, so a 3× downclock is a 3× slower UI, and the panel (~145 mA)
+dwarfs the 10–15 mA the downclock saved. The clock still drops to 80 MHz once the
+panel is dark, and `screen_on()` restores 240 MHz *before* its repaint and fade,
+so a wake is never rendered at the sleep clock.
 
 ### Quiet face (v1.8)
 
-In `IDLE`, `NIGHT`, `LOW_BATT` and `CRITICAL` the wallpaper is not drawn: the
+In `NIGHT`, `LOW_BATT` and `CRITICAL` the wallpaper is not drawn: the
 clock sits on black. AMOLED emission is per pixel, so at an identical brightness
 level a full-screen photo draws several times the current of a few glyphs, and
 black pixels draw none. This is why the panel is 68 % of the bill — brightness
@@ -85,51 +108,61 @@ what it last painted and returns early when nothing moved. On an AMOLED the win
 is not the CPU cycles, it is the emission and the flush that the repaint would
 have cost.
 
-### Auto deep sleep (v1.9)
+### The dark phase (v2.0)
 
-After the profile's dark interval with no interaction, the SoC parks in deep
-sleep instead of light-sleeping in a 250 ms loop:
+The time after the panel goes black is split into two stages, and the split is
+what makes the watch usable rather than thrifty:
 
-| State | Draw | 10 h dark costs |
-| --- | --- | --- |
-| `SCREEN_OFF` (light sleep, 250 ms ticks) | ~3 mA | ~30 mAh |
-| Auto deep sleep | ~0.2 mA | ~2 mAh |
+| Stage | When | Draw | Wake cost |
+| --- | --- | --- | --- |
+| Light sleep | first `deep_after_ms` dark | ~3 mA | **instant** — one tap puts the same interface back, no boot |
+| Deep sleep | after that, still dark | ~0.2 mA | full reboot, only BOOT presses |
 
-The clock keeps running. `deep_sleep_now()` already pins
-`ESP_PD_DOMAIN_RTC_PERIPH` on, so the internal RTC keeps time across the sleep,
-`time_save_now()` snapshots it to NVS first, and `setup()` reconciles the two on
-the way back up — the watch wakes with the right time, offline.
+Ten hours of continuous darkness costs ~30 mAh in stage 1 and ~2 mAh in stage 2,
+which is the entire argument for crossing over.
 
-**What it costs: waking is a full reboot, and only BOOT does it.** `TP_INT` is
-GPIO38, which is not an RTC pad, so ext1 cannot watch the touch controller and the
-FT3168 cannot wake the chip — that is a board fact, not a choice here. So this
-mode is off in Performance, has an **Auto Sleep** switch in Settings, and is
-skipped whenever the watch is doing something: charging or sitting on USB
-(VBUS is read directly, because a full pack reports "not charging"), holding a
-screen for an app copy or a command, a WiFi scan, the ESP-SR bring-up — and
-whenever Always-On Xander is enabled, because a wake word cannot hear anything
-from deep sleep.
+**The clock is `g_pmDarkSince`, not the touch timer.** It is stamped in
+`screen_off()` and zeroed in `screen_on()`, so the interval means exactly what the
+Settings row says: *continuous* darkness. Any wake restarts it — a tap, the PWR
+button, a BOOT press, a voice command that holds the screen, or a battery alert
+that lights the panel on its own. Measuring from `lastTouchMs` instead (what v1.9
+did) let a non-touch wake shorten the window, because the touch clock and the
+dark clock are not the same clock.
+
+`pm_auto_deep()` refuses to cross over when it would be wrong: charging, or on
+USB with a full pack (VBUS is read from the PMIC directly, because a full battery
+reports "not charging" — a dock must not reboot itself every ten minutes), an app
+copy or command holding the screen, a WiFi scan, the ESP-SR bring-up, and
+**Always-On Xander**, because a wake word cannot hear anything from deep sleep.
 
 Intervals live in the profile table (`deep_after_ms`): Power Saver 10 min,
-Balanced 10 min, Performance 0 (never). One cell changes it.
+Balanced 10 min, Performance 0 (light sleep for ever). One cell changes it, and
+the **Auto Sleep** switch in Settings disables the crossover without touching the
+profiles.
 
-If you want the clock readable without a reboot, keep the switch off — light
-sleep already gets the dark screen to ~3 mA, and deep sleep only buys the last
-2.8 mA.
+The clock keeps running across the crossover. `deep_sleep_now()` pins
+`ESP_PD_DOMAIN_RTC_PERIPH` on, so the internal RTC keeps time, `time_save_now()`
+snapshots it to NVS first, and `setup()` reconciles the two on the way back up —
+the watch wakes with the right time, offline, and the `from_deep_sleep` path skips
+the splash and the WiFi bring-up.
+
+**The board limit that shapes all of this:** deep sleep can only be woken by
+BOOT. `TP_INT` is GPIO38, which is not an RTC pad, so ext1 cannot watch the touch
+controller and the FT3168 cannot wake the chip. That is why the first stage
+exists — it is the only way to keep tap-to-wake.
 
 ### Timeout under load (v1.8)
 
 The Settings timeout is a ceiling, not a floor. On a low pack the panel holds
 for at most 8 s (`PM_LOW_HOLD_MS`) and at critical for 5 s (`PM_CRIT_HOLD_MS`),
 whatever the slider says — a 60 s hold at 7 % is how a watch dies mid-evening.
-`pm_hold_ms()` is the only place that number is computed, and `pm_idle_after_ms()`
-derives the dim threshold from it, so the two can never cross. Charging clears
-the latch, so a plugged-in watch keeps the user's setting.
+`pm_hold_ms()` is the only place that number is computed. Charging clears the
+latch, so a plugged-in watch keeps the user's setting.
 
-Balanced and Power Saver keep the awake clock at 80 MHz because that is what
-the firmware already ran at. Raising it would spend battery to make an interface
-nobody called slow feel faster; only Performance pays for 160/240 MHz. The
-numbers are one table (`kPmProfiles`) if you want to test others.
+Below 20 % the panel sits at the low/critical brightness cap from the first frame
+and only the *timeout* (8 s / 5 s) controls when it goes black. A
+`g_pmBattLatch` of 1 or 2 is therefore a pure hold-time reduction, not a
+brightness one — which is what the table above means by "ceiling".
 
 ## Settings (Xander → Settings)
 
@@ -186,8 +219,10 @@ Redraws, sensor samples and battery polls never stamp it.
 
 ## CPU
 
-`setCpuFrequencyMhz()` is called only on a state transition (and at boot), never
-on every loop pass, and never while:
+While the panel is lit every profile asks for `cpu_active` = 240 MHz; the only
+downclock left is `cpu_off` (80 MHz) for `SCREEN_OFF`. `setCpuFrequencyMhz()` is
+called only on a state transition (and at boot), never on every loop pass, and
+never while:
 
 * `screen_held()` — an app copy or command is running,
 * `g_wifi_scan_busy` — a scan is in flight,
@@ -198,7 +233,7 @@ state's clock via `pm_restore_cpu()` instead of forcing 80 MHz.
 
 ## Diagnostics
 
-* `[pm] ACTIVE -> IDLE  cpu=80 MHz  bright=70  batt=64%` on each transition,
+* `[pm] ACTIVE -> SCREEN_OFF  cpu=80 MHz  bright=0  batt=64%` on each transition,
   rate-limited to one line per second.
 * `[pm] <state> batt=.. cpu=.. bright=.. awake=..s off=..s xitions=.. heap=..`
   every 10 minutes, plus the %/hour since boot.
@@ -225,7 +260,7 @@ The AXP2101 percentage is coarse: 1 % of a 400 mAh pack is 4 mAh, about 25 s of
 `ACTIVE`. So a sample has to cover a window long enough to move that digit, and
 for the result to mean anything the window must contain exactly one mode.
 Reading on a fixed timer fails both ways — a 15 s poll during use straddles
-`ACTIVE` and `IDLE` and averages 145 mA with 82 mA, which is worse than no
+`ACTIVE` and `SCREEN_OFF` and averages 145 mA with 3 mA, which is worse than no
 number at all.
 
 So the ledger closes its window on the state change instead: `pm_enter()` reads
@@ -241,11 +276,10 @@ Thirty minutes after boot, and on demand:
 
 ```
 [pm] energy: 41 windows, 88.0 mAh measured, capacity 400 mAh
-[pm]   ACTIVE       0.42h     60.9mAh   145mA   69%
-[pm]   IDLE         0.11h      9.0mAh    82mA   10%
+[pm]   ACTIVE       0.48h     69.6mAh   145mA   79%
 [pm]   NIGHT        0.05h      2.9mAh    58mA    3%
 [pm]   LOW_BATT     0.00h      0.0mAh      -    0%
-[pm]   SCREEN_OFF   5.03h     15.2mAh     3mA   17%
+[pm]   SCREEN_OFF   5.03h     15.2mAh     3mA   18%
 ```
 
 Columns: exact dwell in that state, mAh attributed to it, the resulting mean
@@ -289,9 +323,9 @@ replace.
 
 ### Sanity check on the first run
 
-A healthy first block lands near `ACTIVE` 145 mA, `IDLE` 80 mA, `NIGHT` 58 mA and
-`SCREEN_OFF` 3 mA, which is the model in the earlier tables. Two failures worth
-recognising:
+A healthy first block lands near `ACTIVE` 145 mA, `NIGHT` 58 mA and `SCREEN_OFF`
+3 mA, which is the model in the earlier tables (`IDLE` stays at 0.00 h — nothing
+enters it since v2.1). Two failures worth recognising:
 
 * `SCREEN_OFF` in the tens of mA — light sleep is not engaging, so the dark
   screen is still running at full clock. The measurement is right, the sleep
@@ -316,9 +350,9 @@ recognising:
   moves more than 25 % in one window is treated as a bad read and counted in
   the `discarded as invalid` line.
 * **It cannot separate two modes that alternate faster than 1 % moves.** If you
-  touch the screen every two seconds, `ACTIVE` and `IDLE` share one window and
-  the ledger attributes it to the state that was running when the window
-  closed. Leave the watch alone for the run if you want clean per-mode numbers.
+  tap the screen awake every few seconds, `ACTIVE` and `SCREEN_OFF` share one
+  window and the ledger attributes it to the state that was running when the
+  window closed. Leave the watch alone for the run if you want clean per-mode numbers.
 
 ## Not implemented (and why)
 
@@ -338,19 +372,20 @@ recognising:
 
 ## Test checklist on hardware
 
-1. Boot, wait 5 s untouched → panel dims to the idle level; log shows
-   `ACTIVE -> IDLE`.
-2. After the configured timeout → `SCREEN_OFF`, panel black, tap wakes it and
-   the brightness ramps up.
+1. Boot, wait untouched → the panel holds the user's brightness for the whole
+   timeout with **no dim step and no wallpaper swap**, then goes black: the log
+   goes `ACTIVE -> SCREEN_OFF`, never `-> IDLE`.
+2. After the configured timeout → `SCREEN_OFF`, panel black, tap wakes it, the
+   brightness fades up **smoothly at 240 MHz** (no stutter in the fade).
 3. Press BOOT with the panel dark → screen lights, `Opening mic...` visible.
 4. Settings → screen timeout 8 s / 60 s behaves accordingly; profile change is
    persisted across a reboot.
 5. Night Mode on → panel drops to 35; off → back to the user level.
 6. On charger: state reports `CHARGING`, no low-battery notice even under 20 %.
 7. Drag the battery to 20 % → one warning, brightness capped, no WiFi resync.
-8. Set a wallpaper, then wait for `IDLE`: the face goes pure black behind the
-   clock and the picture returns on the next touch — check it comes back without
-   a visible SD re-read (no white flash).
+8. Set a wallpaper, leave the watch until the panel is dark, then wake it: the
+   picture returns without a visible SD re-read (no white flash) and without any
+   intermediate dim frame.
 9. Set the timeout to 60 s and cross 20 % on battery: the panel now holds ~8 s,
    not 60 s. Plug in → back to 60 s.
 10. Leave the watch dark at 21 % overnight: the log shows
@@ -363,8 +398,17 @@ recognising:
     protection still arms after two samples and deep-sleeps; it must not do so
     while an app copy holds the screen.
 13. Dark at the 10 min mark on Balanced → log shows
-    `[pm] idle 10 min on Balanced -> deep sleep (BOOT wakes)`, then BOOT wakes it
+    `[pm] dark 10 min on Balanced -> deep sleep (BOOT wakes)`, then BOOT wakes it
     and the face comes up with the correct time (no NTP needed).
+13a. **The tap window.** On Power Saver, wake it, let it go dark, then tap it at
+    2 min, 6 min and 9 min: each tap restores the same screen instantly with no
+    boot splash. At 11 min the same tap does nothing and BOOT is required — that
+    boundary is the whole point of the two-stage dark phase.
+13b. Wake it at minute 9 with a voice command (not a tap), let it go dark again:
+    the ten minutes start over, so it must still answer a tap at minute 18. This
+    is what `g_pmDarkSince` buys over the old `lastTouchMs` clock.
+13c. Wake, then leave it alone: the panel keeps your brightness unchanged for
+    the full timeout and then goes straight to black. Nothing dims before that.
 14. Same test on Performance: no sleep at 10 min, log stays quiet, screen-off
     draw stays ~3 mA.
 15. Auto Sleep off in Settings → 13 does not happen, even after an hour dark.

@@ -388,7 +388,7 @@ HWCDC USBSerial;
 // any prototype that mentions PmState has to see this enum first.
 enum PmState {
     PM_ACTIVE = 0,
-    PM_IDLE,
+    PM_IDLE,            // reserved: v2.1 never enters it (no auto-dim)
     PM_NIGHT,
     PM_CHARGING,
     PM_LOW_BATT,
@@ -405,7 +405,6 @@ struct PmProfileDef {
     uint8_t  idle_bright;
     uint8_t  night_bright;
     uint8_t  low_bright;
-    uint16_t idle_after_ms;
     uint16_t cpu_active_mhz;
     uint16_t cpu_idle_mhz;
     uint16_t cpu_off_mhz;
@@ -696,6 +695,13 @@ static uint8_t g_brightness_target = DEFAULT_BRIGHTNESS;
 #define PM_LOW_HOLD_MS           8000    // screen timeout cap at LOW_BATT
 #define PM_CRIT_HOLD_MS          5000    // ...and at CRITICAL
 
+// v2.1: no auto-dim.  While the panel is lit it holds the user's brightness
+// for the whole screen-on window and goes straight to black at the timeout,
+// which is how the pre-v1.6 firmware behaved.  The dim step in the middle of
+// that window read as the watch falling asleep mid-use, and the quiet face
+// that came with it swapped the wallpaper out and back on every glance.  Both
+// are gone; PM_IDLE below is now reserved rather than reached.
+
 // ---- power states ----------------------------------------------------------
 // (enum PmState lives up in POWER-SAVING TUNABLES -- see the note there.)
 
@@ -706,10 +712,14 @@ static uint8_t g_brightness_target = DEFAULT_BRIGHTNESS;
 // Brightness caps are absolute panel levels (0-255), applied as
 // min(user_target, cap) so a user who dimmed to 60 keeps 60 in every state.
 static const PmProfileDef kPmProfiles[PMP_COUNT] = {
-    // name             idle night low  idle-after  cpu: act  idle  off  wifi  deep-after
-    { "Power Saver",     45,   25,  30,   4000,          80,   80, 80,  false,   600000 },
-    { "Balanced",        70,   35,  40,   5000,          80,   80, 80,  true,    600000 },
-    { "Performance",    100,   50,  50,   8000,         240,  160, 80,  true,         0 },
+    // name             idle night low   cpu: act  idle  off  wifi  deep-after
+    // v2.1: every profile runs the SoC at 240 MHz while the panel is lit.  The
+    // 80 MHz active clock was the lag -- LVGL and the QSPI flush both ride the
+    // CPU, so a 3x downclock is a visibly choppy UI -- and the panel (~145 mA)
+    // dominates the draw anyway, which makes the 10-15 mA it saved a bad trade.
+    { "Power Saver",     45,   25,  30,         240,   80, 80,  false,   600000 },
+    { "Balanced",        70,   35,  40,         240,   80, 80,  true,    600000 },
+    { "Performance",    100,   50,  50,         240,  160, 80,  true,         0 },
 };
 
 // ---- runtime status --------------------------------------------------------
@@ -754,6 +764,12 @@ static bool      g_pmQuietFace   = false;   // dim state: wallpaper hidden (see 
 static bool      g_pmWpDirty     = false;   // wallpaper changed while the face was quiet
 static bool      g_pmDeepOn      = true;    // settings: allow auto deep sleep
 static bool      g_pmVoiceArmed  = false;   // wake word is listening; set by aon_service()
+// v2.0: millis() at which the panel went dark, 0 while it is lit.  The auto
+// deep-sleep clock runs off THIS rather than the touch timer, so the dark
+// phase is exactly "10 minutes of continuous darkness": every screen_on()
+// (tap, BOOT, PWR, a voice command, a battery alert) restarts the countdown,
+// and only a panel that has been dark for the whole interval may park the SoC.
+static uint32_t  g_pmDarkSince   = 0;
 
 static const uint16_t kPmTimeouts[] = { 8000, 15000, 30000, 60000 };
 #define PM_TIMEOUT_CHOICES ((int)(sizeof(kPmTimeouts) / sizeof(kPmTimeouts[0])))
@@ -765,7 +781,6 @@ static void        pm_activity(const char *why);
 static void        pm_note_battery(uint32_t now);
 static bool        pm_wifi_allowed();
 static void        pm_restore_cpu();
-static uint32_t    pm_idle_after_ms();
 static void        pm_log(uint32_t now);
 static int         pm_profile_index();
 static int         pm_timeout_index();
@@ -2987,7 +3002,7 @@ static void build_screen_settings() {
                 20, 255, g_cur_brightness, cards_on_brightness_cb);
 
     // 1b) v1.6 power manager: profile, timeout, night mode
-    card_dropdown(list, "Power Profile", "brightness + CPU policy",
+    card_dropdown(list, "Power Profile", "night + low-battery brightness",
                   "Power Saver\nBalanced\nPerformance",
                   pm_profile_index(), cards_on_power_profile_cb);
     card_dropdown(list, "Screen Timeout", "idle seconds before dark",
@@ -3616,6 +3631,9 @@ static void fade_brightness(uint8_t target, uint32_t dur_ms) {
 static void screen_off() {
     if (screenIsOff) return;
     screenIsOff = true;
+    // Start the dark phase.  millis() is well past 0 by the time a timeout can
+    // fire, so the "0 = no dark phase yet" sentinel in pm_auto_deep() is safe.
+    g_pmDarkSince = millis();
     fade_brightness(0, 220);                // smooth ~220 ms ramp to black
     // Clear the sticky touch interrupt flag.  The FT3168 ISR sets this on
     // every TP_INT falling-edge but nothing clears it during normal swipes
@@ -3627,6 +3645,15 @@ static void screen_off() {
 static void screen_on() {
     if (!screenIsOff) return;
     screenIsOff = false;
+    g_pmDarkSince = 0;                      // lit again: the dark phase is over
+    // v2.1: back to the lit clock BEFORE anything is painted.  The screen-off
+    // policy leaves the SoC at 80 MHz, and the repaint plus 200 ms fade below
+    // both run on this core -- a wake that spent them at 80 MHz was the
+    // choppiest moment in the whole UI.
+#if POWER_SAVE
+    if (pm_prof().cpu_active_mhz && getCpuFrequencyMhz() != pm_prof().cpu_active_mhz)
+        setCpuFrequencyMhz(pm_prof().cpu_active_mhz);
+#endif
     // v6.2: BEFORE we repaint + fade up, force the visible screen to
     // pull the CURRENT wall-clock value off the RTC.  The 1-second tick
     // in loop() only runs once a second, so without this push the user
@@ -4111,23 +4138,31 @@ static uint32_t pm_hold_ms() {
     return hold;
 }
 
-// ---- auto deep sleep (v1.9) ------------------------------------------------
-// After the profile's dark-screen interval with no interaction, park the SoC:
-// deep sleep draws ~0.2 mA where light sleep still costs ~3 mA, so an idle
-// night drops from ~25 mAh to ~2 mAh.  Clock: deep_sleep_now() keeps the RTC
-// peripheral domain powered, so the wall clock keeps ticking and
-// getLocalTime() is already correct after the reboot (setup() also reconciles
-// the NVS snapshot against it).
+// ---- auto deep sleep (v2.0) ------------------------------------------------
+// The dark phase is two-stage, and the split is what makes the watch usable:
 //
-// The cost of this state is that only BOOT wakes it -- TP_INT is GPIO38, which
-// is not an RTC pad, so ext1 cannot see the touch controller and no amount of
-// code here changes that.  Which is why the interval lives in the profile
-// table, is off in Performance, and has an off switch in Settings.
+//   0 .. limit      LIGHT SLEEP.  The panel is dark, the SoC wakes every
+//                   LIGHT_SLEEP_POLL_MS to watch TP_INT, so a tap puts the
+//                   same interface back on screen instantly -- no boot, no
+//                   splash, no lost screen, nothing re-initialised.
+//   limit ..        DEEP SLEEP.  ~0.2 mA where light sleep still costs ~3 mA,
+//                   at the price of a full reboot to answer, because only
+//                   BOOT can wake it (TP_INT is GPIO38, not an RTC pad, so
+//                   ext1 cannot see the touch controller and no code here
+//                   changes that).
+//
+// The clock for that is g_pmDarkSince -- the moment the panel went dark -- and
+// not the touch timer.  That distinction is the whole fix: "dark for ten
+// minutes" is the promise made in Settings, and it has to survive a wake that
+// was not a touch (a battery alert, a voice command holding the screen, the
+// PWR button).  Any screen_on() zeroes it, so the ten minutes start over.
 static void pm_auto_deep(uint32_t now) {
     if (!g_pmDeepOn) return;
     uint32_t limit = pm_prof().deep_after_ms;
     if (!limit) return;                        // this profile never auto-sleeps
     if (!g_pmReady || !screenIsOff) return;    // a lit panel is not idle
+    if (!g_pmDarkSince) return;                // no dark phase has started yet
+    if ((uint32_t)(now - g_pmDarkSince) < limit) return;
     if (g_charging) return;                    // pointless, and hides the charge
     // On USB with the pack full the AXP2101 reports "not charging", so ask the
     // PMIC directly: a docked watch must not reboot itself every ten minutes.
@@ -4135,10 +4170,9 @@ static void pm_auto_deep(uint32_t now) {
     if (g_has_pmu && g_pmu.isVbusIn()) return;
     if (pm_cpu_busy(now)) return;              // app copy, scan or mic bring-up
     if (g_pmVoiceArmed) return;                // the wake word would die with us
-    if ((uint32_t)(now - lastTouchMs) < limit) return;
 
-    USBSerial.printf("[pm] idle %lu min on %s -> deep sleep (BOOT wakes)\n",
-                     (unsigned long)(limit / 60000UL), pm_prof().name);
+    USBSerial.printf("[pm] dark %lu min on %s -> deep sleep (BOOT wakes)\n",
+                     (unsigned long)((now - g_pmDarkSince) / 60000UL), pm_prof().name);
     deep_sleep_now();                          // saves the clock, never returns
 }
 
@@ -4154,15 +4188,9 @@ static PmState pm_desired_state(uint32_t now) {
     if (screen_held(now))                return PM_ACTIVE;
     if (pm_night_active())               return PM_NIGHT;
     if (charging)                        return PM_CHARGING;
-    if ((uint32_t)(now - lastTouchMs) >= pm_idle_after_ms()) return PM_IDLE;
+    // No auto-dim: a lit panel keeps the user's brightness until the timeout
+    // takes it to black.
     return PM_ACTIVE;
-}
-
-static uint32_t pm_idle_after_ms() {
-    uint32_t idle = pm_prof().idle_after_ms;
-    uint32_t hold = pm_hold_ms();
-    uint32_t cap  = (hold > 3000) ? hold - 3000 : 1500;
-    return (idle > cap) ? cap : idle;
 }
 
 static void pm_enter(PmState s, uint32_t now) {
@@ -4353,13 +4381,16 @@ static void pm_init() {
     g_pmOffStreak  = 0;
     g_pmOffDone    = false;
     g_pmNoticeUntil = 0;
+    // A boot that starts with the panel already dark (a woke-from-sleep path
+    // that came up black) begins its dark phase now; a lit boot begins it in
+    // screen_off(), so the ten minutes are always measured from real darkness.
+    g_pmDarkSince  = screenIsOff ? (g_pmBootMs ? g_pmBootMs : 1) : 0;
     if (g_has_pmu) pm_note_battery(g_pmBootMs);
     g_pmReady = true;
 
     pm_apply_cpu(g_pmBootMs);
-    USBSerial.printf("[pm] profile %s | timeout %us | idle dim %ums | night %s%s\n",
+    USBSerial.printf("[pm] profile %s | timeout %us | no auto-dim | night %s%s\n",
                      pm_prof().name, (unsigned)(g_pmTimeoutMs / 1000),
-                     (unsigned)pm_idle_after_ms(),
                      g_pmNightManual ? "manual" : "off",
                      (g_pmNightSched && !g_pmNightManual) ? " + schedule" : "");
     USBSerial.printf("[pm] cpu %u MHz  brightness %u/%u  batt %d%%%s\n",
@@ -4369,8 +4400,10 @@ static void pm_init() {
                      (g_has_pmu && g_charging) ? " (charging)" : "");
     uint32_t dpark = g_pmDeepOn ? pm_prof().deep_after_ms : 0;
     if (dpark)
-        USBSerial.printf("[pm] auto deep sleep after %lu min dark (BOOT wakes)\n",
+        USBSerial.printf("[pm] dark phase: tap wakes for %lu min, then deep sleep (BOOT wakes)\n",
                          (unsigned long)(dpark / 60000UL));
+    else
+        USBSerial.println("[pm] dark phase: light sleep only - never parks in deep sleep");
 }
 
 // ---- Settings rows ---------------------------------------------------------
